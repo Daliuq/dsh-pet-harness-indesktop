@@ -159,3 +159,28 @@ ghostField（桥不写）→ 测试红。
 `test_settings_and_resources.py::test_dialogue_key_params_match_runtime_call_sites` 保证；
 端到端渲染（target 真出现在气泡里）由
 `test_agent_link.py::test_activity_bubble_receives_target_from_tool_record` 保证。
+
+## 六、链路可提供但未注入的字段清单（潜在增强，2026-09-06 核对）
+
+下表列出「整条链路（桥接记录 / Pet 侧回调参数 / 会话元数据）拿得到、但调用点
+没有传给模板」的字段。当前模板**不宣称**它们；若要开放，需在对应调用点补
+kwargs 并同步 `PARAMETERS`（AST 测试会双向校验）。
+
+| 弹窗 | 可获取但未传入的字段（来源） |
+|---|---|
+| activity.* | `command`、`argsKey`（tool/call 记录已写出）；`sessionName`/`projectName`/`label`（记录含 sessionId 时可取） |
+| approval.command / tool / generic | `sessionName`（`get_session_display_name(sessionId)`，fallback 前缀已在用但未作为参数）、`projectName`/`label`（记录）、原始工具名 `toolName`（approval.tool 传入的是中文 label）、`rpcId`/`approvalId`（记录，可作“编号”类文案） |
+| question.empty / one / many | `sessionName`/`projectName`/`label`（记录）；选项标签列表（handler 已从 `questions[].options[].label` 提取供 fallback，未传给模板）、`multiSelect`、`header`（已并入 body） |
+| rate_limit.one / many | `errorCode`/`errorMessage`/`consecutiveRetryCount`/`retry`（记录）、`sessionName`/`projectName`/`label` |
+| llm_error.api | `errorCode`/`errorMessage`/`retry`（记录）、`sessionName` |
+| failure.retry / tool / generic | `source`/`errorCode`/`errorMessage`/`retries`/`retryExhausted`（execution/failed 记录）、`sessionName`/`projectName`/`label` |
+| agent.attention / error、start / thinking、done.* | ——（状态机触发，链路只有状态，无记录） |
+| watchdog.warning / intervention | `risk`（评分）、`targetCount`/`targets`（目标清单）、`goal`、`steps`、`judge.verdict`/`judge.reason`（payload/Judge 均有，现仅传格式化后的 `reasons`） |
+| watchdog.unknown | 同上（`risk`/`targets` 等） |
+| pattern.control | `class`（细分类）、`count`、`window`、`verdict`（Judge 决策）——现仅传 `name`/`reasons` |
+| pattern.warning | 不弹气泡（仅播动画），无文案入口 |
+| stuck.reminder | `severity`（档位）——现仅传 `name` |
+| control.replan.* / interrupt.* / failed | `operation`/`ok`/`detail`（控制结果回调参数）——现仅传 `name` |
+| dsh.writeback.failed | `ok`/`detail`（回写结果回调参数）——当前零参数 |
+| balance.loading / result | ——（`text` 已全量注入） |
+| bridge.* | ——（`detail` 已传入，无缺口） |

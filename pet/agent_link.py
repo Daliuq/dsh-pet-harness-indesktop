@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox
 
 from .click_sound import play_sound, resolve_builtin_sound
@@ -3361,8 +3361,6 @@ class AgentLinkManager(QObject):
         entry = self._llm_error_cache.get(session_key)
         if not entry:
             return
-        now = self._clock()
-        ts = entry.get("_ts", now)
         delay_s = self._429_DURATION_MS / 1000.0
         self._cancel_llm_error_timer(session_key)
         parent = self.win if isinstance(self.win, QObject) else None

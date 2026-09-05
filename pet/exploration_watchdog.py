@@ -241,7 +241,6 @@ def parse_judge_result(value) -> dict:
         try:
             data = json.loads(raw)
         except Exception:
-            upper = raw.upper()
             return {"verdict": JudgeVerdict.UNKNOWN.value, "reason": "judge-invalid-response", "next_action": "", "confidence": 0.0}
     verdict = str(data.get("verdict", "UNKNOWN")).upper()
     if verdict not in {v.value for v in JudgeVerdict}:

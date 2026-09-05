@@ -35,7 +35,7 @@ from typing import Optional
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import harness_launcher
-from .agent_link import ByteOffsetTailer, DirGlobTailer
+from .agent_link import DirGlobTailer
 
 log = logging.getLogger("dsh-pet-standalone")
 

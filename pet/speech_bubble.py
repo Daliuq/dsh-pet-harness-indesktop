@@ -17,7 +17,6 @@ macOS 焦点问题由气泡窗口自身解决：`WindowDoesNotAcceptFocus`、
 from __future__ import annotations
 
 import logging
-import re
 import sys
 
 log = logging.getLogger(__name__)
@@ -30,7 +29,7 @@ from PySide6.QtGui import (
     QPixmap, QTransform,
 )
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLayout, QPushButton, QSizePolicy, QVBoxLayout,
+    QFrame, QLabel, QLayout, QPushButton, QSizePolicy, QVBoxLayout,
     QWidget,
 )
 

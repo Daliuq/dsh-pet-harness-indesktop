@@ -4079,9 +4079,11 @@ class ModernSettingsDialog(QDialog):
         }
 
     def _current_dialogue_template(self) -> dict:
+        # 导出 = 纯字段参考模板：phrases 一律留空（不携带当前已配置的台词），
+        # 供 AI 依角色卡从零撰写；当前台词如需备份请直接复制编辑框内容。
         return build_persona_template({
             "dialogue_mode": self.dialogue_mode_select.currentData() or "legacy",
-            "dialogue_phrases": self._dialogue_phrase_values(),
+            "dialogue_phrases": {},
         })
 
     def _export_dialogue_template(self) -> None:

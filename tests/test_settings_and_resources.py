@@ -219,3 +219,17 @@ def test_dialogue_key_params_match_runtime_call_sites():
     assert "target" in DIALOGUE_KEY_PARAMS["activity.read"]
     assert DIALOGUE_KEY_PARAMS["rate_limit.one"] == ("count",)
     assert DIALOGUE_KEY_PARAMS["dsh.writeback.failed"] == ()
+
+
+def test_dialogue_template_export_is_blank_without_current_phrases(qapp, tmp_path):
+    """导出 = 纯字段参考模板：不携带当前已配置的台词（phrases 一律留空）。"""
+    cfg = Config(tmp_path / "appdata")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        dialog.dialogue_phrase_edits["start"].setPlainText("当前已配置的台词不应出现在导出里")
+        data = dialog._current_dialogue_template()
+        assert all(not v for v in data["phrases"].values())
+        assert all(not e["phrases"] for e in data["entries"])
+        assert data["mode"] == dialog.dialogue_mode_select.currentData()
+    finally:
+        dialog.deleteLater()

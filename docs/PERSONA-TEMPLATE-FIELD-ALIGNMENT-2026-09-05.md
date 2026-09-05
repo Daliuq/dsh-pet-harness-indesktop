@@ -184,3 +184,29 @@ kwargs 并同步 `PARAMETERS`（AST 测试会双向校验）。
 | dsh.writeback.failed | `ok`/`detail`（回写结果回调参数）——当前零参数 |
 | balance.loading / result | ——（`text` 已全量注入） |
 | bridge.* | ——（`detail` 已传入，无缺口） |
+
+
+### 字段中文语义对照（2026-09-06 补充）
+
+公共会话字段（凡记录含 sessionId 即可取得，下表不再重复列）：
+
+| 字段 | 中文语义 |
+|---|---|
+| `sessionName` | 会话显示名（`get_session_display_name(sessionId)`） |
+| `projectName` | 会话所属项目名 |
+| `label` | 会话标签/对话名（与 approval.tool、activity 的工具标签 `label` 同名不同义） |
+
+| 弹窗 | 字段 → 中文语义 |
+|---|---|
+| activity.* | `command` → 完整命令文本（从工具参数提取，已折叠单行）；`argsKey` → 工具参数摘要键（参数指纹） |
+| approval.* | `toolName` → 原始工具名（如 `pwsh`；传入的 `label` 是它的中文标签）；`rpcId` → Mux 请求 ID（审批交互稳定标识）；`approvalId` → 审批项 ID |
+| question.* | 选项标签列表 → 问题给出的候选项文字（handler 已从 `questions[].options[].label` 提取）；`multiSelect` → 是否可多选；`header` → 问题分组标题（已并入 `body` 前缀） |
+| rate_limit.* | `errorCode` → 错误码（如 `429`）；`errorMessage` → 错误信息原文；`consecutiveRetryCount` → 已连续限流次数；`retry` → 本轮重试序号 |
+| llm_error.api | `errorCode` → 错误码（如 `PI_AI_ERROR`）；`errorMessage` → 错误信息原文；`retry` → 重试序号 |
+| failure.* | `source` → 失败来源（`tool`=工具执行，其余=模型请求）；`errorCode` → 错误码；`errorMessage` → 错误信息原文；`retries` → 本轮已重试次数；`retryExhausted` → 是否重试耗尽 |
+| watchdog.warning / intervention | `risk` → 风险评分（越高越危险）；`targetCount` → 涉及目标数量；`targets` → 目标清单；`goal` → 当前任务目标；`steps` → 最近步骤序列；`judge.verdict` → Judge 决策（NORMAL/REPLAN/STOP/ASK_USER/UNKNOWN）；`judge.reason` → Judge 判断原因原文 |
+| watchdog.unknown | `risk`/`targets`/`targetCount` 等 → 同 watchdog（Judge 不可用时仅检测层数据） |
+| pattern.control | `class` → 行为细分类别；`count` → 统计窗口内出现次数；`window` → 统计窗口；`verdict` → Judge 决策（默认 REPLAN） |
+| stuck.reminder | `severity` → 卡住档位（1=仅播动画，2=弹持续提醒） |
+| control.replan.* / interrupt.* / failed | `operation` → 控制操作类型（interrupt=终止 / replan=重新规划）；`ok` → 控制请求是否送达成功；`detail` → 失败/异常详情 |
+| dsh.writeback.failed | `ok` → 回写是否成功；`detail` → 回写失败详情 |

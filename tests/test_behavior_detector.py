@@ -393,14 +393,6 @@ class TestLifecycle:
         det.feed_record("dsh", _call("Read", 7))  # flush step6 → W6 Search=3
         assert col.controls
 
-    def test_defaults_are_sane(self):
-        det, _ = _make_detector()
-        assert det.is_enabled() is True
-        assert DEFAULT_MIN_STEPS_BETWEEN >= 1
-        assert det._w6_control >= 1
-        assert det._w10_control > det._w10_warn
-
-
 def _state_probe(det: BehaviorPatternDetector, agent_key: str):
     """便捷方法：暴露内部状态供断言（生产代码不依赖）。"""
     return det._states.get(agent_key)

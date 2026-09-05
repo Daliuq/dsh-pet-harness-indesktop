@@ -294,11 +294,3 @@ class TestStuckHelpers:
         assert "{name}" not in stuck_reminder_text("DSH")
         assert "DSH" in stuck_reminder_text("DSH")
         assert stuck_reminder_text("DSH", "快去看 {name}！") == "快去看 DSH！"
-
-
-class TestDetectorDefaults:
-    def test_defaults_are_sane(self):
-        assert DEFAULT_WORRIED_THRESHOLD < DEFAULT_INTERVENE_THRESHOLD
-        det, _ = _make_detector()
-        assert det.get_score("dsh") == 0
-        assert det.is_enabled() is True

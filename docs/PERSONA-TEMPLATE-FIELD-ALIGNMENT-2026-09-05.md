@@ -1,11 +1,19 @@
-# 台词模板字段对齐审计（2026-09-05）
+# 台词模板字段对齐审计（2026-09-05，v2 修订）
 
 背景：上游（origin/main）大规模重构合并（`8fb74a5` 等）后，`pet/persona_template.py`
 导出模板里宣称的字段/参数与运行时实际传给 `PhrasePicker` 的值严重脱节——模板告诉
 用户/AI「可以写 {riskScore}、{arguments}」，运行时却从未注入，占位符原样露出。
 本文是逐事件 key 的对齐审计结论，并记录本次修正。回归防线：
-`tests/test_persona_template.py::test_template_parameters_match_runtime_call_sites`、
+`tests/test_persona_template.py::test_all_advertised_fields_reach_presentation_layer`（AST 双向校验）、
 `tests/test_settings_and_resources.py::test_dialogue_key_params_match_runtime_call_sites`。
+
+> **v2 修订（严格逐 key）**：v1 曾把「组级上下文字段」（base/组记录字段）合并进每个
+> key 的 `entries[].parameters`，导致 `agent.error`（状态机触发、上游方法只注入
+> `name`）宣称了 `errorCode/retries`、`start/thinking` 带了一串 base 字段——AI 依此
+> 写出的占位符运行时原样露出。v2 规则：**每个 key 的 `parameters` 与其上游方法显式
+> 注入的 kwargs 严格相等**；上下文记录字段只在顶层 `upstream` 一节做文档说明，不混入
+> per-key 宣称。`EVENT_FIELDS` 组字段表已删除。原 v1 测试名已由 AST 双向校验的
+> `test_all_advertised_fields_reach_presentation_layer` 取代。
 
 ## 一、渲染链路与“参数”的两个层级
 

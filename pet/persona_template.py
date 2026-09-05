@@ -71,16 +71,16 @@ DISPLAY_HINTS = {
     "done.attention": "{name} 停下来了，结果请主人确认。",
     "done.success": "{name} 这一轮完成啦。",
     "failure.generic": "{name} 本轮运行失败，请检查后再运行。",
-    "failure.retry": "{name} 本轮多次重试后仍未成功（错误：{errorMessage}，视最新记录而定）。",
-    "failure.tool": "{name} 本轮工具执行失败（错误：{errorMessage}，视最新记录而定）。",
-    "llm_error.api": "AI 服务暂时没有回应（{errorCode}：{errorMessage}，视最新记录而定）。",
+    "failure.retry": "{name} 本轮多次重试后仍未成功。",
+    "failure.tool": "{name} 本轮工具执行失败。",
+    "llm_error.api": "AI 服务暂时没有回应。",
     "pattern.control": "{name} 行为模式异常，已建议干预：{reasons}。",
     "pattern.warning": "{name} 行为模式需要留意：{reasons}。",
     "question.empty": "{name} 在等你回答。",
     "question.many": "{name} 有 {count} 个问题等你回答。",
     "question.one": "{name} 在问你：{body}",
-    "rate_limit.many": "已连续限流 {count} 次，请稍后再试（错误：{errorMessage}，视最新记录而定）。",
-    "rate_limit.one": "通信被限流了，请稍后再试（错误：{errorMessage}，视最新记录而定）。",
+    "rate_limit.many": "已连续限流 {count} 次，请稍后再试。",
+    "rate_limit.one": "通信被限流了，请稍后再试。",
     "start": "{name} 开始干活啦～",
     "stuck.reminder": "{name} 可能卡住了，去看一眼吧。",
     "thinking": "{name} 正在认真想办法……",
@@ -121,23 +121,10 @@ EVENT_SOURCES = {
     "balance.loading": ("Pet 内置余额查询",), "balance.result": ("Pet 内置余额查询",),
 }
 
-EVENT_FIELDS = {
-    "start": BASE_FIELDS + ("name",),
-    "thinking": BASE_FIELDS + ("name",),
-    "activity": BASE_FIELDS + ("name", "tool", "label", "target", "callId", "step", "ok"),
-    "approval": BASE_FIELDS + ("name", "label", "command", "rpcId", "approvalId", "requestId", "callId", "toolName", "outcome"),
-    "question": BASE_FIELDS + ("name", "body", "count", "rpcId", "questionRpcId", "callId", "questions"),
-    "error": BASE_FIELDS + ("name", "errorCode", "errorMessage", "errorText", "retryExhausted", "retries"),
-    "llm_error.api": BASE_FIELDS + ("errorCode", "errorMessage"),
-    "watchdog": BASE_FIELDS + ("name", "reasons"),
-    "pattern": BASE_FIELDS + ("name", "reasons"),
-    "control": BASE_FIELDS + ("name",),
-    "rate_limit": BASE_FIELDS + ("count", "errorCode", "errorMessage"),
-    "balance": ("text",),
-}
-
-# 每个事件 key 由调用点显式注入的参数（保证可用）；entries 里与
-# EVENT_FIELDS 组字段合并去重（组字段在前，key 补充在后）。
+# 每个事件 key 由其对应的上游方法（调用点）显式注入的参数——这是该弹窗
+# 「能获取到的字段」的完整清单，entries[].parameters 与之逐 key 严格相等。
+# 上游事件记录附带字段（同轮可读的上下文）只在顶层 upstream 做文档说明，
+# 不混入 per-key 宣称；改调用点 kwargs 时必须同步改这里（有 AST 回归测试）。
 PARAMETERS: dict[str, tuple[str, ...]] = {
     "start": ("name",), "thinking": ("name",),
     "activity.read": ("name", "tool", "label", "target", "callId", "step", "ok"),
@@ -165,19 +152,6 @@ PARAMETERS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _event_group(key: str) -> str:
-    if key.startswith("activity."): return "activity"
-    if key.startswith("approval."): return "approval"
-    if key.startswith("question."): return "question"
-    if key.startswith("failure.") or key == "agent.error": return "error"
-    if key.startswith("watchdog."): return "watchdog"
-    if key.startswith("pattern."): return "pattern"
-    if key.startswith("control."): return "control"
-    if key.startswith("rate_limit."): return "rate_limit"
-    if key == "balance.loading" or key == "balance.result": return "balance"
-    return key
-
-
 # JSON 没有注释语法，因此导出的便携文档以 `_说明` 键携带使用指南（放在文件最顶部）。
 # 导入侧只读取 template / phrases / entries 等业务键，这段自述在导入时会被忽略，可随意保留或删除。
 EXPORT_GUIDE: dict[str, Any] = {
@@ -190,8 +164,8 @@ EXPORT_GUIDE: dict[str, Any] = {
         "1. 改 phrases：每个 key 是一类事件的文案，值是候选文案数组；数组里每项一句，实际弹出时轮换使用。"
         "改成 [] 表示留空，该事件自动沿用原有模式台词。",
         "2. 文案里可用 {变量} 占位符，弹出时自动代入真实信息，例如 {name}（Agent 名称）、{command}（待审批命令）。"
-        "变量分两级：variables 是每个事件保证可用的参数（见各 entries 的 parameters）；"
-        "upstream 是上游事件记录附带字段，审批/提问/限流/工具/失败类文案在事件触发时可读，其他场景不保证有值。",
+        "每种弹窗能代入的字段 = 它对应上游方法显式注入的参数，见各 entries 的 parameters（保证可用，占位符一定会被替换）；"
+        "upstream 是上游事件记录附带字段，审批/提问/限流/失败/工具类文案在事件触发时可读，其他场景不保证有值，依赖时请写好留空回退。",
         "3. 想整体换风格：改 mode（legacy=原有模式 / whale_maid=鲸鱼娘女仆模式 / custom=自定义台词），"
         "并顺带改 name / description；导入后会自动切到「自定义台词」。",
         "4. 想精确改某一句：到 entries 按 key 找到同一项，参考 sources（什么事件触发）与 parameters（该项可用变量），"
@@ -204,8 +178,8 @@ EXPORT_GUIDE: dict[str, Any] = {
         "mode": "表达风格：legacy=原有模式；whale_maid=鲸鱼娘女仆模式；custom=自定义台词。",
         "name": "这套台词的名字，仅作标识，可随意修改。",
         "description": "整份模板用途的一句话说明，可随意修改或删除。",
-        "variables": "每个事件保证可用的 {变量} 占位符及含义，写文案时对照参考，一般无需改动。",
-        "upstream": "上游事件记录附带字段（{任意字段}、{payload.xx}、{data.xx} 等）；审批/提问/限流/工具/失败类文案在事件触发时可读，其他场景不保证有值，依赖时请写好留空回退。",
+        "variables": "各事件保证可用的 {变量} 占位符及含义，写文案时对照参考，一般无需改动。",
+        "upstream": "上游事件记录附带字段（{任意字段}、{payload.xx}、{data.xx} 等）；审批/提问/限流/失败/工具类文案在事件触发时可读，其他场景不保证有值，依赖时请写好留空回退。",
         "phrases": "核心编辑区：事件 key → 候选文案数组（编辑方法见上方『怎么改』）。",
         "entries": "逐事件明细表，与 phrases 一一对应：列出每个 key 的触发来源 sources、可用变量 parameters 与示例 displayHint，"
         "方便人/AI 弄清每句台词在什么场景出现、能写哪些信息。",
@@ -214,7 +188,7 @@ EXPORT_GUIDE: dict[str, Any] = {
         "key": "事件标识（与顶层 phrases 的键一致）：如 start=开始工作、thinking=思考、activity.read=读取文件、approval.command=命令审批。",
         "description": "该 key 的说明文字（当前为占位，内容与 key 相同），可自行补充更易读的说明。",
         "sources": "触发该文案的上游事件来源名，帮助理解在什么时刻出现，一般不改。",
-        "parameters": "该项文案可用的 {变量} 清单（含义见顶层 variables）。",
+        "parameters": "该项对应上游方法显式注入的 {变量} 清单（保证可用，含义见顶层 variables）。上游事件记录附带字段不在此列，需要时参考顶层 upstream（仅事件同轮可读）。",
         "displayHint": "用占位符写出的一句话示例，展示该事件能表达的信息上限，方便你或 AI 判断写多少内容；不会直接展示给用户。",
         "phrases": "与顶层 phrases 中同名 key 的数组，两处应保持一致。",
     },
@@ -258,15 +232,14 @@ def build_persona_template(config: dict[str, Any] | None) -> dict[str, Any]:
         else:
             value = []
         phrases[key] = copy.deepcopy(value)
-        group = _event_group(key)
-        parameters = list(dict.fromkeys(EVENT_FIELDS.get(group, ()) + PARAMETERS.get(key, ())))
+        parameters = list(PARAMETERS.get(key, ()))
         entries.append({"key": key, "description": key, "sources": list(EVENT_SOURCES.get(key, ())), "parameters": parameters, "displayHint": DISPLAY_HINTS.get(key, ""), "phrases": copy.deepcopy(value)})
     mode = str(config.get("dialogue_mode", "custom") or "custom")
     document = {
         "template": TEMPLATE_VERSION,
         "mode": mode if mode in {"legacy", "whale_maid", "custom"} else "custom",
         "name": str(config.get("persona_template_name", "我的角色台词") or "我的角色台词"),
-        "description": "Pet 全部弹窗/气泡内容模板。每个 entries 项的 parameters 是该事件保证可用的参数（组字段为上游记录字段，事件触发时可读）；同时支持自动读取上游事件记录字段。",
+        "description": "Pet 全部弹窗/气泡内容模板。每个 entries 项的 parameters 是该项上游方法显式注入的参数（保证可用）；上游事件记录附带字段见顶层 upstream（仅事件同轮可读）。",
         "variables": copy.deepcopy(VARIABLES),
         "upstream": {
             "description": "模板渲染会自动合并最近一条上游事件记录的字段（审批/提问/限流/工具/失败类文案与记录同轮触发，字段可靠；状态机与本地检测触发的文案不保证有记录），并保留完整对象于 payload/data。显式别名（如 name、command）优先。",

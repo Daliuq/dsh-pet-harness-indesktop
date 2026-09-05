@@ -102,7 +102,17 @@ def test_all_advertised_fields_reach_presentation_layer():
     assert set(PARAMETERS) == set(entries) == set(phrase_keys())
     for key, entry in entries.items():
         assert key in DISPLAY_HINTS and key in EVENT_SOURCES, key
-        assert set(PARAMETERS[key]) <= set(entry["parameters"])
+        # 严格逐 key 相等：entries.parameters 只能列该项上游方法显式注入的字段，
+        # 组级上下文字段（ts/sessionId/errorCode 等）不得混入——否则 AI 会写出
+        # 运行时永远原样露出的占位符（如 agent.error 宣称 {errorCode}）。
+        assert entry["parameters"] == list(PARAMETERS[key]), key
+
+    # 典型误报场景抽查：状态机/检测器触发的弹窗只有保证参数
+    assert entries["start"]["parameters"] == ["name"]
+    assert entries["agent.error"]["parameters"] == ["name"]
+    assert entries["llm_error.api"]["parameters"] == []
+    assert entries["rate_limit.one"]["parameters"] == ["count"]
+    assert entries["approval.command"]["parameters"] == ["name", "command"]
 
     # ── 核心保证：模板宣称参数 == 调用点实际注入（双向相等）──
     for key in phrase_keys():

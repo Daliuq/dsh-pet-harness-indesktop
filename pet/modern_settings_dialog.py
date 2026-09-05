@@ -83,7 +83,9 @@ from .menu_layout import (
 )
 from .speech_bubble import BUBBLE_STYLE_PRESETS
 from .persona_phrases import phrase_keys, default_phrases
-from .persona_template import PARAMETERS, build_persona_template, template_json
+from .persona_template import (
+    CONDITIONAL_PARAMETERS, PARAMETERS, build_persona_template, template_json,
+)
 
 
 # 语言配置页只展示用户能理解的事件名称；内部 key 仍用于保存和渲染。
@@ -121,6 +123,18 @@ DIALOGUE_PARAMS = {
 
 # 与 persona_template.PARAMETERS 保持同一真相源：调用点注入什么，这里就宣称什么。
 DIALOGUE_KEY_PARAMS = dict(PARAMETERS)
+
+
+def dialogue_params_hint(key: str) -> str:
+    """「可用参数」提示文案：区分保证注入与条件注入（仅上游记录提供时可用）。"""
+    params = DIALOGUE_KEY_PARAMS.get(key, ())
+    if not params:
+        return ""
+    text = "、".join("{" + item + "}（" + DIALOGUE_PARAMS[item] + "）" for item in params)
+    conditional = [item for item in params if item in CONDITIONAL_PARAMETERS.get(key, ())]
+    if conditional:
+        text += "；其中 " + "、".join("{" + item + "}" for item in conditional) + " 仅在上游记录提供时可用"
+    return text
 
 
 def _system_font_families() -> tuple[str, ...]:
@@ -3002,10 +3016,7 @@ class ModernSettingsDialog(QDialog):
             SettingRow(
                 f"dialogue_{key}",
                 labels.get(key, key),
-                "留空则使用基础模式台词。可用参数："
-                + "、".join("{" + item + "}" for item in DIALOGUE_KEY_PARAMS.get(key, ()))
-                if DIALOGUE_KEY_PARAMS.get(key)
-                else "留空则使用基础模式台词。可用参数：无",
+                "留空则使用基础模式台词。可用参数：" + (dialogue_params_hint(key) or "无"),
                 edit,
                 stacked=True,
             )
@@ -3446,13 +3457,9 @@ class ModernSettingsDialog(QDialog):
                 edit.setPlainText(str(raw_value or ""))
             edit.setMinimumHeight(48)
             edit.setMaximumHeight(120)
-            params = DIALOGUE_KEY_PARAMS.get(key, ())
-            if params:
-                param_text = "、".join(
-                    "{" + item + "}（" + DIALOGUE_PARAMS[item] + "）"
-                    for item in params
-                )
-                placeholder = "留空使用基础模式台词；本事件支持：" + param_text
+            hint = dialogue_params_hint(key)
+            if hint:
+                placeholder = "留空使用基础模式台词；本事件支持：" + hint
             else:
                 placeholder = "留空使用基础模式台词；本事件无可替换参数"
             edit.setPlaceholderText(placeholder)

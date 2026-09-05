@@ -151,6 +151,14 @@ PARAMETERS: dict[str, tuple[str, ...]] = {
     "balance.loading": (), "balance.result": ("text",),
 }
 
+# 条件可用参数：调用点仅在上游记录提供该字段时才注入（缺失时占位符原样保留）。
+# 仍属于「上游方法能获取到的字段」（保留在 entries.parameters 中），但与保证
+# 注入的参数不同——设置页提示与导出文档据此区分表述。
+CONDITIONAL_PARAMETERS: dict[str, tuple[str, ...]] = {
+    key: ("target", "callId", "step", "ok")
+    for key in ("activity.read", "activity.search", "activity.edit", "activity.run", "activity.default")
+}
+
 
 # JSON 没有注释语法，因此导出的便携文档以 `_说明` 键携带使用指南（放在文件最顶部）。
 # 导入侧只读取 template / phrases / entries 等业务键，这段自述在导入时会被忽略，可随意保留或删除。

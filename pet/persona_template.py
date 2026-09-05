@@ -14,16 +14,26 @@ TEMPLATE_VERSION = "persona-phrases/v1"
 # 对齐审计见 docs/PERSONA-TEMPLATE-FIELD-ALIGNMENT-2026-09-05.md。
 VARIABLES = {
     "name": "Agent 展示名称（所有事件都会注入）",
-    "command": "待审批命令（approval.command；已折叠为单行、超长截断）",
-    "label": "工具/操作的中文标签（approval.tool、activity.*）",
+    "command": "命令文本（approval.command=待审批命令；activity.*=工具命令，上游记录提供时可用；已折叠单行、超长截断）",
+    "label": "标签（approval.tool/activity.*=工具中文标签；approval.command/generic、question.*、rate_limit.*、failure.*=会话标签，上游提供时可用）",
     "body": "问题内容（question.one；含 header 前缀）",
     "count": "数量（question.many=问题数；rate_limit.many=连续限流次数）",
     "reasons": "循环/行为检测的判断原因（watchdog.*、pattern.*；已格式化为文本）",
     "detail": "桥接安装失败详情（bridge.install.failed）",
     "text": "余额查询结果文本（balance.result）",
     "tool": "原始工具名（activity.*）",
+    "toolName": "审批原始工具名（approval.*；上游记录提供时可用）",
+    "argsKey": "工具参数摘要键（activity.*；上游记录提供时可用）",
     "callId": "工具调用 ID（activity.*；上游记录提供时可用）",
     "step": "turn 内步骤序号（activity.*；上游记录提供时可用）",
+    "sessionName": "会话显示名（含 sessionId 的弹窗均可用；上游记录提供时可用）",
+    "projectName": "会话所属项目名（含 sessionId 的弹窗均可用；上游记录提供时可用）",
+    "errorCode": "错误码（rate_limit.*、failure.*；上游记录提供时可用）",
+    "errorMessage": "错误信息原文（rate_limit.*、failure.*；上游记录提供时可用）",
+    "consecutiveRetryCount": "已连续限流次数（rate_limit.*；上游记录提供时可用）",
+    "retry": "本轮重试序号（rate_limit.*；上游记录提供时可用）",
+    "retries": "本轮已重试次数（failure.*；上游记录提供时可用）",
+    "retryExhausted": "是否重试耗尽（failure.*；上游记录提供时可用）",
 }
 
 # 上游记录字段——以桥接插件源码（integrations/dsh-pet-bridge/index.js）逐事件
@@ -128,27 +138,45 @@ EVENT_SOURCES = {
 
 # 每个事件 key 由其对应的上游方法（调用点）显式注入的参数——这是该弹窗
 # 「能获取到的字段」的完整清单，entries[].parameters 与之逐 key 严格相等。
-# 上游事件记录附带字段（同轮可读的上下文）只在顶层 upstream 做文档说明，
-# 不混入 per-key 宣称；改调用点 kwargs 时必须同步改这里（有 AST 回归测试）。
+# 分两类：无条件注入的（保证可用）+ 条件注入的（CONDITIONAL_PARAMETERS，
+# 上游未提供/为空/为 null 时占位符自动隐藏，不会原样露出）。
+# 改调用点 kwargs 时必须同步改这里（有 AST 回归测试）。
 PARAMETERS: dict[str, tuple[str, ...]] = {
     "start": ("name",), "thinking": ("name",),
-    "activity.read": ("name", "tool", "label", "callId", "step"),
-    "activity.search": ("name", "tool", "label", "callId", "step"),
-    "activity.edit": ("name", "tool", "label", "callId", "step"),
-    "activity.run": ("name", "tool", "label", "callId", "step"),
-    "activity.default": ("name", "tool", "label", "callId", "step"),
+    "activity.read": ("name", "tool", "label", "command", "argsKey", "callId", "step",
+                      "sessionName", "projectName"),
+    "activity.search": ("name", "tool", "label", "command", "argsKey", "callId", "step",
+                        "sessionName", "projectName"),
+    "activity.edit": ("name", "tool", "label", "command", "argsKey", "callId", "step",
+                      "sessionName", "projectName"),
+    "activity.run": ("name", "tool", "label", "command", "argsKey", "callId", "step",
+                     "sessionName", "projectName"),
+    "activity.default": ("name", "tool", "label", "command", "argsKey", "callId", "step",
+                         "sessionName", "projectName"),
     "agent.attention": ("name",), "agent.error": ("name",),
     "agent.missing": ("name",), "bridge.install.pending": ("name",),
     "bridge.install.success": ("name",), "bridge.install.failed": ("name", "detail"),
     "bridge.uninstall.failed": ("name",), "dsh.writeback.failed": (),
-    "approval.command": ("name", "command"), "approval.tool": ("name", "label"),
-    "approval.generic": ("name",), "question.empty": ("name",),
-    "question.one": ("name", "body"), "question.many": ("name", "count"),
+    "approval.command": ("name", "command", "toolName", "sessionName", "projectName", "label"),
+    "approval.tool": ("name", "label", "toolName", "sessionName", "projectName"),
+    "approval.generic": ("name", "toolName", "sessionName", "projectName", "label"),
+    "question.empty": ("name", "sessionName", "projectName", "label"),
+    "question.one": ("name", "body", "sessionName", "projectName", "label"),
+    "question.many": ("name", "count", "sessionName", "projectName", "label"),
     "watchdog.warning": ("name", "reasons"), "watchdog.intervention": ("name", "reasons"),
-    "watchdog.unknown": ("name",), "rate_limit.one": ("count",),
-    "rate_limit.many": ("count",), "llm_error.api": (),
+    "watchdog.unknown": ("name",),
+    "rate_limit.one": ("count", "errorCode", "errorMessage", "consecutiveRetryCount", "retry",
+                       "sessionName", "projectName"),
+    "rate_limit.many": ("count", "errorCode", "errorMessage", "consecutiveRetryCount", "retry",
+                        "sessionName", "projectName"),
+    "llm_error.api": (),
     "done.success": ("name",), "done.attention": ("name",),
-    "failure.retry": ("name",), "failure.tool": ("name",), "failure.generic": ("name",),
+    "failure.retry": ("name", "source", "errorCode", "errorMessage", "retries", "retryExhausted",
+                      "sessionName", "projectName"),
+    "failure.tool": ("name", "source", "errorCode", "errorMessage", "retries", "retryExhausted",
+                     "sessionName", "projectName"),
+    "failure.generic": ("name", "source", "errorCode", "errorMessage", "retries", "retryExhausted",
+                        "sessionName", "projectName"),
     "control.replan.pending": ("name",), "control.replan.success": ("name",),
     "control.interrupt.pending": ("name",), "control.interrupt.success": ("name",),
     "control.failed": ("name",), "pattern.warning": ("name", "reasons"),
@@ -156,15 +184,38 @@ PARAMETERS: dict[str, tuple[str, ...]] = {
     "balance.loading": (), "balance.result": ("text",),
 }
 
-# 条件可用参数：调用点仅在上游记录提供该字段时才注入（缺失时占位符原样保留）。
-# 仍属于「上游方法能获取到的字段」（保留在 entries.parameters 中），但与保证
-# 注入的参数不同——设置页提示与导出文档据此区分表述。
-# 注意：tool/call 记录只含 tool/argsKey/command/callId/step/sessionId——
-# target/ok 仅存在于 tool/result 与 watchdog reasoning 记录，活动气泡在
-# tool/call 同轮触发时拿不到，因此不得宣称（2026-09-06 桥接源码核实）。
+# 条件可用参数：调用点仅在上游记录提供该字段（非空/非 null）时才注入；缺失时
+# 渲染端自动隐藏对应占位符（不会原样露出 {xxx}）。仍是「上游方法能获取到的
+# 字段」（保留在 entries.parameters 中），但与保证注入的参数不同——设置页提示
+# 与导出文档据此区分表述。
+# 注意（2026-09-06 桥接源码核实）：tool/call 记录只含
+# tool/argsKey/command/callId/step/sessionId——target/ok 仅存在于 tool/result
+# 与 watchdog reasoning 记录，活动气泡在 tool/call 同轮触发时拿不到，不得宣称。
+# label 同名双义：activity.*/approval.tool 的 label=工具中文标签（保证注入，
+# 不含会话标签）；approval.command/generic、question.*、rate_limit.*、failure.*
+# 的 label=会话标签（条件注入）。
 CONDITIONAL_PARAMETERS: dict[str, tuple[str, ...]] = {
-    key: ("callId", "step")
-    for key in ("activity.read", "activity.search", "activity.edit", "activity.run", "activity.default")
+    "activity.read": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "activity.search": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "activity.edit": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "activity.run": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "activity.default": ("command", "argsKey", "callId", "step", "sessionName", "projectName"),
+    "approval.command": ("toolName", "sessionName", "projectName", "label"),
+    "approval.tool": ("toolName", "sessionName", "projectName"),
+    "approval.generic": ("toolName", "sessionName", "projectName", "label"),
+    "question.empty": ("sessionName", "projectName", "label"),
+    "question.one": ("sessionName", "projectName", "label"),
+    "question.many": ("sessionName", "projectName", "label"),
+    "rate_limit.one": ("errorCode", "errorMessage", "consecutiveRetryCount", "retry",
+                       "sessionName", "projectName"),
+    "rate_limit.many": ("errorCode", "errorMessage", "consecutiveRetryCount", "retry",
+                        "sessionName", "projectName"),
+    "failure.retry": ("source", "errorCode", "errorMessage", "retries", "retryExhausted",
+                      "sessionName", "projectName"),
+    "failure.tool": ("source", "errorCode", "errorMessage", "retries", "retryExhausted",
+                     "sessionName", "projectName"),
+    "failure.generic": ("source", "errorCode", "errorMessage", "retries", "retryExhausted",
+                        "sessionName", "projectName"),
 }
 
 
@@ -180,8 +231,10 @@ EXPORT_GUIDE: dict[str, Any] = {
         "1. 改 phrases：每个 key 是一类事件的文案，值是候选文案数组；数组里每项一句，实际弹出时轮换使用。"
         "改成 [] 表示留空，该事件自动沿用原有模式台词。",
         "2. 文案里可用 {变量} 占位符，弹出时自动代入真实信息，例如 {name}（Agent 名称）、{command}（待审批命令）。"
-        "每种弹窗能代入的字段 = 它对应上游方法显式注入的参数，见各 entries 的 parameters（保证可用，占位符一定会被替换）；"
-        "upstream 是上游事件记录附带字段，审批/提问/限流/失败/工具类文案在事件触发时可读，其他场景不保证有值，依赖时请写好留空回退。",
+        "每种弹窗能代入的字段 = 它对应上游方法显式注入的参数，见各 entries 的 parameters："
+        "未标注的参数保证会被替换；标注「上游记录提供时可用」的条件参数，在上游未提供/为空/为 null 时会自动隐藏"
+        "（占位符不会原样露出，无需自己写回退）。"
+        "upstream 是上游事件记录附带字段，审批/提问/限流/失败/工具类文案在事件触发时可读，其他场景不保证有值。",
         "3. 想整体换风格：改 mode（legacy=原有模式 / whale_maid=鲸鱼娘女仆模式 / custom=自定义台词），"
         "并顺带改 name / description；导入后会自动切到「自定义台词」。",
         "4. 想精确改某一句：到 entries 按 key 找到同一项，参考 sources（什么事件触发）与 parameters（该项可用变量），"

@@ -95,30 +95,49 @@ def _safe_get_field(field_name: str, values: Mapping[str, Any]) -> Any:
     return current
 
 
-def render_template(template: str, values: Mapping[str, Any] | None = None) -> str:
+def render_template(template: str, values: Mapping[str, Any] | None = None, autohide=None) -> str:
     """Format templates using safe mapping/list traversal.
 
     Unknown or malformed placeholders remain verbatim so future upstream fields
     and existing custom phrases remain usable without exposing object attributes.
+
+    ``autohide``：条件字段根名集合。这些字段的值缺失/为 None/为空串，或上游
+    根本没提供时，占位符不原样保留而是整体隐藏（渲染为空串），并做最小
+    清理（折叠重复空格、去掉空 ``/（）/() 残壳）。
     """
     values = _template_values(values or {})
+    autohide = set(autohide or ())
     formatter = Formatter()
     output: list[str] = []
+    hid_any = False
     try:
         for literal, field_name, format_spec, conversion in formatter.parse(str(template)):
             output.append(literal)
             if field_name is None:
                 continue
+            root = re.split(r"[.\[]", field_name, 1)[0]
+            hide = root in autohide
             try:
                 obj = _safe_get_field(field_name, values)
+                if hide and (obj is None or obj == ""):
+                    hid_any = True
+                    continue
                 if conversion:
                     obj = formatter.convert_field(obj, conversion)
                 output.append(format(obj, format_spec))
             except (KeyError, IndexError, AttributeError, TypeError, ValueError):
+                if hide:
+                    hid_any = True
+                    continue
                 output.append("{" + field_name + ("!" + conversion if conversion else "") + (":" + format_spec if format_spec else "") + "}")
     except (ValueError, TypeError):
         return str(template)
-    return "".join(output)
+    text = "".join(output)
+    if hid_any:
+        text = text.replace("``", "").replace("（ ）", "").replace("（）", "").replace("( )", "").replace("()", "")
+        text = re.sub(r" {2,}", " ", text)
+        text = text.strip()
+    return text
 
 
 
@@ -180,7 +199,7 @@ class PhrasePicker:
     def __init__(self) -> None:
         self._last: dict[str, int] = defaultdict(lambda: -1)
 
-    def get(self, mode: str, key: str, fallback: str, **values) -> str:
+    def get(self, mode: str, key: str, fallback: str, autohide=None, **values) -> str:
         if str(mode or "legacy").lower() != "whale_maid":
             return fallback
         variants = _PHRASES.get(key)
@@ -192,11 +211,11 @@ class PhrasePicker:
         index = (last + 1) % len(variants)
         self._last[key] = index
         try:
-            return render_template(variants[index], values)
+            return render_template(variants[index], values, autohide=autohide)
         except (KeyError, ValueError):
             return fallback
 
-    def custom(self, custom_phrases: dict, key: str, fallback: str, **values) -> str:
+    def custom(self, custom_phrases: dict, key: str, fallback: str, autohide=None, **values) -> str:
         """Render a custom phrase, rotating through all configured variants."""
         if not isinstance(custom_phrases, dict):
             return fallback
@@ -210,7 +229,7 @@ class PhrasePicker:
         last = self._last[key]
         index = (last + 1) % len(variants)
         self._last[key] = index
-        return render_template(variants[index], values)
+        return render_template(variants[index], values, autohide=autohide)
 def phrase_keys() -> tuple[str, ...]:
     return tuple(sorted(_PHRASES))
 

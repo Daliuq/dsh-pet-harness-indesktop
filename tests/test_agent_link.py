@@ -1411,36 +1411,42 @@ class TestAgentLinkChainingAndActivity:
         mgr._on_agent_activity("dsh", "memory_search")
         assert "正在翻记忆" in bubbles[-1]
 
-    def test_activity_bubble_receives_target_from_tool_record(self, tmp_path):
-        """过程汇报气泡必须拿到上游 tool/call 的 target 等字段（显式注入，非隐式上下文）。
+    def test_activity_bubble_receives_tool_record_fields(self, tmp_path):
+        """过程汇报气泡必须拿到上游 tool/call 记录的字段（显式注入，非隐式上下文）。
 
-        上游重构后 target 曾只在 raw_record 里、从未传入表现层；现在监视器同轮
-        转发的工具记录被按 agent 缓存，_on_agent_activity 显式传给模板。"""
+        监视器同轮转发的工具记录被按 agent 缓存，_on_agent_activity 把
+        tool/label/command/argsKey/callId/step + 会话字段显式传给模板；
+        条件字段缺失时占位符自动隐藏（不原样露出 {target} 等死占位符）。"""
         mgr, win, bubbles, clock = self._make_mgr(
             tmp_path, agent_link_cfg={"notify_activity": True}
         )
         # 模拟监视器 _poll 的同轮顺序：先 raw_record（工具记录），再 activity 信号
+        # 字段以桥接真实写出的 tool/call 为准（tool/argsKey/command/callId/step）。
         mgr._remember_dialogue_record("dsh", {
-            "ts": 1, "event": "tool/call", "tool": "read", "target": "src/app.py",
-            "callId": "call-1", "step": 2, "ok": True,
+            "ts": 1, "event": "tool/call", "tool": "read", "command": "cat src/app.py",
+            "argsKey": "a1b2", "callId": "call-1", "step": 2,
+            "sessionId": "sess-1",
         })
         cfg = mgr.cfg
         cfg.data["dialogue_mode"] = "custom"
         cfg.data["dialogue_phrases"] = {
-            "activity.read": ["正在读取 {target}（第 {step} 步）"],
-            "activity.search": ["搜索目标：{target}"],
+            "activity.read": ["正在读取（{tool}，第 {step} 步，命令 {command}）"],
+            "activity.search": ["搜索（{tool}）argsKey={argsKey}"],
         }
         cfg.save()
         mgr._on_agent_activity("dsh", "read")
         assert bubbles, "气泡未弹出"
-        assert "src/app.py" in bubbles[-1]
         assert "第 2 步" in bubbles[-1]
+        assert "cat src/app.py" in bubbles[-1]
 
-        # 无 target 的工具记录（如 Claude hooks 只有 tool）：占位符保持原样，不注入空串
+        # 字段缺失的最小记录：条件占位符自动隐藏，不原样保留 {command}/{step}
         clock[0] += 15.0
-        mgr._remember_dialogue_record("dsh", {"ts": 2, "event": "tool/call", "tool": "read"})
+        mgr._remember_dialogue_record("dsh", {"ts": 2, "event": "tool/call", "tool": "grep"})
         mgr._on_agent_activity("dsh", "grep")
-        assert "{target}" in bubbles[-1]
+        assert "argsKey=a1b2" not in bubbles[-1]
+        assert "{command}" not in bubbles[-1]
+        assert "{step}" not in bubbles[-1]
+        assert "{argsKey}" not in bubbles[-1]
 
     def test_window_smooth_chaining(self, tmp_path):
         """4. window 侧平滑衔接（用真实 PetWindow + MovieLibrary，offscreen，参考 TestAgentMenuRebound 的构造）：

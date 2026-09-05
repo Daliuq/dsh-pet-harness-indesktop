@@ -215,9 +215,13 @@ def test_dialogue_key_params_match_runtime_call_sites():
     # 展示名必须覆盖全部宣称的参数（对话框 hint 渲染用 DIALOGUE_PARAMS[item]）
     advertised = {f for fields in PARAMETERS.values() for f in fields}
     assert advertised <= set(DIALOGUE_PARAMS), sorted(advertised - set(DIALOGUE_PARAMS))
-    # activity 组把上游 target 等字段送到表现层后的代表条目
-    assert "target" in DIALOGUE_KEY_PARAMS["activity.read"]
-    assert DIALOGUE_KEY_PARAMS["rate_limit.one"] == ("count",)
+    # activity 组字段以桥接 tool/call 真实记录为准：target/ok 不在 tool/call 里，
+    # 不得宣称（活动气泡渲染时拿不到，写了就是永不替换的占位符）
+    assert "callId" in DIALOGUE_KEY_PARAMS["activity.read"]
+    assert "target" not in DIALOGUE_KEY_PARAMS["activity.read"]
+    assert "ok" not in DIALOGUE_KEY_PARAMS["activity.read"]
+    assert {"errorCode", "errorMessage", "consecutiveRetryCount", "retry"} <= set(
+        DIALOGUE_KEY_PARAMS["rate_limit.one"])
     assert DIALOGUE_KEY_PARAMS["dsh.writeback.failed"] == ()
 
 

@@ -44,6 +44,7 @@ from .rate_limit_tracker import RateLimitTracker
 from .node_runtime import augmented_path as _augmented_path
 
 from .persona_phrases import PhrasePicker
+from .persona_template import CONDITIONAL_PARAMETERS
 from .speech_bubble import SECTION_HEADER_LABEL, SECTION_HINT_LABEL
 
 log = logging.getLogger("dsh-pet-standalone")
@@ -2103,10 +2104,34 @@ class AgentLinkManager(QObject):
         """Render an event with explicit aliases plus latest upstream fields."""
         merged = dict(self._dialogue_context)
         merged.update(values)
+        # 条件参数（CONDITIONAL_PARAMETERS）：上游未提供/为空/为 null 时渲染端
+        # 自动隐藏对应占位符，不原样露出 {xxx}。
+        autohide = CONDITIONAL_PARAMETERS.get(key, ())
         mode = str(self.cfg.get("dialogue_mode", "legacy") or "legacy")
         if mode == "custom":
-            return self._phrase_picker.custom(self.cfg.get("dialogue_phrases", {}), key, fallback, **merged)
-        return self._phrase_picker.get(mode, key, fallback, **merged)
+            return self._phrase_picker.custom(self.cfg.get("dialogue_phrases", {}), key, fallback,
+                                              autohide=autohide, **merged)
+        return self._phrase_picker.get(mode, key, fallback, autohide=autohide, **merged)
+
+    def _session_conditional(self, record: dict) -> dict[str, str]:
+        """从记录提取条件会话字段（缺失/为空不注入，渲染端自动隐藏占位符）。
+
+        返回 sessionName（会话显示名）/ projectName（项目名）/ label（会话标签）。
+        注意 label 同名双义：activity.*/approval.tool 的 label 是工具标签，
+        由调用点显式传入——那些调用点不要用本方法返回值覆盖 label。
+        """
+        record = record if isinstance(record, dict) else {}
+        vals: dict[str, str] = {}
+        for field in ("projectName", "label"):
+            value = str(record.get(field) or "").strip()
+            if value:
+                vals[field] = value
+        session_id = str(record.get("sessionId") or "").strip()
+        if session_id:
+            session_name = self.get_session_display_name(session_id)
+            if session_name and session_name.strip():
+                vals["sessionName"] = session_name.strip()
+        return vals
 
     def _thinking_text(self, agent_key: str) -> str:
         """thinking 气泡文案：按 Agent 自定义 > 旧全局自定义 > 按 Agent 默认。"""
@@ -2191,11 +2216,17 @@ class AgentLinkManager(QObject):
         # activity），按 agent 取最近一条工具记录，把 target/callId/step/ok 显式
         # 送进气泡；缺失的字段不传，占位符保持原样（不注入空串撑脏文案）。
         tool_record = self._last_tool_records.get(agent_key) or {}
-        values: dict[str, Any] = {"name": name, "tool": str(tool).strip(), "label": label}
-        for field in ("target", "callId", "step", "ok"):
+        # tool/call 记录字段：command/argsKey/callId/step + 会话字段（缺失不注入，
+        # 渲染端自动隐藏占位符）。target/ok 不在 tool/call 记录里，不读取。
+        # label 同名双义：activity 的 label=工具标签，须后写覆盖会话标签。
+        values: dict[str, Any] = dict(self._session_conditional(tool_record))
+        for field in ("command", "argsKey", "callId", "step"):
             value = tool_record.get(field)
             if value not in (None, ""):
                 values[field] = value
+        values["name"] = name
+        values["tool"] = str(tool).strip()
+        values["label"] = label
         text = self._dialogue(key, f"{name} {label}…", **values)
         self._show_link_bubble(text, important=False, duration_ms=2600)
 
@@ -2228,12 +2259,16 @@ class AgentLinkManager(QObject):
         session_id = str(payload.get("sessionId") or "")
         session_display = self.get_session_display_name(session_id) if session_id else ""
         prefix = f"{session_display} · " if session_display and session_display != f"DSH · {session_id[:8]}" else ""
+        # 条件会话字段 + 原始工具名（缺失不注入，渲染端自动隐藏占位符）
+        conditional = self._session_conditional(payload)
+        if tool:
+            conditional["toolName"] = tool
         if command:
             # 命令全文优先：折叠换行/空白成单行，超长截断加省略号（气泡是图片气泡）
             formatted = self._format_command(command)
             text = self._dialogue(
                 "approval.command", f"{prefix}{name} 请求执行：{formatted}，请选择：",
-                command=formatted, name=name,
+                command=formatted, name=name, **conditional,
             )
         else:
             tool_lower = tool.lower()
@@ -2241,14 +2276,16 @@ class AgentLinkManager(QObject):
             if label:
                 text = self._dialogue(
                     "approval.tool", f"{prefix}{name} 在请求审批：{label}，请选择：",
-                    label=label, name=name,
+                    label=label, name=name, **conditional,
                 )
             elif tool:
-                text = self._dialogue("approval.tool", f"{prefix}{name} 有审批等你决定（{tool}）：", label=tool, name=name)
+                text = self._dialogue("approval.tool", f"{prefix}{name} 有审批等你决定（{tool}）：",
+                                      label=tool, name=name, **conditional)
             else:
-                text = self._dialogue("approval.generic", f"{prefix}{name} 有审批等你决定：", name=name)
+                text = self._dialogue("approval.generic", f"{prefix}{name} 有审批等你决定：",
+                                      name=name, **conditional)
             if not label and not tool:
-                text = self._dialogue("approval.generic", text, name=name)
+                text = self._dialogue("approval.generic", text, name=name, **conditional)
         self._register_interaction(
             agent_key, kind="approval", text=text, tool=tool, command=command,
             interactive=bool(payload.get("rpcId")),
@@ -2310,8 +2347,10 @@ class AgentLinkManager(QObject):
         session_id = str(payload.get("sessionId") or "")
         session_display = self.get_session_display_name(session_id) if session_id else ""
         prefix = f"{session_display} · " if session_display and session_display != f"DSH · {session_id[:8]}" else ""
+        conditional = self._session_conditional(payload)
         self._register_interaction(
-            agent_key, kind="question", text=self._question_text(name, questions, prefix=prefix),
+            agent_key, kind="question", text=self._question_text(name, questions, prefix=prefix,
+                                                                 conditional=conditional),
             questions=questions,
             interactive=bool(payload.get("rpcId")) and self._questions_all_have_options(questions),
             rpc_id=payload.get("rpcId"),
@@ -2319,22 +2358,26 @@ class AgentLinkManager(QObject):
             session_id=session_id,
         )
 
-    def _question_text(self, name: str, questions: list, *, prefix: str = "") -> str:
+    def _question_text(self, name: str, questions: list, *, prefix: str = "",
+                       conditional: dict | None = None) -> str:
         """把 questions 载荷排版成气泡文案（单行紧凑）。
 
         泡泡是图片气泡：normalize_bubble_text 会把换行折叠成空格，且 sticky 只
         显示第一页——所以选项用「 / 」内联拼接而非强行多行，保证「永久选项弹窗」
         在小气泡里完整可见（交互模式下按钮本身也展示了选项）。"""
+        conditional = conditional or {}
         if not questions:
-            return self._dialogue("question.empty", f"{prefix}{name} 在等你回答一个问题，快去看一下～", name=name)
+            return self._dialogue("question.empty", f"{prefix}{name} 在等你回答一个问题，快去看一下～",
+                                  name=name, **conditional)
         if len(questions) > 1:
             if self._questions_all_have_options(questions):
-                return self._dialogue("question.many", f"{prefix}{name} 有 {len(questions)} 个问题等你回答，快去看一下～", count=len(questions), name=name)
+                return self._dialogue("question.many", f"{prefix}{name} 有 {len(questions)} 个问题等你回答，快去看一下～",
+                                      count=len(questions), name=name, **conditional)
             return self._dialogue(
                 "question.many",
                 f"{prefix}{name} 有 {len(questions)} 个问题等你回答"
                 "（含文本输入，请到 DSH 界面输入文本回答）～",
-                count=len(questions), name=name,
+                count=len(questions), name=name, **conditional,
             )
         q = questions[0]
         if not isinstance(q, dict):
@@ -2357,7 +2400,7 @@ class AgentLinkManager(QObject):
         return self._dialogue(
             "question.one",
             f"{name} 在问你：{body}，需要你输入，请到 DSH 界面输入文本回答～",
-            body=body, name=name,
+            body=body, name=name, **conditional,
         )
 
     def _interaction_key(self, agent_key: str, kind: str, rpc_id) -> str:
@@ -3218,15 +3261,26 @@ class AgentLinkManager(QObject):
             existing["count"] = max(existing_count, supplied_count) if supplied_count else existing_count + 1
             existing["_ts"] = now
             existing["_dismissed"] = False
+            self._remember_429_record_fields(existing, record)
             self._show_429_alert(session_key, existing["count"])
             return
-        cache[session_key] = {
+        entry = {
             "count": max(1, supplied_count),
             "_ts": now,
             "_first_ts": now,
             "_dismissed": False,
         }
-        self._show_429_alert(session_key, cache[session_key]["count"])
+        self._remember_429_record_fields(entry, record)
+        cache[session_key] = entry
+        self._show_429_alert(session_key, entry["count"])
+
+    def _remember_429_record_fields(self, entry: dict, record: dict) -> None:
+        """把限流记录的条件字段缓存进条目，供弹窗模板条件注入（缺失自动隐藏）。"""
+        record = record if isinstance(record, dict) else {}
+        for field in ("errorCode", "errorMessage", "consecutiveRetryCount", "retry"):
+            value = record.get(field)
+            if value not in (None, ""):
+                entry[field] = value
 
     def _show_429_alert(self, session_key: str, count: int) -> None:
         """展示 429 提醒弹窗，高优先级，带「知道了」按钮，15 秒自动收起。"""
@@ -3236,7 +3290,16 @@ class AgentLinkManager(QObject):
             f"DSH 请求受限（429），已连续限流 {count} 次；请稍后重试。"
         )
         key = "rate_limit.many" if count > 1 else "rate_limit.one"
-        text = self._dialogue(key, fallback, count=count)
+        entry = self._429_cache.get(session_key) or {}
+        conditional: dict[str, Any] = {}
+        for field in ("errorCode", "errorMessage", "consecutiveRetryCount", "retry"):
+            value = entry.get(field)
+            if value not in (None, ""):
+                conditional[field] = value
+        session_name = self.get_session_display_name(session_key)
+        if session_name and session_name.strip():
+            conditional["sessionName"] = session_name.strip()
+        text = self._dialogue(key, fallback, count=count, **conditional)
         # PhrasePicker's built-in persona text is intentionally allowed to use
         # different wording; only an unavailable/empty renderer falls back.
         if not str(text or '').strip():
@@ -3662,12 +3725,19 @@ class AgentLinkManager(QObject):
             self.win.request_link_anim(anim)
         source = str(payload.get("source") or "").strip()
         retry_exhausted = bool(payload.get("retryExhausted"))
+        # execution/failed 记录条件字段（缺失不注入，渲染端自动隐藏占位符）
+        conditional: dict[str, Any] = {}
+        for field in ("source", "errorCode", "errorMessage", "retries", "retryExhausted"):
+            value = payload.get(field)
+            if value not in (None, ""):
+                conditional[field] = value
+        conditional.update(self._session_conditional(payload))
         if retry_exhausted:
-            text = self._dialogue("failure.retry", f"{name} 本轮运行失败——模型请求多次重试后仍未成功，需要检查或重新运行", name=name)
+            text = self._dialogue("failure.retry", f"{name} 本轮运行失败——模型请求多次重试后仍未成功，需要检查或重新运行", name=name, **conditional)
         elif source == "tool":
-            text = self._dialogue("failure.tool", f"{name} 本轮运行失败——工具执行最终失败，需要检查或重新运行", name=name)
+            text = self._dialogue("failure.tool", f"{name} 本轮运行失败——工具执行最终失败，需要检查或重新运行", name=name, **conditional)
         else:
-            text = self._dialogue("failure.generic", f"{name} 本轮运行失败，需要检查或重新运行", name=name)
+            text = self._dialogue("failure.generic", f"{name} 本轮运行失败，需要检查或重新运行", name=name, **conditional)
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(text, duration_ms=self._FAIL_REMINDER_MS, sticky=False)
         elif hasattr(self.win, "show_bubble"):

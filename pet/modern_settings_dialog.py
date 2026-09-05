@@ -114,11 +114,17 @@ DIALOGUE_LABELS = {
 }
 
 DIALOGUE_PARAMS = {
-    "name": "Agent 名称", "command": "待审批命令", "label": "工具标签",
+    "name": "Agent 名称", "command": "命令文本", "label": "标签（工具标签/会话标签随事件而定）",
     "body": "问题内容", "count": "数量", "reasons": "判断原因",
     "detail": "错误详情", "text": "显示文本",
-    "tool": "原始工具名", "target": "操作目标", "callId": "工具调用 ID",
-    "step": "步骤序号", "ok": "是否成功",
+    "tool": "原始工具名", "callId": "工具调用 ID",
+    "step": "步骤序号",
+    "toolName": "审批原始工具名", "argsKey": "工具参数摘要键",
+    "sessionName": "会话显示名", "projectName": "项目名",
+    "errorCode": "错误码", "errorMessage": "错误信息原文",
+    "consecutiveRetryCount": "连续限流次数", "retry": "重试序号",
+    "retries": "已重试次数", "retryExhausted": "是否重试耗尽",
+    "source": "失败来源",
 }
 
 # 与 persona_template.PARAMETERS 保持同一真相源：调用点注入什么，这里就宣称什么。

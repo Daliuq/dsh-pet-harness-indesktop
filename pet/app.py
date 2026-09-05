@@ -82,9 +82,12 @@ def _persona_text(win, key: str, fallback: str, **values) -> str:
     if cfg is None:
         return fallback
     mode = str(cfg.get("dialogue_mode", "legacy") or "legacy")
+    from .persona_template import CONDITIONAL_PARAMETERS
+    autohide = CONDITIONAL_PARAMETERS.get(key, ())
     if mode == "custom":
-        return _PERSONA_PICKER.custom(cfg.get("dialogue_phrases", {}), key, fallback, **values)
-    return _PERSONA_PICKER.get(mode, key, fallback, **values)
+        return _PERSONA_PICKER.custom(cfg.get("dialogue_phrases", {}), key, fallback,
+                                      autohide=autohide, **values)
+    return _PERSONA_PICKER.get(mode, key, fallback, autohide=autohide, **values)
 
 
 def _show_balance_payload(win, payload) -> None:

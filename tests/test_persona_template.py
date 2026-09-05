@@ -38,11 +38,13 @@ def test_all_advertised_fields_reach_presentation_layer():
     from pathlib import Path
 
     from pet.persona_template import (
-        DISPLAY_HINTS, EVENT_SOURCES, PARAMETERS, UPSTREAM_FIELDS, VARIABLES,
+        CONDITIONAL_PARAMETERS, DISPLAY_HINTS, EVENT_SOURCES, PARAMETERS,
+        UPSTREAM_FIELDS, VARIABLES,
     )
 
     root = Path(__file__).resolve().parent.parent
     delivered = {}
+    expansion_keys = set()
     dynamic = []
     for fname in ("agent_link.py", "app.py"):
         tree = ast.parse((root / "pet" / fname).read_text(encoding="utf-8"))
@@ -57,24 +59,30 @@ def test_all_advertised_fields_reach_presentation_layer():
             has_expansion = any(kw.arg is None for kw in node.keywords)
             if isinstance(key_arg, ast.Constant) and isinstance(key_arg.value, str):
                 delivered.setdefault(key_arg.value, set()).update(kws)
+                if has_expansion:
+                    expansion_keys.add(key_arg.value)
             else:
                 dynamic.append((has_expansion, frozenset(kws)))
 
-    # 动态 key 调用点：activity（**values 展开）/ pattern（name, reasons）/ rate_limit（count）
-    assert (True, frozenset()) in dynamic, "activity 调用点应显式传 values 字典（含 tool/target 等）"
+    # 动态 key 调用点：activity（**values 展开）/ pattern（name, reasons）/ rate_limit（count + **conditional 展开）
+    assert (True, frozenset()) in dynamic, "activity 调用点应显式传 values 字典（含 tool/command 等）"
     assert (False, frozenset({"name", "reasons"})) in dynamic, "pattern 动态调用点缺失"
-    assert (False, frozenset({"count"})) in dynamic, "rate_limit 动态调用点缺失"
+    assert (False, frozenset({"count"})) in dynamic or (True, frozenset({"count"})) in dynamic, \
+        "rate_limit 动态调用点缺失（count + **conditional 展开）"
     # activity 调用点会读记录里的 target/ok 并按需注入，但桥接写出的 tool/call
     # 记录从不含这两个字段（只在 tool/result / watchdog reasoning）——活动气泡
     # 渲染时填充物是 tool/call，因此模板不宣称（写了就是永不替换的占位符）。
-    activity_fields = ("name", "tool", "label", "target", "callId", "step", "ok")
+    activity_fields = ("name", "tool", "label", "command", "argsKey", "callId", "step",
+                       "sessionName", "projectName")
     activity_unadvertised = {"target", "ok"}
+    # rate_limit 的 key 是变量：dynamic_delivered 需包含 count + 条件参数
+    rate_limit_fields = {"count"} | set(CONDITIONAL_PARAMETERS["rate_limit.one"])
     dynamic_delivered = {
         "activity.read": set(activity_fields), "activity.search": set(activity_fields),
         "activity.edit": set(activity_fields), "activity.run": set(activity_fields),
         "activity.default": set(activity_fields),
         "pattern.warning": {"name", "reasons"}, "pattern.control": {"name", "reasons"},
-        "rate_limit.one": {"count"}, "rate_limit.many": {"count"},
+        "rate_limit.one": set(rate_limit_fields), "rate_limit.many": set(rate_limit_fields),
     }
 
     data = build_persona_template(None)
@@ -83,7 +91,10 @@ def test_all_advertised_fields_reach_presentation_layer():
     # variables/upstream 结构 sanity：cordis 等死字段不得回流
     assert set(VARIABLES) == {
         "name", "command", "label", "body", "count", "reasons", "detail", "text",
-        "tool", "callId", "step",
+        "tool", "toolName", "argsKey", "callId", "step",
+        "sessionName", "projectName",
+        "errorCode", "errorMessage", "consecutiveRetryCount", "retry",
+        "retries", "retryExhausted",
     }
     assert "cordis" not in data["upstream"]["fields"]
     assert "sessionName" not in UPSTREAM_FIELDS["base"], "桥接从不写出 sessionName"
@@ -99,31 +110,50 @@ def test_all_advertised_fields_reach_presentation_layer():
     assert entries["start"]["parameters"] == ["name"]
     assert entries["agent.error"]["parameters"] == ["name"]
     assert entries["llm_error.api"]["parameters"] == []
-    assert entries["rate_limit.one"]["parameters"] == ["count"]
-    assert entries["approval.command"]["parameters"] == ["name", "command"]
+    assert {"count", "errorCode", "errorMessage", "consecutiveRetryCount", "retry",
+            "sessionName", "projectName"} == set(
+        entries["rate_limit.one"]["parameters"])
+    assert set(entries["approval.command"]["parameters"]) == {
+        "name", "command", "toolName", "sessionName", "projectName", "label"}
 
-    # ── 核心保证：模板宣称参数 == 调用点实际注入（双向相等）──
-    # activity 的 target/ok 属「注入但不宣称」：记录里永不出现，宣称即谎言。
+    # ── 核心保证：模板宣称参数与调用点注入对齐 ──
+    # 参数分两类：保证参数必须以命名 kwargs 出现（少宣称=已注入却不告知，
+    # 多宣称=占位符原样露出的谎言）；条件参数经 **conditional 展开注入
+    #（AST 只能看到展开标记），其集合由 CONDITIONAL_PARAMETERS 声明并保证
+    # 非空展开调用点都合法。
     for key in phrase_keys():
-        actual = delivered.get(key, set()) | dynamic_delivered.get(key, set())
+        actual = set(delivered.get(key, set())) | set(dynamic_delivered.get(key, set()))
         if key.startswith("activity."):
-            actual = actual - activity_unadvertised
-        assert set(PARAMETERS[key]) == actual, (
-            key + ": 模板宣称 " + str(sorted(PARAMETERS[key]))
-            + " != 运行时注入 " + str(sorted(actual))
-        )
+            actual -= activity_unadvertised
+        conditional = set(CONDITIONAL_PARAMETERS.get(key, ()))
+        expected_guaranteed = set(PARAMETERS[key]) - conditional
+        if key in expansion_keys:
+            assert expected_guaranteed <= actual, (
+                key + ": 保证参数未以命名 kwargs 注入 " + str(sorted(expected_guaranteed - actual)))
+            assert actual - conditional <= expected_guaranteed, (
+                key + ": 注入了未宣称的字段 " + str(sorted(actual - conditional - expected_guaranteed)))
+        else:
+            assert set(PARAMETERS[key]) == actual, (
+                key + ": 模板宣称 " + str(sorted(PARAMETERS[key]))
+                + " != 运行时注入 " + str(sorted(actual)))
 
     # activity 不得残留从未传入的死字段；宣称的字段必须全部真的注入
-    advertised_activity = {"name", "tool", "label", "callId", "step"}
+    advertised_activity = {"name", "tool", "label", "command", "argsKey", "callId",
+                           "step", "sessionName", "projectName"}
     assert advertised_activity <= set(entries["activity.read"]["parameters"])
-    for dead in ("arguments", "argsKey", "command", "toolName", "riskScore", "pluginId",
-                 "sessionName", "target", "ok"):
+    for dead in ("toolName", "riskScore", "pluginId", "sessionLabel", "target", "ok"):
         assert dead not in entries["activity.read"]["parameters"]
 
+    # 条件参数声明非空校验：所有带 **conditional 展开的 key 必须声明条件参数
+    for key in expansion_keys:
+        assert set(CONDITIONAL_PARAMETERS.get(key, ())), (
+            key + " 使用了 **conditional 展开，但 CONDITIONAL_PARAMETERS 未声明")
+
     # 审批/提问/限流/余额：与调用点一致
-    assert set(entries["approval.command"]["parameters"]) >= {"name", "command"}
-    assert set(entries["question.one"]["parameters"]) >= {"name", "body"}
-    assert "count" in entries["rate_limit.one"]["parameters"]
+    assert set(entries["approval.command"]["parameters"]) >= {"name", "command", "toolName",
+                                                             "sessionName", "projectName", "label"}
+    assert set(entries["question.one"]["parameters"]) >= {"name", "body", "sessionName"}
+    assert {"count", "errorCode", "errorMessage"} <= set(entries["rate_limit.one"]["parameters"])
     assert entries["balance.result"]["parameters"] == ["text"]
 
     # balance.loading/balance.result 真实渲染（pet/app.py），必须可导出；死键不得回流

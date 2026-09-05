@@ -14,6 +14,14 @@
 > 注入的 kwargs 严格相等**；上下文记录字段只在顶层 `upstream` 一节做文档说明，不混入
 > per-key 宣称。`EVENT_FIELDS` 组字段表已删除。原 v1 测试名已由 AST 双向校验的
 > `test_all_advertised_fields_reach_presentation_layer` 取代。
+>
+> **v3 修订（以桥接源码为唯一真相）**：v2 之后进一步核实（2026-09-06），宣称还必须
+> 过「填充物」这一关——活动气泡渲染时缓存的记录是 `tool/call`，而桥接写出的
+> `tool/call` 只含 `tool/argsKey/command/callId/step/sessionId`，**不含 `target/ok`**
+> （它们只在 `tool/result` 与 watchdog reasoning 记录里）。据此撤掉 activity.* 的
+> `{target}/{ok}` 宣称；`UPSTREAM_FIELDS` 改为按事件族逐项列出桥接真实字段
+> （approval/request 无 `requestId/callId/outcome`，question/requested 无
+> `questionRpcId`，base 无 `source/agentName`）。
 
 ## 一、渲染链路与“参数”的两个层级
 

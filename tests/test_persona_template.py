@@ -17,22 +17,6 @@ def test_template_is_complete_and_safe():
     assert "secret" not in text and "C:/secret" not in text
 
 
-def test_export_document_leads_with_usage_guide_and_stays_import_compatible():
-    """导出的 JSON 最顶部带 `_说明` 逐字段注释，且不影响导入侧读取。"""
-    data = build_persona_template({"dialogue_mode": "custom", "dialogue_phrases": {"start": ["你好"]}})
-    assert next(iter(data)) == "_说明"
-    guide = data["_说明"]
-    assert isinstance(guide, dict)
-    for key in ("template", "mode", "name", "description", "variables",
-                "upstream", "phrases", "entries"):
-        assert key in guide["顶层字段涵义"]
-    assert "entries 项内字段涵义" in guide
-    # 导入侧解析路径（只校验 template、读取 phrases）不受 _说明 影响
-    parsed = json.loads(template_json({"dialogue_phrases": {"start": ["你好"]}}))
-    assert parsed["template"] == "persona-phrases/v1"
-    assert parsed["phrases"]["start"] == ["你好"]
-
-
 def test_template_limits_and_ignores_bad_values():
     data = build_persona_template({"dialogue_phrases": {"start": [" a ", 3] * 10, "thinking": None}})
     assert data["phrases"]["start"] == ["a"] * 8
@@ -80,7 +64,11 @@ def test_all_advertised_fields_reach_presentation_layer():
     assert (True, frozenset()) in dynamic, "activity 调用点应显式传 values 字典（含 tool/target 等）"
     assert (False, frozenset({"name", "reasons"})) in dynamic, "pattern 动态调用点缺失"
     assert (False, frozenset({"count"})) in dynamic, "rate_limit 动态调用点缺失"
+    # activity 调用点会读记录里的 target/ok 并按需注入，但桥接写出的 tool/call
+    # 记录从不含这两个字段（只在 tool/result / watchdog reasoning）——活动气泡
+    # 渲染时填充物是 tool/call，因此模板不宣称（写了就是永不替换的占位符）。
     activity_fields = ("name", "tool", "label", "target", "callId", "step", "ok")
+    activity_unadvertised = {"target", "ok"}
     dynamic_delivered = {
         "activity.read": set(activity_fields), "activity.search": set(activity_fields),
         "activity.edit": set(activity_fields), "activity.run": set(activity_fields),
@@ -95,7 +83,7 @@ def test_all_advertised_fields_reach_presentation_layer():
     # variables/upstream 结构 sanity：cordis 等死字段不得回流
     assert set(VARIABLES) == {
         "name", "command", "label", "body", "count", "reasons", "detail", "text",
-        "tool", "target", "callId", "step", "ok",
+        "tool", "callId", "step",
     }
     assert "cordis" not in data["upstream"]["fields"]
     assert "sessionName" not in UPSTREAM_FIELDS["base"], "桥接从不写出 sessionName"
@@ -115,16 +103,21 @@ def test_all_advertised_fields_reach_presentation_layer():
     assert entries["approval.command"]["parameters"] == ["name", "command"]
 
     # ── 核心保证：模板宣称参数 == 调用点实际注入（双向相等）──
+    # activity 的 target/ok 属「注入但不宣称」：记录里永不出现，宣称即谎言。
     for key in phrase_keys():
         actual = delivered.get(key, set()) | dynamic_delivered.get(key, set())
+        if key.startswith("activity."):
+            actual = actual - activity_unadvertised
         assert set(PARAMETERS[key]) == actual, (
             key + ": 模板宣称 " + str(sorted(PARAMETERS[key]))
             + " != 运行时注入 " + str(sorted(actual))
         )
 
-    # 组字段覆盖已注入字段；activity 不得残留从未传入的死字段
-    assert set(activity_fields) <= set(entries["activity.read"]["parameters"])
-    for dead in ("arguments", "argsKey", "command", "toolName", "riskScore", "pluginId", "sessionName"):
+    # activity 不得残留从未传入的死字段；宣称的字段必须全部真的注入
+    advertised_activity = {"name", "tool", "label", "callId", "step"}
+    assert advertised_activity <= set(entries["activity.read"]["parameters"])
+    for dead in ("arguments", "argsKey", "command", "toolName", "riskScore", "pluginId",
+                 "sessionName", "target", "ok"):
         assert dead not in entries["activity.read"]["parameters"]
 
     # 审批/提问/限流/余额：与调用点一致

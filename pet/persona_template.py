@@ -22,34 +22,39 @@ VARIABLES = {
     "detail": "桥接安装失败详情（bridge.install.failed）",
     "text": "余额查询结果文本（balance.result）",
     "tool": "原始工具名（activity.*）",
-    "target": "操作目标：文件路径/URL/命令（activity.*；上游记录未提供时占位符原样保留）",
-    "callId": "工具调用 ID（activity.*；同上）",
-    "step": "turn 内步骤序号（activity.*；同上）",
-    "ok": "工具是否成功（activity.*；同上）",
+    "callId": "工具调用 ID（activity.*；上游记录提供时可用）",
+    "step": "turn 内步骤序号（activity.*；上游记录提供时可用）",
 }
 
-# 上游记录字段（raw_record 携带、模板可透读）：审批/提问/限流/失败类文案
-# 在收到对应事件的同一轮触发，此时这些字段可靠；工具类文案的 tool/target/
-# callId/step/ok 已由调用点显式注入（保证可用）。状态机与本地检测器触发的
-# 文案（start/thinking/agent.*/done.* 等）不保证拿到最新记录，勿依赖。
-# 基础字段：ts/agent/event/source 为桥接 writeRecord 固定写入；projectName/label/
-# agentName 由 session/meta 补充；agent_key 由 Pet 侧 _remember_dialogue_record 注入。
-# sessionName 桥接从不写出，不得宣称。
-BASE_FIELDS = ("ts", "agent", "agent_key", "agentName", "event", "source", "sessionId", "projectName", "label")
+# 上游记录字段——以桥接插件源码（integrations/dsh-pet-bridge/index.js）逐事件
+# writeRecord/writeRecordDedup 实际写出的字段为准（2026-09-06 核实）：
+#   公共: ts/agent/event 恒有；sessionId 存在时补 projectName/label（session/meta）
+#   Pet 侧注入: agent_key（_remember_dialogue_record）
+#   tool/call: tool/argsKey/command/callId/step/sessionId —— 无 target/ok（在 tool/result）
+#   approval/request: rpcId/approvalId/toolName/command/sessionId —— 无 requestId/callId/outcome
+#   question/requested: rpcId(mux)/callId/sessionId/questions —— 无 questionRpcId（在 resolved）
+#   execution/failed: source/errorCode/errorMessage/retries/retryExhausted
+# 审批/提问/限流/失败/工具类文案与记录同轮触发，这些字段可靠；状态机与本地
+# 检测触发的文案（start/thinking/agent.*/done.* 等）不保证拿到记录，勿依赖。
+BASE_FIELDS = ("ts", "agent", "agent_key", "event", "sessionId", "projectName", "label")
 UPSTREAM_FIELDS = {
     "base": BASE_FIELDS,
-    "tool": ("tool", "target", "callId", "ok", "step"),
-    "approval": ("rpcId", "approvalId", "requestId", "callId", "toolName", "command", "sessionId", "outcome"),
-    "question": ("rpcId", "questionRpcId", "callId", "sessionId", "questions"),
-    "error": ("errorCode", "errorMessage", "errorText", "retryExhausted", "retries", "source"),
-    "rate_limit": ("errorCode", "errorMessage", "sessionId"),
+    "tool/call": ("tool", "argsKey", "command", "callId", "step"),
+    "tool/result": ("tool", "command", "callId", "ok", "timeout", "errorCode", "errorText", "resultSummary", "durationMs"),
+    "approval/request": ("rpcId", "approvalId", "toolName", "command", "sessionId"),
+    "approval/resolved": ("rpcId", "approvalId", "outcome", "sessionId"),
+    "question/requested": ("rpcId", "callId", "sessionId", "questions"),
+    "question/resolved": ("rpcId", "callId", "sessionId"),
+    "rate_limit": ("errorCode", "errorMessage", "consecutiveRetryCount", "retry", "sessionId"),
+    "llm_error": ("errorCode", "errorMessage", "retry"),
+    "execution/failed": ("source", "errorCode", "errorMessage", "retries", "retryExhausted"),
 }
 DISPLAY_HINTS = {
-    "activity.default": "{name} 正在处理 {tool}（目标 {target}）。",
-    "activity.edit": "{name} 正在编辑 {target}。",
-    "activity.read": "{name} 正在读取 {target}。",
-    "activity.run": "{name} 正在运行 {target}。",
-    "activity.search": "{name} 正在搜索 {target}。",
+    "activity.default": "{name} 正在处理 {tool}。",
+    "activity.edit": "{name} 正在编辑（{tool}）。",
+    "activity.read": "{name} 正在读取（{tool}）。",
+    "activity.run": "{name} 正在运行（{tool}）。",
+    "activity.search": "{name} 正在搜索（{tool}）。",
     "agent.attention": "{name} 需要你看一眼。",
     "agent.error": "{name} 好像出错了，主人帮忙看一下吧。",
     "agent.missing": "暂时没有检测到本机安装 {name}。",
@@ -127,11 +132,11 @@ EVENT_SOURCES = {
 # 不混入 per-key 宣称；改调用点 kwargs 时必须同步改这里（有 AST 回归测试）。
 PARAMETERS: dict[str, tuple[str, ...]] = {
     "start": ("name",), "thinking": ("name",),
-    "activity.read": ("name", "tool", "label", "target", "callId", "step", "ok"),
-    "activity.search": ("name", "tool", "label", "target", "callId", "step", "ok"),
-    "activity.edit": ("name", "tool", "label", "target", "callId", "step", "ok"),
-    "activity.run": ("name", "tool", "label", "target", "callId", "step", "ok"),
-    "activity.default": ("name", "tool", "label", "target", "callId", "step", "ok"),
+    "activity.read": ("name", "tool", "label", "callId", "step"),
+    "activity.search": ("name", "tool", "label", "callId", "step"),
+    "activity.edit": ("name", "tool", "label", "callId", "step"),
+    "activity.run": ("name", "tool", "label", "callId", "step"),
+    "activity.default": ("name", "tool", "label", "callId", "step"),
     "agent.attention": ("name",), "agent.error": ("name",),
     "agent.missing": ("name",), "bridge.install.pending": ("name",),
     "bridge.install.success": ("name",), "bridge.install.failed": ("name", "detail"),
@@ -154,8 +159,11 @@ PARAMETERS: dict[str, tuple[str, ...]] = {
 # 条件可用参数：调用点仅在上游记录提供该字段时才注入（缺失时占位符原样保留）。
 # 仍属于「上游方法能获取到的字段」（保留在 entries.parameters 中），但与保证
 # 注入的参数不同——设置页提示与导出文档据此区分表述。
+# 注意：tool/call 记录只含 tool/argsKey/command/callId/step/sessionId——
+# target/ok 仅存在于 tool/result 与 watchdog reasoning 记录，活动气泡在
+# tool/call 同轮触发时拿不到，因此不得宣称（2026-09-06 桥接源码核实）。
 CONDITIONAL_PARAMETERS: dict[str, tuple[str, ...]] = {
-    key: ("target", "callId", "step", "ok")
+    key: ("callId", "step")
     for key in ("activity.read", "activity.search", "activity.edit", "activity.run", "activity.default")
 }
 

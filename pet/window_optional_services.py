@@ -111,7 +111,7 @@ class WindowFeatureGateMixin:
     def _effects_paint_end(self, painter, rect) -> None:
         angle = self._effects_current_angle()
         if abs(angle) > 1e-6:
-            end_rotation(painter, rect, angle)
+            end_rotation(painter, angle)
 
     def _effects_untransform(self, point, rect):
         """命中测试逆变换：把窗口逻辑点映射回未旋转坐标系。"""

@@ -214,6 +214,36 @@ def get_config_path_for_slot(config_dir: Path | str, slot_id: int) -> Path:
     return config_path / "config.json" if slot_id == 0 else config_path / f"config-slot-{slot_id}.json"
 
 
+# 新 slot 落种时剔除的每窗状态键（位置/朝向不继承，其余设置跟随主配置）
+_SEED_EXCLUDE_KEYS = ("rx", "ry", "screen_name", "facing")
+
+
+def seed_slot_config_from_main(config_dir: Path | str, slot_id: int) -> bool:
+    """新 slot 的初始配置跟随主设置：slot 配置文件不存在时，用主 config.json
+    落种一份（剔除每窗状态键）。已有存档的 slot（用户改过的）一律不动。
+
+    用户反馈：多开出的新桌宠从零默认设置起步不合理，应跟随主设置。
+    返回 True 表示落了种。"""
+    if not slot_id:
+        return False
+    slot_path = get_config_path_for_slot(config_dir, slot_id)
+    if slot_path.exists():
+        return False  # 已有存档，不动
+    main_path = Path(config_dir) / "config.json"
+    try:
+        data = json.loads(main_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    for key in _SEED_EXCLUDE_KEYS:
+        data.pop(key, None)
+    try:
+        slot_path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def get_sessions_dir_for_slot(config_dir: Path | str, slot_id: int) -> Path:
     """获取槽位对应的会话目录。"""
     config_path = Path(config_dir)
@@ -427,3 +457,139 @@ def migrate_legacy_spawns(config_dir: Path | str) -> bool:
             pass
 
     return success_all
+
+
+def pid_alive(pid: int) -> bool:
+    """跨平台探活：Windows 用 OpenProcess，其余用 kill(pid, 0)。"""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        # PROCESS_QUERY_LIMITED_INFORMATION
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+# --- 批5.2 R4：runtime 标记格式版本化（多窗每窗一份，旧 glob 不匹配）--------
+# 旧版（runtime-<pid>.json）用 glob('runtime-*.json') 读取；为避免新旧混跑时
+# 旧版把新版标记也计入「存活实例」而虚高计数（多开位置避让被干扰），新版标记
+# 改用不与 'runtime-*.json' 匹配的 pet-runtime-v2-<pid>-slot-<N>.json 前缀。
+_RUNTIME_V2_PREFIX = "pet-runtime-v2-"
+
+
+def _slot_label(instance_id: str) -> str:
+    """从 instance_id 提取 slot 标签（用于 runtime 标记文件名）。"""
+    s = str(instance_id or "").strip()
+    if not s or s == "slot-0":
+        return "0"
+    if s.startswith("slot-"):
+        return s[len("slot-"):] or "0"
+    return re.sub(r"[^A-Za-z0-9_-]", "_", s) or "0"
+
+
+def runtime_marker_name(instance_id: str = "", *, versioned: bool = False) -> str:
+    """返回某窗 runtime 标记文件名。versioned=False 用旧名
+    runtime-<pid>.json（单窗/flag 关时保持旧行为）；True 用版本化新名
+    pet-runtime-v2-<pid>-slot-<N>.json（批5.2 多窗，规避旧 glob 匹配）。"""
+    pid = os.getpid()
+    if versioned:
+        return f"{_RUNTIME_V2_PREFIX}{pid}-slot-{_slot_label(instance_id)}.json"
+    return f"runtime-{pid}.json"
+
+
+def runtime_marker_path(config_dir: Path | str, instance_id: str = "",
+                        *, versioned: bool = False) -> Path:
+    """返回某窗 runtime 标记的完整路径。"""
+    return Path(config_dir) / runtime_marker_name(instance_id, versioned=versioned)
+
+
+def write_runtime_marker(config_dir: Path | str, instance_id: str,
+                         x: int, y: int, w: int, h: int,
+                         *, versioned: bool = False) -> Path:
+    """写入本窗 runtime 标记（旧格式仅主窗/pflag 关时用；versioned 多窗用）。
+
+    写版本化标记时顺手清掉同 pid 的旧格式标记，避免同进程混用重复计数。
+    """
+    path = runtime_marker_path(config_dir, instance_id, versioned=versioned)
+    try:
+        if versioned:
+            legacy = Path(config_dir) / f"runtime-{os.getpid()}.json"
+            try:
+                if legacy.exists():
+                    legacy.unlink()
+            except OSError:
+                pass
+        path.write_text(json.dumps({
+            'pid': os.getpid(),
+            'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
+        }), encoding='utf-8')
+    except OSError:
+        pass
+    return path
+
+
+def delete_runtime_marker(config_dir: Path | str, instance_id: str = "",
+                          *, versioned: bool = True) -> None:
+    """删除本窗 runtime 标记（「退出这只」必须显式删，否则活 pid 的陈旧
+    标记永久虚增计数/避让错乱）。新旧两种命名都尝试删（跨格式迁移兜底）。"""
+    for ver in (bool(versioned), not bool(versioned)):
+        try:
+            path = runtime_marker_path(config_dir, instance_id, versioned=ver)
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def read_live_instances(
+    config_dir: Path | str,
+    *,
+    exclude_pid: int | None = None,
+    exclude_markers=None,
+    pid_alive_fn=None,
+) -> list[tuple[int, int, int, int, int]]:
+    """读取目录内 runtime 标记，返回存活实例 (pid, x, y, w, h) 列表。
+
+    同时认旧（runtime-<pid>.json）与批5.2 新（pet-runtime-v2-*）两种命名
+    （避让定位兼容新旧混跑）。死进程 pid、损坏 JSON、字段非法的标记顺手
+    删除（避免越积越多）；exclude_markers（本窗自己的标记路径/文件名）跳过
+    且保留——批5.2 多窗同 pid 下不能再用 exclude_pid 这种按 pid 过滤的
+    方式（会把同进程所有窗都排除）。pid_alive_fn 可注入（测试用）。
+    """
+    alive = pid_alive_fn if pid_alive_fn is not None else pid_alive
+    try:
+        exclude_names = {Path(m).name for m in (exclude_markers or ())}
+    except (TypeError, OSError):
+        exclude_names = set()
+    instances: list[tuple[int, int, int, int, int]] = []
+    try:
+        files = list(Path(config_dir).glob('runtime-*.json'))
+        files.extend(Path(config_dir).glob(f'{_RUNTIME_V2_PREFIX}*.json'))
+    except OSError:
+        return instances
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding='utf-8'))
+            pid = int(data.get('pid', 0))
+            if exclude_pid is not None and pid == exclude_pid:
+                continue
+            if f.name in exclude_names:
+                continue
+            if not alive(pid):
+                raise OSError('stale marker')
+            x, y, w, h = (int(data.get(k, 0)) for k in ('x', 'y', 'w', 'h'))
+            instances.append((pid, x, y, w, h))
+        except (OSError, ValueError, TypeError):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    return instances

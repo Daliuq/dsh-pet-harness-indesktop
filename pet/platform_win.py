@@ -119,6 +119,10 @@ _FS_SKIP_CLASSES = {
     'Windows.UI.Core.CoreWindow',  # 开始菜单/通知中心全屏层
 }
 
+# 已知覆盖层工具进程（截图/取色工具的全屏监听层不是"全屏应用"）：
+# 实测 PixPin（pixpin.exe）打字时热键监听闪现全屏覆盖层曾致桌宠误隐藏频闪
+_FS_SKIP_PROCS = {'pixpin.exe', 'snipaste.exe'}
+
 
 def _fullscreen_geometry_hit(l: float, t: float, r: float, b: float,
                              geom, has_caption: bool, topmost: bool = False) -> bool:
@@ -168,9 +172,10 @@ def _fg_fullscreen_probe() -> tuple[bool, str]:
     可在任意线程调用——不触碰 Qt 对象。判定链：
     1. foreground_window_info()（vision.py）：排除不可见/最小化/cloaked
        窗口，取 DWM 框架边界（物理像素，与本进程 DPI awareness 一致）；
-    2. 排除本进程与 shell 窗口；
-    3. 几何判定：窗口覆盖所在显示器完整几何（含任务栏），且无标题栏或置顶；
-    4. 兜底判定：Windows SHQueryUserNotificationState 报告全屏忙状态。
+    2. 排除本进程、已知覆盖层工具进程（_FS_SKIP_PROCS）与 shell 窗口；
+    3. 排除 WS_EX_TOOLWINDOW 工具窗口（截图覆盖层/输入法候选框/悬浮面板）；
+    4. 几何判定：窗口覆盖所在显示器完整几何（含任务栏），且无标题栏或置顶；
+    5. 兜底判定：Windows SHQueryUserNotificationState 报告全屏忙状态。
     """
     if os.name != 'nt':
         return False, "非 Windows"
@@ -189,6 +194,10 @@ def _fg_fullscreen_probe() -> tuple[bool, str]:
     proc = info.get('process', '')
     if info.get('pid') == os.getpid() or proc.lower().startswith('dsh-pet-'):
         return False, f"前台是桌宠自身 {proc}"
+    # 已知覆盖层工具进程永不视为全屏（实测：PixPin 截屏覆盖层全屏无边框置顶，
+    # 用户打字时其热键监听闪现覆盖层 → 误命中全屏 → 桌宠频闪）。
+    if proc.lower() in _FS_SKIP_PROCS:
+        return False, f"覆盖层工具进程 {proc}"
     # 排除桌面/任务栏等 shell 窗口
     buf = ctypes.create_unicode_buffer(256)
     u32.GetClassNameW(hwnd, buf, 256)
@@ -200,6 +209,11 @@ def _fg_fullscreen_probe() -> tuple[bool, str]:
     has_caption = bool(style & _WS_CAPTION)
     exstyle = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
     topmost = bool(exstyle & _WS_EX_TOPMOST)
+    # 工具窗口（WS_EX_TOOLWINDOW：截图覆盖层/输入法候选框/悬浮面板）永不视为
+    # 全屏——实测 PixPin 截屏覆盖层（全屏、无标题栏、置顶）曾触发桌宠误隐藏
+    # 频闪（用户打字时 PixPin 覆盖层闪现 → 几何覆盖误判全屏）。
+    if exstyle & 0x00000080:  # WS_EX_TOOLWINDOW
+        return False, f"工具窗口 cls={cls} proc={info.get('process', '')}"
     x, y, w, h = info['rect']
     # 窗口所在显示器的完整几何（与 GetWindowRect/DWM 边界同为
     # 本进程 DPI awareness 下的坐标，天然一致）

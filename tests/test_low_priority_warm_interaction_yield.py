@@ -17,7 +17,7 @@
 - 右键菜单测试用 monkeypatch 替换了 QMenu.exec()（立即返回），只验证
   _context_menu_open 同步块内的 begin/end 配对；真实 exec() 的 nested event
   loop、子菜单、菜单期间切角色/隐藏、action 退出等场景不在单测覆盖内。
-- 窗口测试未走真实 PetApp.switch_character()；旧窗口迟到事件用直接调用
+- 窗口测试未走真实 AppShell/PetInstance.switch_character()；旧窗口迟到事件用直接调用
   _on_frame/_on_clip_finished 模拟（生产路径是 hide() 后 Qt 队列中的残留信号）。
 """
 from __future__ import annotations
@@ -69,7 +69,11 @@ class BlockableClip(FakeClip):
         self.meta_calls += 1
         self.warmed_meta = True
         self.meta_entered.set()
-        self.meta_release.wait(5.0)
+        # CI 慢 runner 上，从 meta_entered 到测试完成编舞步骤（begin_interaction、
+        # 打闸门补丁、放行）可能超过 5s；放行前超时会让 worker 先行通过闸门，
+        # 破坏「让路/放弃」断言。放宽到 30s：正常路径由测试显式放行，超时只是
+        # 防挂死兜底。
+        self.meta_release.wait(30.0)
 
 
 class _GateObjectsLib(library_mod.MovieLibrary):
@@ -81,13 +85,14 @@ class _GateObjectsLib(library_mod.MovieLibrary):
         self.objects_entered = threading.Event()
         self.objects_release = threading.Event()
 
-    def _warm_objects(self, clips, workers, *, yield_to_interaction=False, generation=None):
+    def _warm_objects(self, clips, workers, *, yield_to_interaction=False, generation=None, include_frames=True):
         self.objects_entered.set()
         self.objects_release.wait(5.0)
         return super()._warm_objects(
             clips, workers,
             yield_to_interaction=yield_to_interaction,
             generation=generation,
+            include_frames=include_frames,
         )
 
 
@@ -96,9 +101,11 @@ def _make_lib(tmp_path, monkeypatch, clip_cls=FakeClip, lib_cls=None):
     monkeypatch.setattr(library_mod, "WebMClip", clip_cls)
     videos = tmp_path / "videos"
     folders = {
-        "idle": ["待机呼吸休闲.webm"],
+        # 批10-A3：idle/move 移入低优先级池后，本文件的编舞（BlockableClip 逐段
+        # 阻塞放行「写代码/吃白饭」）会被前置的 idle/move 假 clip 打乱——这里
+        # 锁定的是让路/代次闸门机制，与池构成无关，故夹具只保留交互核 + 随机池。
+        # 池构成的拆分断言由 test_library_priority_warm.py 专项覆盖。
         "turn": ["东张西望.webm"],
-        "move": ["螃蟹走路.webm"],
         "click": ["点击回应 - 开心跃动.webm"],
         "drag": ["被鼠标拖拽悬空反馈.webm"],
         "random": ["写代码.webm", "吃白饭.webm"],
@@ -108,10 +115,17 @@ def _make_lib(tmp_path, monkeypatch, clip_cls=FakeClip, lib_cls=None):
         directory.mkdir(parents=True)
         for name in files:
             (directory / name).write_bytes(b"fake")
-    return lib_cls(asset_dir=videos)
+    # 本文件锁定的是让路/代次机制（含首帧阶段），用 full 档保持旧预热语义；
+    # 档位对首帧的门控由 test_library_priority_warm.py 专项覆盖。
+    return lib_cls(asset_dir=videos, prewarm_policy="full")
 
 
-def _wait_until(predicate, timeout=3.0):
+def _wait_until(predicate, timeout=30.0):
+    # CI 预算：本文件是已知的高负载 flake（批10-A3 缩池后让路场景结构性变化），
+    # 预热 worker 由守护线程承载，在 CI 满载/慢 runner 上从「批次认领」到
+    # 「首个 clip 进入 warm_meta / 批次收尾」可能超过 10s（实测本地重载机也会
+    # 偶发超 10s）。断言业务强度不变（仍是「最终必须满足 predicate」），只放宽
+    # 等待上界。
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -221,8 +235,12 @@ def test_no_busy_loop_while_waiting_gate(tmp_path, monkeypatch):
 
 def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypatch):
     lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    # CI 顺序无关：低优池顺序来自目录枚举，Linux/Windows 不同（ubuntu CI 上
+    # 「吃白饭」可能排在「写代码」前）——按真实池顺序取前两个，编舞语义不变。
+    _, low = lib._priority_names()
+    first, second = low[0], low[1]
     lib._warm_low_priority_background()  # 非交互状态启动批次
-    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
+    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
 
     lib.begin_interaction()
     # 观测第二个 clip 前的让路闸门：worker 放行第一个 clip 后应阻塞在此
@@ -234,17 +252,17 @@ def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypa
         return orig_gate(generation)
 
     lib._await_interaction_clear = gated
-    lib._movies["写代码"].meta_release.set()  # 放行第一个 clip
+    lib._movies[first].meta_release.set()  # 放行第一个 clip
     _wait_until(gate_entered.is_set)  # 事件同步确定 worker 已进入闸门（不猜时序）
-    assert lib._movies["吃白饭"].warmed_meta is False, "交互中低优先级预热必须让路"
+    assert lib._movies[second].warmed_meta is False, "交互中低优先级预热必须让路"
 
     # 放行第二个 clip 的阻塞再结束交互：worker 立即完成，不留在飞线程
-    lib._movies["吃白饭"].meta_release.set()
+    lib._movies[second].meta_release.set()
     lib.end_interaction()
     _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies["吃白饭"].warmed_meta is True
-    assert lib._movies["吃白饭"].warmed_frame is True
-    assert lib._movies["写代码"].warmed_frame is True
+    assert lib._movies[second].warmed_meta is True
+    assert lib._movies[second].warmed_frame is True
+    assert lib._movies[first].warmed_frame is True
 
 
 def test_low_warm_batch_dedup_in_flight(tmp_path, monkeypatch):
@@ -303,25 +321,28 @@ def test_completed_flag_stable_after_completion(tmp_path, monkeypatch):
 
 def test_pause_warm_aborts_stale_batch_no_revival(tmp_path, monkeypatch):
     lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    # CI 顺序无关：低优池顺序来自目录枚举（平台相关），按真实池顺序取前两个
+    _, low = lib._priority_names()
+    first, second = low[0], low[1]
     lib._warm_low_priority_background()
-    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
+    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
 
     lib.begin_interaction()  # 拖拽中
-    lib._movies["写代码"].meta_release.set()
+    lib._movies[first].meta_release.set()
     lib.pause_warm()  # 隐藏/切角色：代次作废旧批次
     lib.end_interaction()  # 旧窗口迟到的松手事件：不得复活旧预热
 
     _wait_until(lambda: not lib._low_warm_in_flight)  # 旧 worker 真正收尾（不猜时序）
-    assert lib._movies["吃白饭"].warmed_meta is False, "旧代次批次必须放弃，不得复活"
+    assert lib._movies[second].warmed_meta is False, "旧代次批次必须放弃，不得复活"
     assert lib._low_first_frames_done is False
 
     # 恢复显示后重新排期：新代次批次完整跑完
     lib.resume_warm()
-    lib._movies["吃白饭"].meta_release.set()  # 新批次遇到阻塞 clip 时直接放行
+    lib._movies[second].meta_release.set()  # 新批次遇到阻塞 clip 时直接放行
     lib._warm_low_priority_background()
     _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies["吃白饭"].warmed_meta is True
-    assert lib._movies["吃白饭"].warmed_frame is True
+    assert lib._movies[second].warmed_meta is True
+    assert lib._movies[second].warmed_frame is True
 
 
 def test_fast_pause_resume_aborts_batch_via_captured_generation(tmp_path, monkeypatch):
@@ -414,7 +435,7 @@ def test_high_priority_warm_unaffected_by_interaction(tmp_path, monkeypatch):
     lib._warm_all_meta_background()  # 高优先级：与调度线程相同的同步路径
     assert lib._movies[catalog.CLICKS[0]].warmed_meta is True
     assert lib._movies[catalog.CLICKS[0]].warmed_frame is True
-    assert lib._movies[catalog.IDLE].warmed_meta is True
+    assert lib._movies[catalog.TURN].warmed_meta is True
     assert lib._movies[catalog.DRAG].warmed_meta is True
 
 
@@ -426,7 +447,7 @@ def test_high_priority_warm_skipped_while_paused(tmp_path, monkeypatch):
     lib._warm_all_meta_background()
     assert lib._movies[catalog.CLICKS[0]].warmed_meta is False
     assert lib._movies[catalog.CLICKS[0]].warmed_frame is False
-    assert lib._movies[catalog.IDLE].warmed_meta is False
+    assert lib._movies[catalog.TURN].warmed_meta is False
     assert lib._movies[catalog.DRAG].warmed_meta is False
 
 
@@ -449,7 +470,7 @@ def test_high_priority_warm_aborts_when_paused_during_sleep(tmp_path, monkeypatc
     assert sleep_calls["n"] == 1, "高优先级预热必须经历随机错峰 sleep"
     assert lib._movies[catalog.CLICKS[0]].warmed_meta is False, "sleep 期间暂停，本批必须作废"
     assert lib._movies[catalog.CLICKS[0]].warmed_frame is False
-    assert lib._movies[catalog.IDLE].warmed_meta is False
+    assert lib._movies[catalog.TURN].warmed_meta is False
     assert lib._movies[catalog.DRAG].warmed_meta is False
 
     # 恢复后新代次批次可正常预热（门控不放错、不误伤）
@@ -458,13 +479,28 @@ def test_high_priority_warm_aborts_when_paused_during_sleep(tmp_path, monkeypatc
     lib._warm_all_meta_background()
     assert lib._movies[catalog.CLICKS[0]].warmed_meta is True
     assert lib._movies[catalog.CLICKS[0]].warmed_frame is True
-    assert lib._movies[catalog.IDLE].warmed_meta is True
+    assert lib._movies[catalog.TURN].warmed_meta is True
 
 
 def test_high_priority_warm_aborts_mid_batch_when_paused(tmp_path, monkeypatch):
     """P2：高优先级预热中途（metadata 解码期间）被 pause_warm——尚未开始的
     clip 不得再拉起 ffmpeg（非阻塞中途作废），首帧阶段整段跳过。"""
     lib = _make_lib(tmp_path, monkeypatch, clip_cls=BlockableClip)
+    # 批10-A3 后高优池 = clicks+turns+drag 共 3 素材 → workers=min(3,3)=3，
+    # 「排队中的 clip」场景结构性消失，使下方 skipped 断言沦为空洞通过。
+    # 本测要验证「pause 作废排队中的 clip」，故给高优池补 2 个假 clip：
+    # 高优至 5、workers 仍为 3，留下 2 个真实排队项。
+    queued_names = ["排队夹甲", "排队夹乙"]
+    for name in queued_names:
+        lib._movies[name] = BlockableClip(tmp_path / "videos" / f"{name}.webm")
+    real_priority_names = lib._priority_names
+
+    def five_high_priority_names():
+        high, low = real_priority_names()
+        return high + queued_names, low
+
+    monkeypatch.setattr(lib, "_priority_names", five_high_priority_names)
+
     results: dict = {}
     t = threading.Thread(
         target=lambda: (lib._warm_all_meta_background(), results.setdefault("done", True)),
@@ -474,10 +510,13 @@ def test_high_priority_warm_aborts_mid_batch_when_paused(tmp_path, monkeypatch):
     # 第一批（并发 3）已进入 warm_meta 阻塞：事件同步，不猜时序
     _wait_until(lambda: lib._movies[catalog.CLICKS[0]].meta_entered.is_set())
     lib.pause_warm()  # 隐藏/切角色：排队中的 clip 必须作废
-    for clip in list(lib._movies.values()):
-        if clip.meta_entered.is_set():
-            clip.meta_release.set()  # 放行已在跑的 metadata 探测
-    t.join(timeout=10.0)
+    # 放行所有已进入 warm_meta 的 clip：循环重查 entered 直到线程退出，
+    # 避免「快照后才进入」的 clip 阻塞在无人放行的 meta_release.wait(5.0)。
+    while t.is_alive():
+        for clip in list(lib._movies.values()):
+            if clip.meta_entered.is_set():
+                clip.meta_release.set()
+        t.join(timeout=0.05)
     assert not t.is_alive()
     assert results.get("done") is True
     # 首帧阶段整段跳过（暂停中，不得再拉起 ffmpeg）
@@ -488,6 +527,7 @@ def test_high_priority_warm_aborts_mid_batch_when_paused(tmp_path, monkeypatch):
     assert entered, "第一批高优先级 clip 必须已进入 warm_meta"
     assert all(c.meta_calls == 1 for c in entered)
     assert all(c.meta_calls == 0 for c in skipped), "暂停后排队中的 clip 不得再拉起 ffmpeg"
+    assert len(skipped) >= 2, "高优池必须留有真实排队项（否则 skipped 断言空洞）"
 
     # 恢复后新代次批次可完整跑完（门控不误伤）
     lib.resume_warm()

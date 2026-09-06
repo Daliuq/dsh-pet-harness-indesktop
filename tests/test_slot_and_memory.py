@@ -411,8 +411,9 @@ def test_field_default_factory_and_individual_memory(tmp_path):
     assert slot2.get("click_sound_volume") == 0.99
 
 
-def test_fresh_spawn_reseeds_existing_slot_config_from_main(tmp_path, monkeypatch):
-    """显式“生小肥鱼”（DSH_PET_SPAWN_FRESH=1）即使复用旧 slot 配置也继承主配置。"""
+def test_spawn_reuse_keeps_existing_slot_config(tmp_path, monkeypatch):
+    """「生小肥鱼」复用已有存档的 slot 时不再顶掉原槽设置（回归：旧版
+    DSH_PET_SPAWN_FRESH 强制重播种会把 slot-N 个体配置覆盖成主配置）。"""
     config_dir = tmp_path / APP_DIR_NAME
     config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -428,18 +429,16 @@ def test_fresh_spawn_reseeds_existing_slot_config_from_main(tmp_path, monkeypatc
     old_slot.set("click_sound_volume", 0.2)
     old_slot.save()
 
+    # 旧版孵化进程环境可能仍带着 SPAWN_FRESH 标记，须被完全忽略
     monkeypatch.setenv("DSH_PET_SPAWN_FRESH", "1")
-    fresh_slot = Config(base=tmp_path, instance_id="slot-1")
-    assert fresh_slot.get("character") == "shenshen"
-    assert fresh_slot.get("playback_speed") == 2.0
-    assert fresh_slot.get("click_sound_volume") == 0.8
-    # 副槽化字段仍不复制主鱼位置/自启
-    assert fresh_slot.get("rx") is None
-    assert fresh_slot.get("autostart_wanted") is False
+    reused_slot = Config(base=tmp_path, instance_id="slot-1")
+    assert reused_slot.get("character") == "dundun"
+    assert reused_slot.get("playback_speed") == 0.5
+    assert reused_slot.get("click_sound_volume") == 0.2
 
 
 def test_normal_reopen_keeps_existing_slot_config(tmp_path, monkeypatch):
-    """普通重启/复用 slot 未带 SPAWN_FRESH 时，已有个体配置不被主配置覆盖。"""
+    """普通重启/复用 slot 时，已有个体配置不被主配置覆盖。"""
     config_dir = tmp_path / APP_DIR_NAME
     config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -451,12 +450,11 @@ def test_normal_reopen_keeps_existing_slot_config(tmp_path, monkeypatch):
     slot.set("character", "dundun")
     slot.save()
 
-    monkeypatch.delenv("DSH_PET_SPAWN_FRESH", raising=False)
     reopened = Config(base=tmp_path, instance_id="slot-1")
     assert reopened.get("character") == "dundun"
 
 
-def test_spawn_seed_respects_inherit_size_switch(tmp_path, monkeypatch):
+def test_spawn_seed_respects_inherit_size_switch(tmp_path):
     """生小肥鱼继承大小开关：开启保留主 scale，关闭改用 spawn_scale。"""
     config_dir = tmp_path / APP_DIR_NAME
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -471,7 +469,6 @@ def test_spawn_seed_respects_inherit_size_switch(tmp_path, monkeypatch):
     island["enabled"] = True
     master.set("dynamic_island", island)
     master.save()
-    monkeypatch.setenv("DSH_PET_SPAWN_FRESH", "1")
     slot_inherit = Config(base=tmp_path, instance_id="slot-1")
     assert slot_inherit.get("scale") == 1.0
     assert slot_inherit.get("dynamic_island", {}).get("enabled") is True

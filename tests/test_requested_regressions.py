@@ -955,11 +955,11 @@ def test_settings_stylesheet_has_dark_overrides(monkeypatch):
     """深色系统下新版设置必须追加深色覆盖段（白底白字不可读问题）。"""
     from pet.modern_settings_dialog import _settings_stylesheet
 
-    monkeypatch.setattr("pet.modern_settings_dialog._system_dark", lambda: True)
+    monkeypatch.setattr("pet.settings_theme_qss._system_dark", lambda: True)
     qss = _settings_stylesheet()
     assert "background: #202024" in qss
     assert "color: #e4e4e9" in qss
-    monkeypatch.setattr("pet.modern_settings_dialog._system_dark", lambda: False)
+    monkeypatch.setattr("pet.settings_theme_qss._system_dark", lambda: False)
     qss_light = _settings_stylesheet()
     assert "background: #202024" not in qss_light
     # 浅色也必须显式给按钮补文字色（防深色 palette 白字）
@@ -996,7 +996,7 @@ def test_settings_window_rethemes_immediately_with_the_appearance_selector(
     from pet.config import Config
 
     app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(settings_mod, "_system_dark", lambda: False)
+    monkeypatch.setattr("pet.settings_theme_qss._system_dark", lambda: False)
     monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
     dialog = settings_mod.ModernSettingsDialog(Config(tmp_path), include_ai=False)
     assert "QDialog { background: #202024" not in dialog.styleSheet()
@@ -1022,11 +1022,12 @@ def test_modern_settings_finished_refreshes_even_on_rejected(tmp_path, monkeypat
     from PySide6.QtWidgets import QApplication
 
     import pet.app as app_mod
-    from pet.app import PetApp
+    from pet.app import AppShell, PetInstance
     from pet.config import Config
 
     app = QApplication.instance() or QApplication([])
-    owner = PetApp.__new__(PetApp)
+    owner = PetInstance.__new__(PetInstance)
+    owner.shell = AppShell.__new__(AppShell)
     owner.modern_settings_dialog = object()
     refreshed = []
 
@@ -1039,15 +1040,14 @@ def test_modern_settings_finished_refreshes_even_on_rejected(tmp_path, monkeypat
 
     owner.win = FakeWin()
     owner.config = Config(tmp_path)
-    # Phase 1：设置保存会同步可选服务；这里只测桌宠刷新，避免碰撞/待办真实服务被拉起。
-    owner.config.set("collision_enabled", False)
-    owner.config.set("todo_reminder_enabled", False)
-    owner._apply_balance_timer = lambda: None
+    owner.shell._apply_balance_timer = lambda: None
+    owner.shell._sync_dynamic_island = lambda: None
+    # Phase 1 门控后 todo 服务走 _sync_todo_service（懒启停）；测试只测桌宠刷新
+    owner.shell._sync_todo_service = lambda: None
     owner._refresh_chat_windows = lambda: None
-    owner.todo_service = types.SimpleNamespace(apply_config=lambda: None, stop=lambda: None)
-    owner.todo_panel = None
+    owner._sync_animation_prewarm = lambda: None
     monkeypatch.setattr(app_mod, "_mac_set_dock_icon_visible", lambda *a, **k: None)
-    PetApp._modern_settings_finished(owner, 0)  # QDialog.Rejected（X 关闭）
+    PetInstance._modern_settings_finished(owner, 0)  # QDialog.Rejected（X 关闭）
     assert refreshed == [1], "Rejected 关闭也必须刷新桌宠"
 
 
@@ -1163,12 +1163,13 @@ def test_macos_dock_menu_keeps_settings_reachable_when_pet_is_mouse_through(monk
     import pet.app as app_mod
 
     app = QApplication.instance() or QApplication([])
-    controller = app_mod.PetApp.__new__(app_mod.PetApp)
+    controller = app_mod.AppShell.__new__(app_mod.AppShell)
     controller.app = app
-    controller.win = mock.Mock()
-    controller.open_modern_settings = mock.Mock()
-    controller.open_chat = mock.Mock()
     controller.enable_chat = True
+    controller.instance = app_mod.PetInstance.__new__(app_mod.PetInstance)
+    controller.instance.win = mock.Mock()
+    controller.instance.open_modern_settings = mock.Mock()
+    controller.instance.open_chat = mock.Mock()
     monkeypatch.setattr(app_mod.sys, "platform", "darwin")
 
     menu = controller._install_macos_dock_menu()
@@ -1178,6 +1179,6 @@ def test_macos_dock_menu_keeps_settings_reachable_when_pet_is_mouse_through(monk
     labels = [action.text() for action in menu.actions() if not action.isSeparator()]
     assert labels[:3] == ["显示桌宠", "桌宠设置", "AI 对话"]
     next(action for action in menu.actions() if action.text() == "桌宠设置").trigger()
-    controller.open_modern_settings.assert_called_once_with()
+    controller.instance.open_modern_settings.assert_called_once_with()
     menu.close()
     app.processEvents()

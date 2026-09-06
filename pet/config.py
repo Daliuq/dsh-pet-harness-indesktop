@@ -518,9 +518,10 @@ class Config:
             else self.dir / "config.json"
         )
         self._migrate_legacy_config(base)
-        fresh_spawn = os.environ.get("DSH_PET_SPAWN_FRESH") == "1"
-        if self.instance_id and (not self.path.exists() or fresh_spawn):
-            self._seed_slot_config_from_main(force=fresh_spawn)
+        # 副槽落种仅在该槽位还没有个体配置时进行；已有存档的 slot（用户改过
+        # 的）一律不动——「生小肥鱼」复用旧槽位时同样保留原槽设置。
+        if self.instance_id and not self.path.exists():
+            self._seed_slot_config_from_main()
         self.data = {
             "version": 4,
             "rx": None,
@@ -641,17 +642,16 @@ class Config:
         except OSError:
             pass
 
-    def _seed_slot_config_from_main(self, *, force: bool = False) -> None:
+    def _seed_slot_config_from_main(self) -> None:
         """新建副槽时继承主配置（issue #69-6），避免“生小肥鱼恢复默认设置”。
 
-        只在该槽位还没有个体配置文件、或本次是通过“生小肥鱼”显式孵化的
-        新进程（DSH_PET_SPAWN_FRESH=1）时执行；普通重启已有 slot-N 配置
-        仍保持独立记忆。复制主 config.json 后做副槽化处理：位置回到自动
-        摆放、开机自启仍只归主槽所有。写盘副本沿用主配置的脱敏策略，
-        不把明文 API Key 复制进副槽。
+        只在该槽位还没有个体配置文件时执行；已有存档的 slot-N 配置（用户
+        改过的）一律保持独立记忆，「生小肥鱼」复用旧槽位也不覆盖。复制主
+        config.json 后做副槽化处理：位置回到自动摆放、开机自启仍只归主槽
+        所有。写盘副本沿用主配置的脱敏策略，不把明文 API Key 复制进副槽。
         """
         main_path = self.dir / "config.json"
-        if (not force and self.path.exists()) or not main_path.is_file():
+        if self.path.exists() or not main_path.is_file():
             return
         try:
             raw = json.loads(main_path.read_text(encoding="utf-8"))

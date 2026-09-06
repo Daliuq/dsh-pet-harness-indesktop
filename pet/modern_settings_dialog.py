@@ -194,7 +194,6 @@ from .settings_widgets import (
 from . import settings_pet_controls
 from .settings_theme_qss import _settings_stylesheet
 from .settings_menu_layout_editor import MenuLayoutEditor
-from .chat.ai_settings_page import _AiSettingsPage
 
 
 class ModernSettingsDialog(QDialog):
@@ -267,6 +266,9 @@ class ModernSettingsDialog(QDialog):
 
         self._build_pet_controls()
         if include_ai:
+            # 延迟 import：no-chat 打包变体 excludes=['pet.chat']，顶层导入会在
+            # 产物运行时抛 ModuleNotFoundError，导致设置界面整体打不开。
+            from .chat.ai_settings_page import _AiSettingsPage
             self.ai_page = _AiSettingsPage(config, self)
 
         general_content = QWidget()

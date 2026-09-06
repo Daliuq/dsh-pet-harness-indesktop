@@ -6,7 +6,9 @@ from PySide6.QtWidgets import QApplication
 
 from pet.golden_spin import (
     GOLDEN_SPIN_ACCEL,
+    GOLDEN_SPIN_CLICK_RUSH_MS,
     GOLDEN_SPIN_DURATION_MS,
+    GOLDEN_SPIN_END_ANGLE,
     GOLDEN_SPIN_MIN_REV_MS,
     GoldenSpinController,
 )
@@ -107,29 +109,28 @@ def test_direct_spin_single_turn_finishes_at_base_duration():
     controller.cancel()
 
 
-def test_direct_spin_accumulates_turns_and_next_revolution_is_faster():
+def test_direct_spin_click_rushes_current_revolution_then_next_is_faster():
     controller, times = _spin_direct_controller()
-    # 第一圈中途再点一次：累计第二圈，且第二圈时长按加速系数缩短。
-    times[0] = GOLDEN_SPIN_DURATION_MS / 1000.0 / 2.0
+    # 第一圈中途再点一次：累计第二圈，并把当前圈剩余角度快速收尾。
+    mid = GOLDEN_SPIN_DURATION_MS / 1000.0 / 2.0
+    times[0] = mid
     controller._update(times[0])
     assert controller.active
     controller.spin_direct()
     assert controller.queued_turns == 2
+    assert controller._rev_duration_ms == GOLDEN_SPIN_CLICK_RUSH_MS
 
-    # 完成第一圈后仍 active（第二圈待转）。
-    times[0] = GOLDEN_SPIN_DURATION_MS / 1000.0
+    # 当前圈应在点击后 CLICK_RUSH_MS 内完成，而不是等到完整 700ms。
+    times[0] = mid + GOLDEN_SPIN_CLICK_RUSH_MS / 1000.0
     controller._update(times[0])
     assert controller.active
     assert controller.queued_turns == 1
+    assert abs(controller.current_angle_deg() - GOLDEN_SPIN_END_ANGLE) < 1e-6
 
+    # 第二圈按逐圈加速后的更短 nominal 时长完成。
     second_ms = round(GOLDEN_SPIN_DURATION_MS * GOLDEN_SPIN_ACCEL)
-    assert second_ms < GOLDEN_SPIN_DURATION_MS
-    # 第二圈未结束时仍在转。
-    times[0] = GOLDEN_SPIN_DURATION_MS / 1000.0 + (second_ms - 1) / 1000.0
-    controller._update(times[0])
-    assert controller.active
-    # 第二圈按加速后的更短时长完成。
-    times[0] = GOLDEN_SPIN_DURATION_MS / 1000.0 + second_ms / 1000.0
+    assert controller._rev_duration_ms == second_ms
+    times[0] += second_ms / 1000.0
     controller._update(times[0])
     assert not controller.active
     assert controller.queued_turns == 0
@@ -137,14 +138,40 @@ def test_direct_spin_accumulates_turns_and_next_revolution_is_faster():
     controller.cancel()
 
 
+def test_direct_spin_repeated_clicks_keep_rushing_same_current_revolution():
+    controller, times = _spin_direct_controller()
+    times[0] = 0.10
+    controller._update(times[0])
+    controller.spin_direct()   # queued=2，开始 rush 当前圈
+    times[0] += 0.05
+    controller._update(times[0])
+    controller.spin_direct()   # 同一圈再次被 rush，只累计圈数
+    assert controller.queued_turns == 3
+
+    times[0] += GOLDEN_SPIN_CLICK_RUSH_MS / 1000.0
+    controller._update(times[0])
+    # 当前圈只完成一次，随后还剩两圈待转。
+    assert controller.active
+    assert controller.queued_turns == 2
+    controller.cancel()
+
+
 def test_direct_spin_speed_floor_never_below_min():
     controller, times = _spin_direct_controller()
+    # 同一点击时刻连按 20 次：都会催促当前圈收尾并累计后续圈。
     for _ in range(20):
         controller.spin_direct()
     assert controller.queued_turns == 21
-    # 逐圈推进直到全部完成，记录每圈时长；加速不得突破下限。
+
+    # 当前圈（被最后一次点击 rush）先快速完成。
+    times[0] += GOLDEN_SPIN_CLICK_RUSH_MS / 1000.0
+    controller._update(times[0])
+    assert controller.active
+    assert controller.queued_turns == 20
+
+    # 依次完成剩余圈，记录每圈 nominal 时长；加速不得突破下限。
     durations = []
-    for _ in range(21):
+    for _ in range(20):
         durations.append(controller._rev_duration_ms)
         times[0] += controller._rev_duration_ms / 1000.0
         controller._update(times[0])

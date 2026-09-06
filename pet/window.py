@@ -3313,7 +3313,11 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             if self.idles:
                 self._switch(self._pick(self.idles))  # 回待机缓冲
         elif dist < catalog.DRAG_THRESHOLD * self.scale:
-            if self._press_sound_pair is not None and self.click_sound_enabled:
+            # 边缘探头激活时，点击是“拉直/重置倒计时”的探头操作，不是普通点击反馈，
+            # 不播点击音效。
+            probe_active = getattr(self, '_effects_probe_active', None)
+            probe_click = bool(probe_active()) if callable(probe_active) else False
+            if self._press_sound_pair is not None and self.click_sound_enabled and not probe_click:
                 volume = float(self.cfg.get("click_sound_volume", 0.70))
                 play_press_sound(self._press_sound_pair, volume)
                 play_release_sound(self._press_sound_pair, volume)

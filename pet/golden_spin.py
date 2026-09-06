@@ -5,9 +5,10 @@
 经 pet/window_effects.py 应用。旋转不依赖素材，不与点击动画叠画面：
 
 - 常规点击触发（armed）：点击动画结束后调用 consume_click_finished() 接一圈。
-- 直连点击触发（golden_spin_direct）：点击立即调用 spin_direct()，旋转中再点
-  会累计待转圈数，并让后续每一圈比上一圈更快（GOLDEN_SPIN_ACCEL 加速，
-  单圈时长下限 GOLDEN_SPIN_MIN_REV_MS）。
+- 直连点击触发（golden_spin_direct）：点击立即调用 spin_direct()；旋转中再点
+  会累计待转圈数、把当前圈剩余角度快速收尾（GOLDEN_SPIN_CLICK_RUSH_MS），
+  并让后续每一圈比上一圈更快（GOLDEN_SPIN_ACCEL 加速，单圈时长下限
+  GOLDEN_SPIN_MIN_REV_MS）。
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ GOLDEN_SPIN_DURATION_MS = 700
 GOLDEN_SPIN_END_ANGLE = -360.0  # Qt 正角=顺时针，负角=逆时针
 GOLDEN_SPIN_ACCEL = 0.82        # 直连模式逐圈加速系数：下一圈 = 上一圈 × 0.82
 GOLDEN_SPIN_MIN_REV_MS = 200    # 单圈时长下限，防长连击后转速失控
+GOLDEN_SPIN_CLICK_RUSH_MS = 130  # 点击时把当前圈剩余角度快速转完的时长
 
 
 class GoldenSpinController(QObject):
@@ -36,9 +38,11 @@ class GoldenSpinController(QObject):
         self._started_at = 0.0
         self._pending_after_click = False
         self._remaining_turns = 0
+        self._nominal_rev_ms = GOLDEN_SPIN_DURATION_MS
         self._rev_duration_ms = GOLDEN_SPIN_DURATION_MS
         self._rev_started_at = 0.0
         self._rev_start_angle_deg = 0.0
+        self._rev_end_angle_deg = GOLDEN_SPIN_END_ANGLE
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -69,9 +73,10 @@ class GoldenSpinController(QObject):
         self._begin_session(1, GOLDEN_SPIN_DURATION_MS)
 
     def spin_direct(self) -> None:
-        """点击直连：空闲时开转一圈；旋转中再点则累计一圈并让后续圈更快。"""
+        """点击直连：空闲时开转一圈；旋转中再点则累计一圈并让当前圈快速收尾。"""
         if self._active:
             self._remaining_turns += 1
+            self._rush_current_revolution()
         else:
             self._begin_session(1, GOLDEN_SPIN_DURATION_MS)
         self.win.update()
@@ -96,8 +101,10 @@ class GoldenSpinController(QObject):
         self._timer.stop()
         self._angle_deg = 0.0
         self._remaining_turns = 0
+        self._nominal_rev_ms = GOLDEN_SPIN_DURATION_MS
         self._rev_duration_ms = GOLDEN_SPIN_DURATION_MS
         self._rev_start_angle_deg = 0.0
+        self._rev_end_angle_deg = GOLDEN_SPIN_END_ANGLE
         self.win.update()
 
     def cancel_pending(self) -> None:
@@ -108,12 +115,20 @@ class GoldenSpinController(QObject):
     def _begin_session(self, turns: int, rev_ms: int) -> None:
         self._active = True
         self._remaining_turns = max(1, int(turns))
-        self._rev_duration_ms = max(GOLDEN_SPIN_MIN_REV_MS, int(rev_ms))
+        self._nominal_rev_ms = max(GOLDEN_SPIN_MIN_REV_MS, int(rev_ms))
+        self._rev_duration_ms = self._nominal_rev_ms
         self._angle_deg = 0.0
         self._rev_start_angle_deg = 0.0
+        self._rev_end_angle_deg = GOLDEN_SPIN_END_ANGLE
         self._rev_started_at = self._clock()
         self._timer.start()
         self.win.update()
+
+    def _rush_current_revolution(self) -> None:
+        """点击后把当前圈从当前角度快速转完（约 CLICK_RUSH_MS）。"""
+        self._rev_start_angle_deg = self._angle_deg
+        self._rev_duration_ms = GOLDEN_SPIN_CLICK_RUSH_MS
+        self._rev_started_at = self._clock()
 
     # ------------------------------------------------------------ 计时
     def _on_timer(self) -> None:
@@ -128,24 +143,31 @@ class GoldenSpinController(QObject):
             self._rev_duration_ms,
         )
         done = progress >= 1.0
-        self._angle_deg = self._rev_start_angle_deg + GOLDEN_SPIN_END_ANGLE * progress
+        self._angle_deg = (
+            self._rev_start_angle_deg
+            + (self._rev_end_angle_deg - self._rev_start_angle_deg) * progress
+        )
         if not done:
             self.win.update()
             return
         if self._remaining_turns > 1:
-            # 当前圈完成，立即开始下一圈并加速；角度取当前终点作为新起点。
+            # 当前圈完成：进入下一圈并逐圈加速（普通圈时长用 nominal）。
             self._remaining_turns -= 1
-            self._rev_start_angle_deg = self._angle_deg
-            self._rev_duration_ms = max(
+            self._nominal_rev_ms = max(
                 GOLDEN_SPIN_MIN_REV_MS,
-                int(round(self._rev_duration_ms * GOLDEN_SPIN_ACCEL)),
+                int(round(self._nominal_rev_ms * GOLDEN_SPIN_ACCEL)),
             )
+            self._rev_start_angle_deg = self._rev_end_angle_deg
+            self._rev_end_angle_deg -= 360.0
+            self._rev_duration_ms = self._nominal_rev_ms
             self._rev_started_at = now
         else:
             self._active = False
             self._timer.stop()
             self._angle_deg = 0.0
             self._remaining_turns = 0
+            self._nominal_rev_ms = GOLDEN_SPIN_DURATION_MS
             self._rev_duration_ms = GOLDEN_SPIN_DURATION_MS
             self._rev_start_angle_deg = 0.0
+            self._rev_end_angle_deg = GOLDEN_SPIN_END_ANGLE
         self.win.update()

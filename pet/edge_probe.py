@@ -15,9 +15,10 @@ from PySide6.QtCore import QEasingCurve, QRect, Qt, QTimer
 from .window_effects import eased_progress, rotated_region_bounds
 
 EDGE_PROBE_ANGLE = 45.0
-# 露出比例以“当前姿态（含 ±45° 旋转）的投影 bbox 宽度”为分母；0.70 保证探头时
-# 整张脸/头完整可见（此前按未旋转宽度 0.50 计算，实际因旋转投影变宽只剩一只眼）。
-EDGE_PEEK_EXPOSURE = 0.70
+# 露出比例以“当前姿态（含 ±45° 旋转）的投影 bbox 宽度”为分母；0.55 使常驻探头
+# 只露头/脸并贴住屏幕边缘，身体大部分留在屏幕外（0.70 曾导致整个角色探出过多）。
+EDGE_PEEK_EXPOSURE = 0.55
+# 点击拉直后基本全出（短暂查看完整桌宠）。
 EDGE_ENGAGE_EXPOSURE = 0.82
 EDGE_ENTER_MS = 300
 EDGE_STRAIGHTEN_MS = 250

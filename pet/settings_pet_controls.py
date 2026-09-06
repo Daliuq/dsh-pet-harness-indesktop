@@ -187,6 +187,12 @@ def build_pet_controls(host) -> None:
     host.click_self_talk_check.setChecked(bool(host.config.get("click_show_self_talk", False)))
     host.music_sing_check = ToggleSwitch(host)
     host.music_sing_check.setChecked(bool(host.config.get("music_sing_enabled", False)))
+    host.golden_spin_click_check = ToggleSwitch(host)
+    host.golden_spin_click_check.setChecked(bool(host.config.get("golden_spin_on_click", False)))
+    host.golden_spin_direct_check = ToggleSwitch(host)
+    host.golden_spin_direct_check.setChecked(bool(host.config.get("golden_spin_direct", False)))
+    host.edge_probe_check = ToggleSwitch(host)
+    host.edge_probe_check.setChecked(bool(host.config.get("edge_probe_enabled", False)))
     host.balance_refresh_spin = None
     host.balance_tier_mode_select = None
     host.balance_tier_peak_edit = None

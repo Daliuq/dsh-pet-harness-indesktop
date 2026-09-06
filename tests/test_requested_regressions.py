@@ -480,7 +480,11 @@ def test_ojingjing_entry_hover_survives_widget_children(monkeypatch):
     monkeypatch.setattr(fun_entry.QCursor, "pos", staticmethod(lambda: QPoint(20, 20)))
     menu = QMenu()
     entry = OjingjingMenuEntry(menu, {"title": "厉害了我的鲸", "hint": "请点击"})
-    menu.show()
+    # 用 popup(0, 0) 而不是 show()：Windows QPA 上 QMenu.show() 跟随真实系统
+    # 光标落点（Qt C++ 内部调用不受 Python 层 QCursor.pos mock 影响），
+    # 会把菜单弹到模拟点 (20, 20) 之外，导致合成高亮无法命中；锚定弹窗位置
+    # 后，showEvent 按模拟光标合成高亮的坐标耦合在任何 QPA 上都确定。
+    menu.popup(QPoint(0, 0))
     app.processEvents()
     try:
         # 1. 菜单弹出时鼠标已悬在项上：showEvent 按光标位置合成高亮

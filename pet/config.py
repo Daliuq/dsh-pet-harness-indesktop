@@ -860,6 +860,7 @@ class Config:
             "collision_mass_scale", "collision_impulse_cap",
             "collision_sound_enabled", "collision_sound_volume",
             "media_prewarm",
+            "animation_prewarm_enabled",
             "first_frame_cache_max_mb",
             "predict_prewarm_lead_ms",
             "ffmpeg_recycle_minutes",

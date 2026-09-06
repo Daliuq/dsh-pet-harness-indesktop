@@ -18,7 +18,6 @@ GifClip 基于 QMovie 播放透明 GIF（兼容旧 GIF 路线）。
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import random
 import threading

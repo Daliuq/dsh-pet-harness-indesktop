@@ -367,8 +367,8 @@ def test_tray_menu_syncs_mouse_through_from_config(tmp_path):
     # 反向：托盘里点掉 → config 落盘
     action.setChecked(False)
     assert config.get("mouse_through") is False
-    # “回到初始默认位置”应路由到该窗的 go_default_corner
-    home = next(a for a in menu.actions() if a.text() == "回到初始默认位置")
+    # “回到右下角”应路由到该窗的 go_default_corner
+    home = next(a for a in menu.actions() if a.text() == "回到右下角")
     home.trigger()
     assert win.corner_calls == 1
     tray.hide()
@@ -480,6 +480,28 @@ def test_edge_probe_click_does_not_play_click_sound(app, tmp_path, monkeypatch):
     win.mouseReleaseEvent(_release(QPointF(10, 10), QPointF(300, 300)))
     assert len(press_calls) == 1
     assert len(release_calls) == 1
+
+    win.close()
+    app.processEvents()
+
+
+def test_go_default_corner_cancels_active_edge_probe(app, tmp_path):
+    """回右下角前必须取消探头会话，避免宠物斜着出现在右下角。"""
+    win = _make_win(app, tmp_path)
+
+    class Probe:
+        active = True
+        cancelled = []
+
+        def cancel(self, reason="", restore=False):
+            self.cancelled.append((reason, restore))
+            self.active = False
+
+    probe = Probe()
+    win._edge_probe = probe
+    win.go_default_corner()
+    assert probe.cancelled == [("return_corner", False)]
+    assert probe.active is False
 
     win.close()
     app.processEvents()

@@ -1091,6 +1091,13 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._cancel_move()
         self._stop_physics()
         self._drag_target = None
+        # 探头会话若未退出，宠物会保持 ±45° 倾斜姿态出现在右下角；显式“回右下角”
+        # 是普通位置命令，应先取消探头（不恢复原 off-screen 位置）。
+        edge = getattr(self, "_edge_probe", None)
+        if edge is not None and getattr(edge, "active", False):
+            cancel = getattr(edge, "cancel", None)
+            if callable(cancel):
+                cancel("return_corner", restore=False)
         scr = self._screen_available()
         avail = scr.availableGeometry()
         x = avail.right() - self._w - catalog.CORNER_MARGIN

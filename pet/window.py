@@ -2469,9 +2469,14 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
                     int(round(catalog.CANVAS_W * self.scale)),
                     int(round(catalog.CANVAS_H * self.scale)),
                 )
-                self._effects_paint(painter, draw_rect)
-                painter.drawPixmap(0, 0, self._frame_pixmap)
-                self._effects_paint_end(painter, draw_rect)
+                effects_angle = getattr(self, '_effects_current_angle', None)
+                angle = effects_angle() if callable(effects_angle) else 0.0
+                if abs(angle) > 1e-6:
+                    self._effects_paint(painter, draw_rect)
+                    painter.drawPixmap(0, 0, self._frame_pixmap)
+                    self._effects_paint_end(painter, draw_rect)
+                else:
+                    painter.drawPixmap(0, 0, self._frame_pixmap)
         painter.end()
         if perfstats.ENABLED:
             # 窗口绘制（paintEvent 全段，含 slingshot/squash 附加绘制，P0 观测）。

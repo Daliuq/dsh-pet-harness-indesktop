@@ -24,6 +24,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -51,6 +52,11 @@ from .runtime_cleanup import cleanup_stale_runtime_dirs
 from .collision_ipc import CollisionIpcSession
 from .decode_fanout import DecodeFanoutHub
 from .todo_reminder import TodoReminderService
+from .dsh_state import DshStateTracker
+from .persona_phrases import PhrasePicker
+
+
+_persona_pickers = weakref.WeakKeyDictionary()
 
 
 class _BackgroundResult(QObject):
@@ -76,6 +82,35 @@ class _BalanceBridge(_BackgroundResult):
             self.owner._update_island_balance(payload)
 
 
+def _persona_picker(win):
+    """Return an application-owned picker without extending PetWindow state."""
+    try:
+        picker = _persona_pickers.get(win)
+    except (TypeError, RuntimeError):
+        picker = None
+    if picker is None:
+        picker = PhrasePicker()
+        try:
+            _persona_pickers[win] = picker
+        except (TypeError, RuntimeError):
+            pass
+    return picker
+
+
+def _persona_text(win, key: str, fallback: str, **values) -> str:
+    """Render a configured persona phrase for application-level messages."""
+    cfg = getattr(win, "cfg", None)
+    if cfg is None:
+        return fallback.format(**values)
+    mode = str(cfg.get("dialogue_mode", "legacy") or "legacy")
+    picker = _persona_picker(win)
+    if mode == "custom":
+        return picker.custom(cfg.get("dialogue_phrases", {}), key, fallback, **values)
+    if mode == "whale_maid":
+        return picker.get(mode, key, fallback, **values)
+    return fallback.format(**values)
+
+
 def _show_balance_payload(win, payload) -> None:
     """展示余额气泡（含峰谷副标题）并按余额档位触发余额动画。
 
@@ -90,6 +125,9 @@ def _show_balance_payload(win, payload) -> None:
     else:
         text = str(payload)
         info = {}
+    cfg = getattr(win, "cfg", None)
+    if cfg is not None:
+        text = _persona_text(win, "balance.result", "余额情况：{text}", text=text)
     cfg = getattr(win, "cfg", None)
     mode = str(cfg.get("balance_tier_labels_mode", "default") or "default") if cfg is not None else "default"
     custom_peak = str(cfg.get("balance_tier_label_peak", "") or "") if cfg is not None else ""
@@ -825,6 +863,17 @@ class AppShell:
         self._enable_chat = bool(enable_chat)
         self._slot_id = slot_id
         self.tray: QSystemTrayIcon | None = None
+        # 托盘上下文菜单所有权（F5）：_build_tray 每次构建的 QMenu 必须由进程侧
+        # 强引用保活——PySide6 下仅靠 tray.setContextMenu 持有 C++ 指针时，Python
+        # wrapper 一旦被回收，之后的 act.menu()/contextMenu() 会命中 shiboken 缓存里
+        # 已失效的 wrapper（RuntimeError: Internal C++ object already deleted）。
+        # 除菜单本体外还必须保活其 QAction wrapper：子菜单的 menuAction 挂在父菜单的
+        # actions 列表里，这些 QAction wrapper 被回收会让仍存活且被强引用的 QMenu
+        # wrapper 连带失效（_install_tray_menu 会一并快照保活）。
+        # 新菜单接管后旧菜单经 _install_tray_menu 显式 deleteLater 释放，不累积泄漏。
+        self._tray_menu: QMenu | None = None
+        self._tray_submenus: list[QMenu] = []
+        self._tray_actions: list = []
         self.dock_menu: QMenu | None = None
         self._notification_click_callback = None
         self._toast_windows: list[DesktopNotification] = []
@@ -834,6 +883,7 @@ class AppShell:
         self._balance_cache = None
         self._balance_bridge = None
         self._on_about_to_quit_connected = False
+        self._dsh_state_tracker = DshStateTracker(config.dir)
         self._balance_timer = QTimer()
         self._balance_timer.timeout.connect(self.show_balance)
         self._update_bridge = None
@@ -906,6 +956,13 @@ class AppShell:
         inst = getattr(self, 'instance', None)
         return inst.win if inst is not None else None
 
+    @win.setter
+    def win(self, value) -> None:
+        """Legacy compatibility setter routed to the primary instance."""
+        inst = getattr(self, 'instance', None)
+        if inst is not None:
+            inst.win = value
+
     @property
     def modern_settings_dialog(self):
         """转发主窗实例的设置对话框引用（TodoReminderService 气泡抑制判定用）。"""
@@ -956,6 +1013,7 @@ class AppShell:
             self.app.aboutToQuit.connect(self._on_about_to_quit)
             self._on_about_to_quit_connected = True
         self.instance.collision_ipc.start()
+        self._dsh_state_tracker.start()
         character_id = str(self.config.get('character', catalog.DEFAULT_CHARACTER))
         logging.info('当前形象: %s', character_id)
         self.instance._create_ui(character_id)
@@ -1029,7 +1087,12 @@ class AppShell:
                 logging.exception("退出时停止碰撞会话失败")
         # 会话异步写盘（B8）：全部会话已保存，再永久关闭写盘 worker
         #（关掉后迟到的 queued 回调提交会被明确拒绝）。
-        self.todo_service.stop()
+        if self.todo_service is not None:
+            self.todo_service.stop()
+        try:
+            self._dsh_state_tracker.stop()
+        except Exception:
+            logging.exception("退出时停止 DSH 状态跟踪器失败")
         try:
             if not _session_store.close_all_writers(permanent=True):
                 logging.warning("退出时会话写盘 worker 未干净关闭")
@@ -1201,11 +1264,16 @@ class AppShell:
         QTimer.singleShot(0, lambda: win.show_bubble('让我看看余额…', duration_ms=6000))
         bridge = _BalanceBridge(win, owner=self)
         self._balance_bridge = bridge
-        threading.Thread(
-            target=self._balance_worker,
-            args=(bridge, provider.base_url, provider.api_key, provider.verify_ssl, provider_key),
-            daemon=True, name='pet-balance',
-        ).start()
+        try:
+            threading.Thread(
+                target=self._balance_worker,
+                args=(bridge, provider.base_url, provider.api_key, provider.verify_ssl, provider_key),
+                daemon=True, name='pet-balance',
+            ).start()
+        except Exception as exc:  # noqa: BLE001 - 启动失败也必须释放忙状态
+            self._balance_busy = False
+            error_message = f'余额查询失败：{exc}'
+            QTimer.singleShot(0, lambda message=error_message: bridge.done.emit(False, message))
 
     def _balance_worker(self, bridge, base_url: str, api_key: str, verify_ssl: bool, provider_key: str = '') -> None:
         try:
@@ -1652,6 +1720,15 @@ class AppShell:
                 self.island.set_pet_visible(win.isVisible())
 
         menu = QMenu()
+        # F5：本 build 创建的全部 QMenu（含子菜单）先收集起来，安装时由
+        # _install_tray_menu 显式接管所有权（进程侧强引用保活 + 旧菜单
+        # 在新菜单接管后才释放），防止 wrapper 被回收导致菜单/子菜单被误判删除。
+        tray_submenus: list[QMenu] = [menu]
+
+        def track_menu(child: QMenu) -> QMenu:
+            tray_submenus.append(child)
+            return child
+
         # 气泡是置顶 Tool 窗口（层级高于原生菜单 popup），托盘菜单弹出前
         # 先隐藏气泡，避免气泡盖住菜单
         menu.aboutToShow.connect(lambda: win.hide_speech_bubble())
@@ -1678,7 +1755,7 @@ class AppShell:
             menu.addAction('AI 设置', self.instance.open_chat_settings)
         menu.addAction('桌宠设置', self.instance.open_modern_settings)
 
-        m_char = menu.addMenu('切换角色')
+        m_char = track_menu(menu.addMenu('切换角色'))
         current = str(self.config.get('character', catalog.DEFAULT_CHARACTER))
         for cid in catalog.list_available_characters():
             act = m_char.addAction(cid)
@@ -1727,7 +1804,7 @@ class AppShell:
                 if win_i is None:
                     continue
                 slot_label = f"[slot-{inst.slot_id}]" if inst.slot_id is not None else ""
-                sub = menu.addMenu(f'桌宠 {slot_label}' if slot_label else '桌宠')
+                sub = track_menu(menu.addMenu(f'桌宠 {slot_label}' if slot_label else '桌宠'))
 
                 def _toggle(win=win_i) -> None:
                     if win.isVisible():
@@ -1737,7 +1814,7 @@ class AppShell:
 
                 sub.addAction('显示 / 隐藏', _toggle)
                 # 每窗独立的切换角色（读各自 config 的 current character）
-                m_char = sub.addMenu('切换角色')
+                m_char = track_menu(sub.addMenu('切换角色'))
                 cur = str(inst.config.get('character', catalog.DEFAULT_CHARACTER))
                 for cid in catalog.list_available_characters():
                     act = m_char.addAction(cid)
@@ -1756,7 +1833,38 @@ class AppShell:
         tray.setContextMenu(menu)
         tray.setToolTip('dsh-pet 独立桌宠')
         tray.show()
+        # F5：菜单已由新菜单接管后，显式记录所有权并释放被替换的旧菜单
+        #（owner 生命周期：强引用保活到替换，旧菜单延迟销毁防泄漏）。
+        self._install_tray_menu(menu, tray_submenus)
         return tray
+
+    def _install_tray_menu(self, menu: QMenu, submenus: list[QMenu]) -> None:
+        """显式接管托盘上下文菜单所有权（F5：owner 与替换/销毁顺序）。
+
+        旧菜单必须先等新菜单 ``tray.setContextMenu(menu)`` 接管完成才释放：
+        先 ``deleteLater`` 旧菜单、再记录新菜单的强引用集合，保证任何时刻
+        托盘引用的菜单都有一份进程侧 Python 引用（PySide6 wrapper 不被回收），
+        且被替换的旧菜单经事件循环延迟销毁，不会永久泄漏。
+
+        除菜单本体外，还必须保活每个菜单的 QAction wrapper：子菜单的 menuAction
+        挂在父菜单的 actions 列表里；这些 QAction wrapper 一旦被 GC 终结，对应
+        QMenu 的 wrapper 即使仍被强引用也会被 PySide6 连带标记为已删除（读取
+        sub.actions() 抛 Internal C++ object already deleted）。因此这里一并
+        快照保活全部菜单的 actions，外部临时持有/丢弃 actions 列表不再造成失效。
+        """
+        old = self._tray_menu
+        if old is not None:
+            old.deleteLater()
+        self._tray_menu = menu
+        self._tray_submenus = list(submenus)
+        snapshot: list = []
+        for m in (menu, *submenus):
+            try:
+                snapshot.extend(m.actions())
+            except RuntimeError:
+                # 菜单刚被接管，正常不会走到；防御性跳过避免拖垮托盘刷新
+                continue
+        self._tray_actions = snapshot
 
 
 def _mac_set_dock_icon_visible(visible: bool) -> None:
@@ -1815,6 +1923,10 @@ def _configure_linux_fcitx_input_method() -> None:
         return
     if not os.environ.get("QT_IM_MODULE", "").strip():
         os.environ["QT_IM_MODULE"] = "fcitx"
+
+
+# Historical public name retained for integrations and older tests.
+PetApp = AppShell
 
 
 def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:

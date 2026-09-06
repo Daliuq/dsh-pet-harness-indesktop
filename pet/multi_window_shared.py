@@ -156,6 +156,15 @@ class SharedAgentLinkManager(AgentLinkManager):
         super().__init__(proxy, config, **kw)
         self._stopped = False
 
+    @property
+    def presentation(self):
+        """Compatibility facade for callers of the pre-split presentation API."""
+        return self
+
+    def show_link_bubble(self, text: str, *, important: bool = False, duration_ms: int = 4500) -> None:
+        """Expose presentation's historical bubble entry point."""
+        self._show_link_bubble(text, important=important, duration_ms=duration_ms)
+
     def pause(self) -> None:
         # 单窗隐藏不停共享监视器；呈现扇出已按「可见窗」过滤
         pass

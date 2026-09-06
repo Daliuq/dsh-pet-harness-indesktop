@@ -1733,6 +1733,7 @@ class AppShell:
         # 先隐藏气泡，避免气泡盖住菜单
         menu.aboutToShow.connect(lambda: win.hide_speech_bubble())
         menu.addAction('显示 / 隐藏', toggle_visible)
+        menu.addAction('回到右下角', lambda: win.go_default_corner())
 
         island_action = menu.addAction('灵动岛')
         island_action.setCheckable(True)
@@ -1813,6 +1814,7 @@ class AppShell:
                         win.show()
 
                 sub.addAction('显示 / 隐藏', _toggle)
+                sub.addAction('回到右下角', lambda w=win_i: w.go_default_corner())
                 # 每窗独立的切换角色（读各自 config 的 current character）
                 m_char = track_menu(sub.addMenu('切换角色'))
                 cur = str(inst.config.get('character', catalog.DEFAULT_CHARACTER))

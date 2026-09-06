@@ -18,34 +18,53 @@ from pathlib import Path
 
 PET_DIR = Path(__file__).resolve().parents[1] / "pet"
 
+
 # window.py 行数预算：合并上游 v4.1.0 后实测 4229，留 ~1.7% 余量。
 # 拆分控制器时本预算应随之下调。
+#
 # 2026-09-04 上调到 4330（流畅度批次：刷新率自适应节拍、PreciseTimer、
 # DPR 兜底轮询限频、perfstats 帧间隔看门狗；均有实测数据支撑）。
+#
 # 2026-09-05 上调到 4345（批11-B1：ffmpeg 圈边界定期回收——窗口层把
 # ffmpeg_recycle_minutes 经 _push_recycle 推送给播放 clip（_switch /
 # _fallback_playable_idle / 拖拽重启 / refresh_pet_settings 四处对齐），
 # 复审 P1-2 要求运行期可刷新。注：此前的注释日期「2026-11」为笔误）。
+#
 # 2026-09-05 上调到 4352（批12：_switch 切走成功时清旧 clip 显示槽——
 # A1 修复的窗口权威侧，+6 行含注释；clip 侧清槽 API 在 webm_clip.py）。
+#
 # 2026-09-05 上调到 4360（批12 复审 N1：_on_clip_finished 对弃播 clip
 # 在结束标记消费点补清显示槽，+6 行含注释）。
+#
 # 2026-09-05 上调到 4367（频闪修复：Windows 穿透改原生 WS_EX_TRANSPARENT
 # 样式位、不再 setWindowFlag 重建窗口 +4 行含注释；hideEvent 补 [VIS] 观测
 # +1 行。详见 _plan/current/memory/REVIEW_flicker_glm53.md）。
+#
 # 2026-09-05 批5.3 合入：删 broker 首个 idle 延迟与轮询（净 -44 行），
 # 频闪修复保留（+5），合并后实测 4261 行，预算按实测 +50 行余量收紧。
-WINDOW_PY_LINE_BUDGET = 4311
+#
+# 2026-09-06 黄金回旋 + 边缘探头：窗口仅保留薄钩子（绘制/mask/命中/拖拽/
+# 点击/隐藏冻结/动画约束），控制器实现在 golden_spin.py / edge_probe.py /
+# window_optional_services.py；window.py 净增约 47 行、实测 4333，
+# 预算上调到 4340（+7 余量，理由见本注释）。
+#
+# 2026-09-07 上调到 4350（探头/回旋第四批微调：go_default_corner 在回到右下角前
+# 取消激活中的边缘探头会话，防止宠物斜着出现在右下角；实测 4350）。
+WINDOW_PY_LINE_BUDGET = 4350
+
 
 # modern_settings_dialog.py 行数预算：按结构线拆分后实测 1857 行（拆分前 4811 行）。
 # 主对话框 ModernSettingsDialog + 对话框装配/配置写回 + 为 pet/ 与 tests/ 保留的
 # re-export 留守本文件；控件库 / 菜单布局编辑器 / AI 设置页 / 主题 QSS 已分别拆至
 # settings_widgets / settings_menu_layout_editor / chat/ai_settings_page /
 # settings_theme_qss。预算 = 实测 + 50 行余量；再往上帝类里塞新页面时只许降不涨。
+#
 # 2026-09-05 建立（perf/memory-footprint 拆分批）。
+#
 # 2026-09-06 上调到 1992：合入上游 main（PR73）带来动画预热开关等 +85 行
 # （实测 1942），预算随实测校准。
 MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 1992
+
 
 
 def _read(name: str) -> str:

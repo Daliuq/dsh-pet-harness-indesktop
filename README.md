@@ -1,11 +1,51 @@
 # dsh-pet-indesktop
 
+<p align="center">
+  <a href="https://github.com/MerZlin/dsh-pet-indesktop/releases"><img alt="版本" src="https://img.shields.io/github/v/release/MerZlin/dsh-pet-indesktop?label=%E7%89%88%E6%9C%AC&color=blue"></a>
+  <a href="https://github.com/MerZlin/dsh-pet-indesktop/releases"><img alt="总下载" src="https://img.shields.io/github/downloads/MerZlin/dsh-pet-indesktop/total?label=%E6%80%BB%E4%B8%8B%E8%BD%BD&color=brightgreen"></a>
+  <a href="https://github.com/MerZlin/dsh-pet-indesktop"><img alt="Stars" src="https://img.shields.io/github/stars/MerZlin/dsh-pet-indesktop?style=social"></a>
+  <a href="https://github.com/MerZlin/dsh-pet-indesktop/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/MerZlin/dsh-pet-indesktop?color=orange"></a>
+  <a href="https://github.com/MerZlin/dsh-pet-indesktop"><img alt="Repo size" src="https://img.shields.io/github/repo-size/MerZlin/dsh-pet-indesktop"></a>
+  <a href="https://github.com/MerZlin/dsh-pet-indesktop/issues"><img alt="Issues" src="https://img.shields.io/github/issues/MerZlin/dsh-pet-indesktop"></a>
+  <img alt="平台" src="https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%20%7C%20macOS%20%7C%20Linux-8A2BE2">
+  <img alt="动画素材" src="https://img.shields.io/badge/%E5%8A%A8%E7%94%BB-dynamic%20animations-ff69b4">
+</p>
+
 一个基于 **Python + PySide6** 的独立桌面宠物。项目脱离 DSH 运行时，提供透明无边框、置顶、可拖动、角色切换、动画播放、系统托盘和可选 AI 对话能力。
 
-> **当前版本：v4.1.0**（2026-09 累计版，自 v4.0.0 以来的功能与修复汇总：多开碰撞、灵动岛、快速对话气泡、API/Provider 列表、三平台 CI 等）。发布形态为 **onedir 目录打包 + Inno Setup 安装包（`.exe`）+ 便携 zip 绿色版**：安装版与绿色版运行期都不解压、不产生临时缓存，启动快、卸载干净。
+> **当前开发版（main，2026-09-06）**：已合并 PR #73 与 PR #76。相比 v4.1.0 发布版，当前主线新增了桌宠内存专项治理（长时运行不再单调上涨）、单进程多窗与共享解码链（3 窗 1 进程 1 解码器）、打字频闪根治、设置对话框拆分与死代码清理等结构治理；同时固化了一批开发约束与规则（见下节）。发布形态仍为 **onedir 目录打包 + Inno Setup 安装包（`.exe`）+ 便携 zip 绿色版**：安装版与绿色版运行期都不解压、不产生临时缓存，启动快、卸载干净。
+
+## 开发约束与规则（PR #76 起）
+
+> PR #76 是一轮“实测数据驱动的性能 + 结构治理”。它不只是提交功能，还把这些约束固化成 CI 断言与开发纪律；**给本项目提交代码前请先读本节以及 [`AGENTS.md`](AGENTS.md)、[`docs/WINDOW_PY_SPLIT_GUIDE.md`](docs/WINDOW_PY_SPLIT_GUIDE.md)**。
+
+### 架构红线（`tests/test_architecture.py`，红了即 CI 失败）
+
+1. **纯逻辑层不依赖 Qt**：`collision.py` / `physics.py` / `collision_codec.py` 禁止 import PySide6。
+2. **共享解码链单向依赖**：`decode_fanout.py` 不得反向依赖 `window.py` / `webm_clip.py`，窗口钩子只能通过注入接入。
+3. **窗口私有面冻结**：`PetWindow` 的 `win._xxx` 只允许 `window.py` 自身与 `collision_client.py` 访问；`app.py` / `agent_link.py` / `context_menus/` 出现即为违规。
+4. **`window.py` 行数预算**：当前预算 `4311` 行，只许降不许涨；确需上调必须在 PR 说明理由。
+5. **`modern_settings_dialog.py` 行数预算**：当前预算 `1992` 行（已拆到 `settings_widgets` / `settings_menu_layout_editor` / `chat/ai_settings_page` / `settings_theme_qss`），再往主对话框塞新页面属于红线。
+6. **孤儿簇守卫**：`settings_widgets.py`、`settings_styles*.qss` 等文件不允许“存在但零引用”——要么删除，要么真正接线；防再发由测试守护。
+
+### 文件 / 结构演进规则
+
+- `window.py` 处于 **“只许瘦不许胖”** 的增量拆分公约下：新功能预计超过约 100 行、需改 3 个以上同域方法、或行数预算告警时，先按 `docs/WINDOW_PY_SPLIT_GUIDE.md` 拆控制器。
+- 拆分应**机械搬移、不夹带行为变更**；保留薄委托/兼容面；PR 里说明拆分域、迁出字段与共享字段。
+- 新增普通顶层配置键必须三处同步登记：**默认值 dict + reload 白名单 + `test_config_schema.py` 快照**；特例键（version / proactive_screen / agent_link / chat）走专门迁移路径，不塞普通白名单。
+- 单进程多开的设置作用域：**每窗独立项**（形象/位置/聊天等）存 `config-slot-N.json`；**进程级共享项**（托盘/共享解码/Agent 联动/待办提醒等）以主桌宠 `config.json` 为准，非主窗修改不生效。
+- 新增子桌宠只在 slot 无存档时从主配置落种，**已有用户存档一律保留**。
+
+### CI 与测试纪律（`AGENTS.md`“CI cost discipline”）
+
+- 推送前必须过三道本地门：**ruff、全量 pytest、受影响时序测试族高负载复跑 3 遍**；缝合/脚本化改动后必须重跑 ruff。
+- 新测试涉及真实线程/Qt 事件循环时，必须**事件同步 + 宽预算**；禁止固定 sleep 猜时序、禁止赌目录枚举顺序、禁止用 monotonic 绝对值做回拨算术（CI runner 可能刚开机）。
+- 同一族时序测试连续两轮不绿就停止重试，按既有先例**隔离出主套件**，不要在 PR 门禁里赌时序。
+- 能本地复现的诊断不派付费子代理；派子代理必须给齐已知排除项。
 
 ## 目录
 
+- [开发约束与规则（PR #76 起）](#开发约束与规则pr-76-起)
 - [项目来源与素材声明](#项目来源与素材声明)
 - [v4.0.0 版本亮点](#v400-版本亮点)
 - [当前状态](#当前状态)
@@ -21,7 +61,7 @@
 - [打包发布](#打包发布)
 - [旧版 onefile 缓存清理（仅旧版本需要）](#旧版-onefile-缓存清理仅旧版本需要)
 - [配置与安全说明](#配置与安全说明)
-- [最近修复（2026-08）](#最近修复2026-08)
+- [最近修复（开发版 / 2026-08 起）](#最近修复开发版--2026-08-起)
 - [已知限制](#已知限制)
 - [项目文档](#项目文档)
 - [许可证与致谢](#许可证与致谢)
@@ -76,7 +116,7 @@ v4.0.0 是一次大版本升级：在 v3.1.1 的桌宠基础上，合并了社�
 
 DeepSeek 余额显示（气泡/小部件思路）参考了 [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)，本项目的实现为桌宠内置的轻量版（菜单「DeepSeek 余额」+ 可选自动刷新，通过 DeepSeek 官方 `/user/balance` 接口查询，详见 [DeepSeek API 查询余额文档](https://api-docs.deepseek.com/zh-cn/api/get-user-balance/)）。
 
-当前动画素材已同步参考项目近期更新后的高清 WebM 资源。项目以 WebM 目录为动画源；`assets/characters` 包含 97 个 WebM 动画文件。GIF 目录仅在构建 GIF 变体时生成。后续新增或替换动画时，请更新 WebM，需要构建 GIF 变体时再生成对应 GIF。
+当前动画素材已同步参考项目近期更新后的高清 WebM 资源。项目以 WebM 目录为动画源；`assets/characters` 包含 106 个 WebM 动画文件。GIF 目录仅在构建 GIF 变体时生成。后续新增或替换动画时，请更新 WebM，需要构建 GIF 变体时再生成对应 GIF。
 
 
 </details>
@@ -86,6 +126,7 @@ DeepSeek 余额显示（气泡/小部件思路）参考了 [MeteorNOX/DeepSeek-B
 
 ## 当前状态
 
+- **开发版（main，2026-09-06，未发布）**：以 PR #76 为最新基线，包含 v4.1.0 之后的 PR #64/#65/#68/#70/#71/#72/#73/#76——桌宠长时运行内存稳定（多进程模式 ~270MB/3 只；单进程多窗 3 窗共 1 进程约 181–197MB，3.5h 无单调上涨）；单进程多窗共享解码（同角色多窗 1 个 ffmpeg 解码链）；打字时不再因截图覆盖层/穿透切换频闪；设置对话框拆分与死代码清理（净 -1300+ 行）。
 - **v4.1.0（累计版）**：自 v4.0.0 以来的功能与修复汇总——多开碰撞、灵动岛、快速对话气泡、自定义 Agent 联动通道、API/Provider 列表、右键菜单 LTR、三平台 CI 等（PR #36/#39/#40/#41/#44/#46/#47/#49/#50/#52/#53/#54/#55/#56/#59/#60）。
 - **v4.0.5**：功能版——音效体系升级（点击音效包/Agent 联动音效）、甩出力度档位、弹弓弹射、光标隐藏自动穿透、点击 Q 弹卡顿修复、自启变体独立（PR #33/#34/#35）。
 - **v4.0.4**：功能版——余额分档动画、DeepSeek 峰谷提示（可自定义文案与颜色）、后台音乐自动唱歌、点击音效打断、移动动画调整、位置记忆修复、自启残留清理、thinking 专属气泡文案等（PR #29/#30/#31/#32）。
@@ -124,7 +165,7 @@ DeepSeek 余额显示（气泡/小部件思路）参考了 [MeteorNOX/DeepSeek-B
 - **只需要桌宠陪伴**：装无 Chat 版，包体更小、启动更轻。
 - **不想安装、追求便携**：用绿色版 zip，解压到任意目录双击即用。
 
-> 两个版本使用同一套高清 WebM 素材（97 段动画），只是入口不同：Chat 版会加载聊天子系统，无 Chat 版完全不携带 AI 对话依赖。
+> 两个版本使用同一套高清 WebM 素材（106 段动画），只是入口不同：Chat 版会加载聊天子系统，无 Chat 版完全不携带 AI 对话依赖。
 >
 > 旧版 GIF 超大单文件（约 800 MB，运行时会在 C 盘临时目录解压并可能残留缓存）不再默认发布；确有需要可参考本文档「打包发布」一节自行构建 GIF 变体。
 >
@@ -335,9 +376,17 @@ pythonw -m pet
 - 在「设置 → 常规 → 动画与移动」开启「省电模式」后：桌宠一段时间无交互时动画按半帧率呈现（24fps 素材 → 12fps 效果），任何交互立即恢复全帧率；同时停止后台动画预热（不再预载非核心动画的首帧，进一步省 CPU 与内存）。
 - 默认关闭；多开时每只各自独立设置。
 
+### 性能与内存治理（PR #76）
+
+- 实测驱动：修复前多开 1-2 小时后每只涨到 220MB+/只且不回落；修复后多进程模式长时运行稳定（3 只合计约 270MB），**单进程多窗模式 3 窗共 1 进程、3.5h 浸泡在 181–197MB 区间震荡、无单调上涨**。
+- 解码链收敛：同角色多窗共享一条进程内解码链（`DecodeFanoutHub`），3 窗只启动 1 个 ffmpeg 解码进程；ffmpeg 固定 `-threads 1`，并按 `ffmpeg_recycle_minutes`（默认 10 分钟）在圈边界定期回收，避免子进程内存无限爬升。
+- 首帧缓存预算：默认 `first_frame_cache_max_mb=8`（4–64 可配），只保留点击/转向/拖拽等瞬时交互核的 pinned 缓存，idle/move 交给预测式预热与 LRU，避免“每播一段新动画就 +1.76MB 不释放”的慢涨。
+- 启动与内存降载：未启用点击/碰撞音效时不拉起 QtMultimedia（省约 38MB）；PIL 只在“看看屏幕/主动识屏”截图路径懒加载。
+- 频闪根因修复：全屏自动隐藏排除截图覆盖层/工具窗口；Windows 光标穿透改用原生 `WS_EX_TRANSPARENT`，不再 `setWindowFlag` 重建原生窗口。
+
 ### 单进程多开与共享解码
 
-- 在「设置 → 常规 → 多开」开启「单进程多开（省内存）」并重启后，「生小肥鱼」在同一进程内创建新桌宠：多只宠物只占一个进程，且空闲时多只播的是同一份待机素材，由进程内帧扇出（`DecodeFanoutHub`）统一解码——待机时 ffmpeg 解码进程从 N 个减到 1 个，解码 CPU 与内存显著降低；机制与平台无关。
+- 正式特性（默认关闭）：在「设置 → 常规 → 多开」开启「单进程多开（省内存）」并重启后，「生小肥鱼」在同一进程内创建新桌宠：多只宠物只占一个进程，且空闲时多只播的是同一份待机素材，由进程内帧扇出（`DecodeFanoutHub`）统一解码——待机时 ffmpeg 解码进程从 N 个减到 1 个，解码 CPU 与内存显著降低；机制与平台无关。
 - 每只桌宠的设置存档（含位置、外观）在多开模式间通用，切换开关不会丢配置。
 - 失败无感回退：无发布者、断流等任何情况下，消费端都会自动回退本地解码，播放行为与关闭时一致。
 
@@ -640,7 +689,7 @@ assets/
             └── random/
 ```
 
-- `assets/characters` 是 WebM 动画源目录，包含 97 个 WebM 动画。
+- `assets/characters` 是 WebM 动画源目录，包含 106 个 WebM 动画。
 - GIF 目录（`assets/characters_gif`）仅在构建 GIF 变体时生成。
 - 没有稳定静态头像时，不强制从 WebM/GIF 截取首帧，以避免启动变慢和打包兼容性问题。
 
@@ -682,7 +731,7 @@ python normalize_step03.py
 python encode_thumbs.py
 ```
 
-> 参考项目全部 97 个动作均采用**路线 B（PR 手工抠像）**：对含第三方物品/透明边缘复杂的动作，自动 HSV 抠像易残边或误抠；`chroma_step02.py` 保留为自动化兜底。中间产物 step01~04 由脚本生成、不入仓库；`video/` 源视频与 `scripts/` 是成果、入库维护。
+> 参考项目全部 106 个动作均采用**路线 B（PR 手工抠像）**：对含第三方物品/透明边缘复杂的动作，自动 HSV 抠像易残边或误抠；`chroma_step02.py` 保留为自动化兜底。中间产物 step01~04 由脚本生成、不入仓库；`video/` 源视频与 `scripts/` 是成果、入库维护。
 
 #### ③ 透明动画 → 接入本项目
 
@@ -699,7 +748,7 @@ python encode_thumbs.py
    ```
 
 2. 保持几何约定与播放器一致：画布 **640×360**、24fps、**VP9 alpha 透明**；角色脚底对齐画布 y=330（`catalog.py` 中 `FEET_Y=330`、落地偏移 `PAD=30`），这样桌宠窗口的脚底落地对齐才准确。
-3. 命名保持稳定、避免重复；可参考 `assets/characters/shenshen/videos/` 现有 97 段动画的组织方式。
+3. 命名保持稳定、避免重复；可参考 `assets/characters/shenshen/videos/` 现有 106 段动画的组织方式。
 4. 如需 GIF 变体，运行 `python scripts/convert_to_gif.py --force --clean` 同步生成。
 
 > 不想重新打包？把做好的透明 WebM 按「切换角色」的外部角色目录结构直接放入 `characters/<角色ID>/videos/`，右键菜单即可热加载新角色。
@@ -746,80 +795,89 @@ python scripts/convert_to_gif.py --force --clean
 
 ```text
 pet/
-├── app.py                 # 应用入口、托盘、角色切换和聊天集成
-├── config.py              # 配置读取、迁移和持久化（reload 白名单 + schema 测试）
-├── config_domains.py      # 配置域 facade（chat/agent_link/proactive/collision/menu）
-├── window.py              # 桌宠主窗口（组合根；碰撞/平台层已拆出，见下行）
-├── collision.py           # 碰撞物理核心（纯 Python，无 Qt）
-├── collision_client.py    # 窗口侧碰撞客户端（预测/对账/上报节流/squash 冷却）
-├── collision_codec.py     # 碰撞 IPC 帧编解码 + 水位去重 + 协议 TypedDict（纯 Python）
-├── collision_ipc.py       # 碰撞协调者选举与成员协议（QLocalServer 控制面）
-├── collision_debug.py     # 碰撞调试日志
-├── decode_fanout.py       # 同角色共享解码链（进程内帧扇出 DecodeFanoutHub）
-├── frame_cache.py         # 通用字节预算 LRU（webm 元数据缓存等小缓存用）
-├── perfstats.py           # 性能打点（PET_PERF_STATS=1 启用，atexit 落盘）
-├── predictive_prewarm.py  # 预测式预解码预热（切动画前预拉下一段）
-├── platform_win.py        # Windows 平台层（鼠标穿透/全屏判定/PerPixel 输入）
-├── platform_mac.py        # macOS 平台层（NSWindow level/激活策略）
-├── catalog.py             # 角色和动画素材发现
-├── library.py             # 动画库访问（懒加载 + 优先级预热）
-├── webm_clip.py           # WebM 播放（reader 线程/解码节流/fan-out 钩子）
-├── speech_bubble.py       # 气泡绘制与交互
-├── speech_bubble_text.py  # 气泡分页/定位纯函数
-├── click_sound.py         # 点击音效（ClickSoundPool 单例封装）
-├── desktop_notify.py      # 自绘右下角系统通知
-├── slot_manager.py        # 多开 slot 文件锁
-├── proactive.py           # 主动识屏陪伴（Watcher 编排）
-├── proactive_limiter.py   # 主动识屏频控
-├── proactive_memory.py    # 主动识屏记忆
-├── agent_link.py          # Agent 联动监视器（多 Agent 事件源：CLI/IDE/SQLite 轮询）
-├── agent_link_reducer.py  # 联动状态机（去抖/节流/完成确认，纯状态）
+├── app.py                    # AppShell + PetInstance：进程级/每窗容器与装配（托盘、多窗共享）
+├── config.py                 # 配置读取、迁移和持久化（reload 白名单 + schema 测试）
+├── config_domains.py         # 配置域 facade（chat/agent_link/proactive/collision/menu）
+├── window.py                 # 桌宠主窗口（组合根；碰撞/平台层/动画链已拆出，受行数预算红线）
+├── window_optional_services.py # 窗口可选服务懒装配 mixin（todo/file_eater 等）
+├── collision.py              # 碰撞物理核心（纯 Python，无 Qt）
+├── collision_client.py       # 窗口侧碰撞客户端（预测/对账/上报节流/squash 冷却）
+├── collision_codec.py        # 碰撞 IPC 帧编解码 + 水位去重 + 协议 TypedDict（纯 Python）
+├── collision_ipc.py          # 碰撞协调者选举与成员协议（QLocalServer 控制面）
+├── collision_debug.py        # 碰撞调试日志
+├── decode_fanout.py          # 同角色共享解码链（进程内帧扇出 DecodeFanoutHub，单向依赖约束）
+├── frame_cache.py            # 通用字节预算 LRU（webm 元数据缓存等小缓存用）
+├── perfstats.py              # 性能打点（PET_PERF_STATS=1 启用，atexit 落盘）
+├── predictive_prewarm.py     # 预测式预解码预热（切动画前预拉下一段，默认提前 350ms）
+├── platform_win.py           # Windows 平台层（鼠标穿透/全屏判定/PerPixel 输入/WS_EX_TRANSPARENT）
+├── platform_mac.py           # macOS 平台层（NSWindow level/激活策略）
+├── catalog.py                # 角色和动画素材发现
+├── library.py                # 动画库访问（懒加载 + 优先级预热）
+├── webm_clip.py              # WebM 播放（reader 线程/软停 re-arm/定期回收/fan-out 钩子）
+├── speech_bubble.py          # 气泡绘制与交互
+├── speech_bubble_text.py     # 气泡分页/定位纯函数
+├── click_sound.py            # 点击音效（ClickSoundPool 单例封装）
+├── desktop_notify.py         # 自绘右下角系统通知
+├── slot_manager.py           # 多开 slot 文件锁
+├── child_pet_cleanup.py      # 子肥鱼清理（关闭非当前 runtime 标记 + 删除 slot 数据）
+├── file_eater.py             # 拖拽文件“吃”动画与统计（不真实删除/移动文件）
+├── proactive.py              # 主动识屏陪伴（Watcher 编排）
+├── proactive_limiter.py      # 主动识屏频控
+├── proactive_memory.py       # 主动识屏记忆
+├── agent_link.py             # Agent 联动监视器（多 Agent 事件源：CLI/IDE/SQLite 轮询）
+├── agent_link_reducer.py     # 联动状态机（去抖/节流/完成确认，纯状态）
 ├── agent_link_presentation.py # 联动表现层（气泡/音效）
-├── multi_window_shared.py # 进程级多窗共享子系统（agent_link/proactive/全屏 watcher）
-├── vision.py              # 视觉模型调用（看看屏幕/主动识屏）
-├── harness_launcher.py    # DeepSeek Harness 一键启动
-├── instance_launcher.py   # 「生小肥鱼」多开孵化
-├── modern_settings_dialog.py  # 新版侧边栏设置对话框
-├── todo_reminder.py      # 待办提醒调度（气泡/桌面通知，PR72 合入）
-├── todo_panel.py         # 待办管理面板（右键菜单「待办提醒」打开）
-├── context_menus/         # 新旧菜单模板、图标、彩蛋入口
-├── chat/                  # 独立 AI 对话子系统（现代双栏 + 经典手机式）
-│   ├── models.py          # 数据模型（ProviderConfig/ChatSession/...）
-│   ├── providers.py       # Provider 请求与连接测试
-│   ├── service.py         # 对话服务
-│   ├── session_store.py   # 会话持久化（异步 writer + 注册表）
-│   ├── geometry.py        # 聊天窗跟随定位（双 UI 共享纯函数）
-│   ├── utils.py           # 会话标题/时间格式化（双 UI 共享）
-│   ├── themes.py          # 聊天窗背景主题
-│   ├── widgets.py         # 新版聊天窗
-│   ├── legacy_widgets.py  # 经典手机式聊天窗
+├── multi_window_shared.py    # 进程级多窗共享子系统（agent_link/proactive/全屏 watcher）
+├── vision.py                 # 视觉模型调用（看看屏幕/主动识屏；PIL 懒加载）
+├── harness_launcher.py       # DeepSeek Harness 一键启动
+├── instance_launcher.py      # 「生小肥鱼」多开孵化
+├── modern_settings_dialog.py # 新版设置主对话框（已拆分瘦身，保留 re-export；受行数预算红线）
+├── settings_widgets.py       # 设置控件库（自绘开关/SettingRow/ModernSelect 等）
+├── settings_menu_layout_editor.py # 右键菜单布局编辑器
+├── settings_theme_qss.py     # 设置主题 QSS（明暗）
+├── todo_reminder.py          # 待办提醒调度（气泡/桌面通知，PR72 合入；进程级单例）
+├── todo_panel.py             # 待办管理面板（右键菜单「待办提醒」打开）
+├── context_menus/            # 新旧菜单模板、图标、彩蛋入口
+├── chat/                     # 独立 AI 对话子系统（现代双栏 + 经典手机式）
+│   ├── models.py             # 数据模型（ProviderConfig/ChatSession/...）
+│   ├── providers.py          # Provider 请求与连接测试
+│   ├── service.py            # 对话服务
+│   ├── session_store.py      # 会话持久化（异步 writer + 注册表）
+│   ├── geometry.py           # 聊天窗跟随定位（双 UI 共享纯函数）
+│   ├── utils.py              # 会话标题/时间格式化（双 UI 共享）
+│   ├── themes.py             # 聊天窗背景主题
+│   ├── widgets.py            # 新版聊天窗
+│   ├── legacy_widgets.py     # 经典手机式聊天窗
+│   ├── ai_settings_page.py   # AI 设置页（PR #76 从 modern_settings_dialog 拆出）
 │   ├── modern_styles.qss / legacy_styles.qss
 │   └── ...
-└── updater.py             # 检查更新与发布资产解析
+└── updater.py                # 检查更新与发布资产解析
 
 integrations/dsh-pet-bridge/  # DSH 桥接插件（Agent 联动）
 packaging/
-├── pet_entry.py           # Chat 构建入口
-├── pet_entry_no_chat.py   # 无 Chat 构建入口
-└── dsh-pet.iss            # Inno Setup 通用安装包脚本（/D 参数编译各变体）
+├── pet_entry.py              # Chat 构建入口
+├── pet_entry_no_chat.py      # 无 Chat 构建入口
+└── dsh-pet.iss               # Inno Setup 通用安装包脚本（/D 参数编译各变体）
 
 scripts/
-├── build_onedir.ps1       # Windows onedir 构建 + zip 绿色版打包（本地与 CI 共用入口）
-├── build_macos.sh         # macOS .app 构建（本地与 CI 共用入口）
-├── build_linux.sh         # Linux onedir 构建（本地与 CI 共用入口）
-├── check_bundle_encoding.py # 产物中文编码自检（issue #26，构建脚本内自动调用）
-├── make_icon.py           # 从待机动画提取封面帧生成应用图标（assets/icon.ico）
-├── convert_to_gif.py      # WebM → GIF 全量同步脚本
-└── cleanup_mei_cache.py   # 检查/清理旧 onefile 版本遗留的 _MEI 缓存（默认预览）
+├── build_onedir.ps1          # Windows onedir 构建 + zip 绿色版打包（本地与 CI 共用入口）
+├── build_macos.sh            # macOS .app 构建（本地与 CI 共用入口）
+├── build_linux.sh            # Linux onedir 构建（本地与 CI 共用入口）
+├── check_bundle_encoding.py  # 产物中文编码自检（issue #26，构建脚本内自动调用）
+├── make_icon.py              # 从待机动画提取封面帧生成应用图标（assets/icon.ico）
+├── convert_to_gif.py         # WebM → GIF 全量同步脚本
+└── cleanup_mei_cache.py      # 检查/清理旧 onefile 版本遗留的 _MEI 缓存（默认预览）
 
-tests/                     # 单元测试、Qt offscreen 测试和构建相关验证
-                           # （含 test_architecture.py 架构红线：依赖方向 /
-                           #  window 私有面冻结 / window.py 行数预算）
+tests/                        # 单元测试、Qt offscreen 测试和构建相关验证
+                              # （含 test_architecture.py 架构红线：依赖方向 /
+                              #  窗口私有面冻结 / window.py 行数预算 /
+                              #  modern_settings_dialog.py 行数预算 / 孤儿簇守卫）
 ```
 
 **给 window.py 加功能前必读**：[docs/WINDOW_PY_SPLIT_GUIDE.md](docs/WINDOW_PY_SPLIT_GUIDE.md)
 ——window.py 处于「只许瘦不许胖」的增量拆分公约下（CI 有行数预算红线），
-新功能先按公约拆对应控制器再动手。
+新功能先按公约拆对应控制器再动手。`modern_settings_dialog.py` 同理：
+控件库/菜单编辑器/AI 设置页/主题 QSS 已拆出，再往主对话框塞新页面会被行数预算红线拦下。
 </details>
 
 <details>
@@ -836,10 +894,12 @@ python -m pytest -q
 python -m compileall pet packaging scripts
 ```
 
-最近一轮记录（v4.0.1）：
+最近一轮记录（PR #76 合并后的 main，2026-09-06）：
 
-- `pytest`：完整测试套件见 CI / 本地运行 `pytest -q`。
+- `pytest`：**1322 passed / 7 skipped**（CI 三平台 windows/ubuntu/macos 全绿；本机如遇 Windows symlink 权限等环境性失败，与改动无关）。
+- `ruff`：干净。
 - `compileall`：通过。
+- 架构红线测试通过：依赖方向 / 窗口私有面冻结 / `window.py` 与 `modern_settings_dialog.py` 行数预算 / 孤儿簇守卫。
 - WebM Chat、WebM 无 Chat 两个 onedir 构建均完成启动冒烟验证：进程存活超过 8 秒，系统临时目录与程序目录**均无新增 `_MEI` 缓存**。
 
 如果要验证真实窗口，不要设置 `QT_QPA_PLATFORM=offscreen`，直接运行 `python -m pet` 或打包后的程序，重点检查：
@@ -970,9 +1030,36 @@ python scripts/cleanup_mei_cache.py --delete
 </details>
 
 <details>
-<summary><b>最近修复（2026-08）</b></summary>
+<summary><b>最近修复（开发版 / 2026-08 起）</b></summary>
 
-## 最近修复（2026-08）
+## 最近修复（开发版 / 2026-08 起）
+
+### PR #76（2026-09-06 合并，当前开发版基线）
+
+**性能与内存**
+- 桌宠长时运行内存不再单调上涨：非显示 clip 清空显示槽，修复每播一段动画就滞留约 1.76MB 的慢涨主因；3.5 小时浸泡无泄漏。
+- ffmpeg 解码改为常驻循环 + `-threads 1`，消灭每 10s 杀进程重启的 churn；圈边界按 `ffmpeg_recycle_minutes`（默认 10 分钟）定期回收。
+- 首帧缓存预算默认降到 8MB（4–64 可配），pinned 集瘦身到点击/转向/拖拽等瞬时交互核；新增预测式首帧预热（默认提前 350ms）。
+- 未启用音效时不拉起 QtMultimedia（省约 38MB）；PIL 改为截图功能按需导入。
+
+**单进程多窗与共享解码**
+- `PetApp` 拆为进程级 `AppShell` + 每窗 `PetInstance`；「单进程多开」转正为设置页正式开关（默认关闭，重启生效）。
+- 同角色共享解码链：进程内 `DecodeFanoutHub` 替代旧 shm broker，3 窗 1 进程 1 解码器；旧 `decode_broker.py`（1464 行）退役删除。
+- 新开实例首次占用 slot 时从主配置落种；移除 `DSH_PET_SPAWN_FRESH` 强制重播种，**已有 slot 用户存档一律保留**。
+
+**交互稳定性**
+- 全屏自动隐藏排除截图覆盖层/工具窗口，修复打字时桌宠频闪第一触发源。
+- Windows 鼠标穿透切换改原生 `WS_EX_TRANSPARENT`，不再 `setWindowFlag` 重建原生窗口，根治第二触发源。
+
+**结构治理 / 代码健康**
+- `modern_settings_dialog.py` 从 4811 行拆到 1857 行：控件库/菜单布局编辑器/AI 设置页/主题 QSS 四模块拆出；新增行数预算红线。
+- 死代码清理净 -1300+ 行：删除被合并静默回退的孤儿文件簇（`settings_widgets.py` 旧残壳、死 QSS、`decode_broker.py` 等），并新增孤儿簇守卫测试。
+- 新增/加固架构红线测试：`decode_fanout` 单向依赖、`window.py` 与 `modern_settings_dialog.py` 行数预算、窗口私有面冻结。
+- 文档漂移修正 16 条，重写“全程未触被测对象”的假测试；`AGENTS.md` 新增 CI 成本纪律。
+
+**验证**
+- 全量测试 **1322 passed / 7 skipped**；CI 三平台（windows/ubuntu/macos）全绿；ruff 干净。
+- 实机浸泡 3.5 小时无泄漏；关键并发/生命周期改动经独立静态审查 + 实机回归双闸门。
 
 ### PR #73（2026-09-05 合并）
 
@@ -1058,7 +1145,7 @@ python scripts/cleanup_mei_cache.py --delete
 - **动画边缘毛边/暗边修复**：帧渲染改为**预乘 alpha 缩放**（直通 alpha 缩放会让透明像素的 RGB 渗入半透明边缘，产生暗边/彩边）；Windows 上点击命中测试由 setMask 的 1-bit 裁剪改为**逐像素命中测试**（WM_NCHITTEST + HTTRANSPARENT，透明区域鼠标穿透、可见区域可点击），不再破坏 `WA_TranslucentBackground` 的逐像素半透明边缘。
 - **Harness 启动兼容旧版 dsh**：启动前探测 `web --help` 是否支持 `--no-open`（按命令缓存）——旧版 dsh（如 0.1.0-rc.3）没有该选项，强行传参会启动失败；不支持时不传，由 dsh 自己打开浏览器，桌宠不重复打开。
 - **动画帧率精度**：视频帧时长按 24fps 精确值（40ms → 42ms = 1000/24）修正，动画播放定时器改用精确定时器（PreciseTimer），消除粗略定时器漂移导致的节奏/移动插值偏差。
-- **右键菜单启动提速与避让**：动画分类子菜单**首次展开才填充**动作（根菜单构建不再遍历 97 个动画，首次右键不再卡顿数秒）；菜单弹出位置智能选择——优先角色右侧（子菜单向右展开）、屏幕不够时放左侧并让子菜单向左展开（RTL）、再不行放屏幕远角，根菜单与子菜单都不再遮挡角色；快捷启动应用图标按 (类型, 路径) 缓存（QFileIconProvider 首次取图标慢）。
+- **右键菜单启动提速与避让**：动画分类子菜单**首次展开才填充**动作（根菜单构建不再遍历 106 个动画，首次右键不再卡顿数秒）；菜单弹出位置智能选择——优先角色右侧（子菜单向右展开）、屏幕不够时放左侧并让子菜单向左展开（RTL）、再不行放屏幕远角，根菜单与子菜单都不再遮挡角色；快捷启动应用图标按 (类型, 路径) 缓存（QFileIconProvider 首次取图标慢）。
 - **设置窗口打开期间暂停气泡**：新版设置/聊天设置任一打开时，桌宠气泡暂停显示（关闭后恢复），不再盖住设置界面。
 - **macOS/Linux 打包补 integrations 资源（PR #22）**：onedir 构建显式打包 `integrations/`（含 DSH 桥接插件），修复 macOS/Linux 上「启动 DeepSeek Harness → 一键安装桥接插件」因资源缺失而失败的问题；构建后增加断言检查，漏打包直接报错。
 - **Chat 版显式收集 keyring（API Key 系统安全存储）**：Windows/Linux/macOS 构建均显式 `--collect-all keyring`，确保 Chat 版 API Key 走系统凭据存储可用。
@@ -1136,6 +1223,9 @@ python scripts/cleanup_mei_cache.py --delete
 
 ## 项目文档
 
+- [`AGENTS.md`](AGENTS.md)：工程指南与 CI 成本纪律（PR #76 后硬性规矩）。
+- [`docs/WINDOW_PY_SPLIT_GUIDE.md`](docs/WINDOW_PY_SPLIT_GUIDE.md)：`window.py` 演进指南、功能驱动拆分流程与架构红线说明。
+- [`docs/HANDOVER_2026-09.md`](docs/HANDOVER_2026-09.md)：2026-09 性能/结构线交付手册（含后续批次更新说明）。
 - [`docs/ONEDIR_PACKAGING.md`](docs/ONEDIR_PACKAGING.md)：onedir 构建、绿色版 zip 与 Inno Setup 安装包流水线。
 - [`docs/BUILD_ARTIFACTS-2026-08-22.md`](docs/BUILD_ARTIFACTS-2026-08-22.md)：EXE 构建、大小、哈希和启动验证记录。
 

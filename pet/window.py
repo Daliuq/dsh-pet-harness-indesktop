@@ -749,6 +749,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self._arm_screen_restore_retry()
 
         self.attach_collision_session(collision_session)
+        self._install_effect_services()
 
     @property
     def click_sound_enabled(self) -> bool:
@@ -992,9 +993,33 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         """公开转发：以窗口中心相对屏幕可用区的比例持久化位置（等价 _save_position）。"""
         self._save_position()
 
-    def _go_default_corner(self, *args, **kwargs):
-        """Compatibility delegation (window_placement.go_default_corner)."""
-        return window_placement.go_default_corner(self, *args, **kwargs)
+    def _go_default_corner(self) -> None:
+        # 用户明确要求回右下角 = 手动位置决策，撤销"等副屏上线自动恢复"
+        _disarm = getattr(self, '_disarm_screen_restore_retry', None)
+        if callable(_disarm):
+            _disarm()
+        # Position can still be written by the animation interpolation timer or
+        # drag-physics timer after a direct move. Stop both first, otherwise the
+        # pet briefly reaches the corner and is immediately snapped back.
+        self._cancel_move()
+        self._stop_physics()
+        self._drag_target = None
+        # 探头会话若未退出，宠物会保持 ±45° 倾斜姿态出现在右下角；显式“回右下角”
+        # 是普通位置命令，应先取消探头（不恢复原 off-screen 位置）。
+        edge = getattr(self, "_edge_probe", None)
+        if edge is not None and getattr(edge, "active", False):
+            cancel = getattr(edge, "cancel", None)
+            if callable(cancel):
+                cancel("return_corner", restore=False)
+        scr = self._screen_available()
+        avail = scr.availableGeometry()
+        x = avail.right() - self._w - catalog.CORNER_MARGIN
+        y = avail.bottom() - self._h
+        logging.info('回到右下角 screen=%s avail=(%d,%d,%d,%d) dpr=%s -> (%d,%d)',
+                     scr.name(), avail.left(), avail.top(), avail.right(),
+                     avail.bottom(), scr.devicePixelRatio(), x, y)
+        self.move(x, y)
+        self._save_position()
 
     def go_default_corner(self) -> None:
         """公开转发：手动回到右下角（等价 _go_default_corner）。"""
@@ -1060,6 +1085,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         if getattr(self, "_music_sing_enabled", False) and music_timer is not None and music_timer.isActive():
             QTimer.singleShot(0, self, self._check_music_sing)
         self._restore_dock_icon_preference()
+        self._effects_on_shown()
 
     def hide(self, *, notify: bool = True) -> None:
         """隐藏桌宠。
@@ -1073,6 +1099,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._ensure_dock_icon_on_hide()
         logging.info("[VIS] 桌宠隐藏 notify=%s anim=%s", notify, getattr(self, 'anim', '?'))  # 频闪排查观测
         self._hidden_paused = True
+        self._effects_on_hidden()
         self._pause_activity()
         super().hide()
         self._submit_collision_state(force=True)
@@ -1527,6 +1554,9 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         B7 复审 R2：Agent 回到 idle 时只取消联动来源的待重试）。
         """
         self._cancel_move()
+        filter_switch = getattr(self, '_effects_filter_switch', None)
+        if callable(filter_switch):
+            name = filter_switch(name)
         prev_anim = self.anim
         prev_movie = self.movie
         prev_click_hold = self._click_hold
@@ -2087,8 +2117,18 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         p = QPainter(canvas)
         if self._frame_pixmap is not None:
             rect = self._frame_draw_rect()
-            # 与 paintEvent 完全相同的绘制调用，保证 mask 与画面逐像素一致
-            p.drawPixmap(rect, self._frame_pixmap)
+            effects_angle = getattr(self, '_effects_current_angle', None)
+            angle = effects_angle() if callable(effects_angle) else 0.0
+            if abs(angle) > 1e-6:
+                # 旋转路径必须与 paintEvent 普通帧分支完全一致：平移 PAD 后
+                # 围绕帧绘制矩形中心旋转，保证 mask/可见轮廓与画面逐像素一致。
+                p.translate(rect.topLeft())
+                draw_rect = QRect(0, 0, rect.width(), rect.height())
+                self._effects_paint(p, draw_rect)
+                p.drawPixmap(0, 0, self._frame_pixmap)
+                self._effects_paint_end(p, draw_rect)
+            else:
+                p.drawPixmap(rect, self._frame_pixmap)
         p.end()
         mask = QBitmap.fromImage(canvas.createAlphaMask())
         self._mask_bounds = QRegion(mask).boundingRect()
@@ -2126,6 +2166,11 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         if self._frame_pixmap is None or self._frame_pixmap.isNull():
             return False
         rect = self._frame_draw_rect()
+        effects_angle = getattr(self, '_effects_current_angle', None)
+        angle = effects_angle() if callable(effects_angle) else 0.0
+        if abs(angle) > 1e-6:
+            # 旋转路径：先把命中点逆变换回未旋转帧坐标，再走既有 alpha 判定。
+            local = self._effects_untransform(local, rect).toPoint()
         if not rect.contains(local):
             return True
         if self._hit_alpha_image is None:
@@ -2220,7 +2265,19 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             else:
                 # 落地对齐：整帧下移 PAD×scale，让人物脚底踩在窗口底线
                 painter.translate(0, int(round(catalog.PAD * self.scale)))
-                painter.drawPixmap(0, 0, self._frame_pixmap)
+                draw_rect = QRect(
+                    0, 0,
+                    int(round(catalog.CANVAS_W * self.scale)),
+                    int(round(catalog.CANVAS_H * self.scale)),
+                )
+                effects_angle = getattr(self, '_effects_current_angle', None)
+                angle = effects_angle() if callable(effects_angle) else 0.0
+                if abs(angle) > 1e-6:
+                    self._effects_paint(painter, draw_rect)
+                    painter.drawPixmap(0, 0, self._frame_pixmap)
+                    self._effects_paint_end(painter, draw_rect)
+                else:
+                    painter.drawPixmap(0, 0, self._frame_pixmap)
         painter.end()
         if perfstats.ENABLED:
             # 窗口绘制（paintEvent 全段，含 slingshot/squash 附加绘制，P0 观测）。
@@ -2381,10 +2438,16 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
                 self._link_anim_current = nxt
                 self._switch(nxt)
                 return
-        if name in self.turns:
+        skip_facing = getattr(self, '_effects_skip_turn_facing', None)
+        if name in self.turns and not (callable(skip_facing) and skip_facing()):
             self.facing = 'right' if self.facing == 'left' else 'left'
         if name == self.drag or name in self.clicks:
             self._cancel_animation_gap()
+            if name in self.clicks:
+                # “点击触发黄金回旋”：点击动画自然结束后接续一段旋转。
+                click_finished = getattr(self, '_effects_on_click_anim_finished', None)
+                if callable(click_finished):
+                    click_finished()
             if self.idles:
                 self._switch(self._pick(self.idles))
             else:
@@ -2981,6 +3044,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
                 return
             self._dragging = True
             self._interaction_state = "DRAGGING"
+            self._effects_on_drag_started()
             self._submit_collision_state(force=True)
             # 用户真正开始拖动 = 接管位置决策，撤销"等副屏上线自动恢复"
             # （必须在这里而不是按下时：普通点击/未过阈值/未按 SHIFT 不算接管）
@@ -3071,7 +3135,11 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             if self.idles:
                 self._switch(self._pick(self.idles))  # 回待机缓冲
         elif dist < catalog.DRAG_THRESHOLD * self.scale:
-            if self._press_sound_pair is not None and self.click_sound_enabled:
+            # 边缘探头激活时，点击是“拉直/重置倒计时”的探头操作，不是普通点击反馈，
+            # 不播点击音效。
+            probe_active = getattr(self, '_effects_probe_active', None)
+            probe_click = bool(probe_active()) if callable(probe_active) else False
+            if self._press_sound_pair is not None and self.click_sound_enabled and not probe_click:
                 volume = float(self.cfg.get("click_sound_volume", 0.70))
                 play_press_sound(self._press_sound_pair, volume)
                 play_release_sound(self._press_sound_pair, volume)
@@ -3090,6 +3158,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._submit_collision_state(force=True)
         # 松手后重算让路闸门：左键已释放，若点击动画仍在播放则继续保持持有
         self._update_interaction_hold()
+        self._effects_on_release(was_dragging)
         event.accept()
 
     def _clear_just_dragged(self) -> None:
@@ -3124,11 +3193,22 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         return True
 
     def _on_click(self) -> None:
-        """真点击 → 随机一个点击回应动画，并重置当前动画（可连续点击打断）。"""
+        """真点击 → 随机一个点击回应动画，并重置当前动画（可连续点击打断）。
+
+        若“点击触发黄金回旋”处于直连模式，则跳过 Q 弹/点击素材直接开始回旋，
+        连续点击由 GoldenSpinController 累计圈数并逐圈加速。
+        """
         if self._just_dragged:
             return
+        consume_click = getattr(self, '_effects_consume_click', None)
+        if callable(consume_click) and consume_click():
+            return  # 边缘探头激活：点击由探头状态机消费（转直/重置倒计时）
         if callable(self.on_restore_fun_windows):
             self.on_restore_fun_windows()
+        # 直连黄金回旋 / 无点击素材时立即旋转；返回 True 表示本次点击已被效果层消费。
+        route_spin = getattr(self, '_effects_route_click_golden_spin', None)
+        if callable(route_spin) and route_spin():
+            return
         if not self.clicks:
             return
         # 点击可以打断当前动画（包括正在播放的点击回应），实现连续 Q 弹。
@@ -3291,6 +3371,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         # _resume_activity() → resume_warm()。缺了它，原生隐藏→显示循环后
         # 预热被永久停用（_warm_paused 永远无法复位）。重复置位是幂等 no-op。
         self._hidden_paused = True
+        self._effects_on_hidden()
         # 原生隐藏直进路径（不经自定义 hide()/_pause_activity）同样复位全部
         # 按住状态：只清点击/菜单标志而残留 _press_global/_dragging 时，
         # 重新显示后 _resume_activity → _switch → _update_interaction_hold

@@ -22,7 +22,7 @@
 之上保留两类架构边界检查（`tests/test_architecture.py`）：
 
 1. 纯逻辑层（collision / physics / collision_codec）不依赖 Qt；
-2. decode_fanout 不反向依赖 window / webm_clip；并限制窗口私有面跨模块回潮。
+2. decode_fanout 不反向依赖 window / webm_clip；
 3. window.py 行数不超过预算值（超出即测试失败）。
 
 这些检查约束依赖关系。

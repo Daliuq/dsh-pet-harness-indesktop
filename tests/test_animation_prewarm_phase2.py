@@ -1,27 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Phase 2：动画预热/低内存模式门控测试。"""
+"""Phase 2：动画预热门控测试（预热由省电模式联动，见 app._create_library）。"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import QApplication
 
 import pet.library as library_mod
-from pet.config import Config
 from pet.library import MovieLibrary
 
 
 def _qapp() -> QApplication:
     return QApplication.instance() or QApplication([])
-
-
-def test_config_animation_prewarm_default_and_normalize(tmp_path):
-    cfg = Config(base=tmp_path)
-    assert cfg.get("animation_prewarm_enabled", True) is True
-
-    cfg.set("animation_prewarm_enabled", "false")
-    assert cfg.get("animation_prewarm_enabled") is False
-
-    cfg.set("animation_prewarm_enabled", True)
-    assert cfg.get("animation_prewarm_enabled") is True
 
 
 def test_disabled_prewarm_does_not_schedule_low_or_high(tmp_path, monkeypatch):

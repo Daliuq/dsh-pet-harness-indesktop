@@ -38,7 +38,7 @@ class _FakeClip:
 def _clean_registry(monkeypatch):
     monkeypatch.setattr(webm_clip, "_first_frame_reg", [])
     monkeypatch.setattr(webm_clip, "_first_frame_bytes", 0)
-    monkeypatch.setattr(webm_clip, "_FIRST_FRAME_BUDGET_BYTES", 250)
+    monkeypatch.setattr(webm_clip, "_first_frame_budget_bytes", 250)
     yield
 
 
@@ -167,3 +167,49 @@ def test_all_pinned_budget_becomes_soft_cap():
     assert victims == []
     assert a._first_image is not None
     assert b._first_image is not None and c._first_image is not None
+
+
+def test_set_first_frame_budget_applies():
+    """运行期预算设置生效：调小后按新预算逐出，恢复默认后不再逐出。"""
+    webm_clip.set_first_frame_budget(150)
+    try:
+        a, b = _FakeClip(100), _FakeClip(100)
+        _store(a, 100)
+        victims = _store(b, 100)  # 200 > 150 → 逐出 a
+        assert [v for v, _t in victims] == [a]
+        assert webm_clip._first_frame_budget_bytes == 150
+    finally:
+        webm_clip.set_first_frame_budget(250)
+
+
+def test_config_first_frame_budget_normalized(tmp_path):
+    from pet.config import Config
+
+    cfg = Config(tmp_path)
+    assert cfg.get("first_frame_cache_max_mb") == 8  # 批10-A3：默认 32→8
+    cfg.set("first_frame_cache_max_mb", 999)
+    assert cfg.get("first_frame_cache_max_mb") == 64  # 夹到上限
+    cfg.set("first_frame_cache_max_mb", "abc")
+    assert cfg.get("first_frame_cache_max_mb") == 8  # 非法值回默认
+
+
+def test_config_first_frame_budget_legacy_32_migrates_to_8(tmp_path):
+    """批10-A3：批9 引入仅一天的旧默认 32 视为遗留值，加载时迁移到 8；
+    其它显式值（如 16/64）不被动。"""
+    import json
+
+    from pet.config import Config
+
+    cfg = Config(tmp_path)
+    cfg.save()  # 确保配置文件落盘（构造不一定立即写）
+    path = cfg.path
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["first_frame_cache_max_mb"] = 32
+    path.write_text(json.dumps(data), encoding="utf-8")
+    cfg2 = Config(tmp_path)
+    assert cfg2.get("first_frame_cache_max_mb") == 8, "旧默认 32 应迁移到 8"
+
+    data["first_frame_cache_max_mb"] = 16
+    path.write_text(json.dumps(data), encoding="utf-8")
+    cfg3 = Config(tmp_path)
+    assert cfg3.get("first_frame_cache_max_mb") == 16, "显式非 32 值不得被迁移"

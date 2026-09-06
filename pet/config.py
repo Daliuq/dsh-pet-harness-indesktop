@@ -557,9 +557,10 @@ class Config:
             else self.dir / "config.json"
         )
         self._migrate_legacy_config(base)
-        fresh_spawn = os.environ.get("DSH_PET_SPAWN_FRESH") == "1"
-        if self.instance_id and (not self.path.exists() or fresh_spawn):
-            self._seed_slot_config_from_main(force=fresh_spawn)
+        # 副槽落种仅在该槽位还没有个体配置时进行；已有存档的 slot（用户改过
+        # 的）一律不动——「生小肥鱼」复用旧槽位时同样保留原槽设置。
+        if self.instance_id and not self.path.exists():
+            self._seed_slot_config_from_main()
         self.data = {
             "version": 4,
             "rx": None,
@@ -608,7 +609,7 @@ class Config:
             "throw_max_speed": 4800.0,     # 由 throw_strength 导出
             "idle_low_fps_enabled": False,  # 闲置降帧（灰度默认关）：长时间无交互时动画隔帧呈现
             "idle_low_fps_threshold": 30.0,  # 闲置阈值（秒）：超过该时长无交互且窗口可见才降帧
-            "animation_prewarm_enabled": True,  # 动画预热（默认开）：预载高频/随机动作首帧以换流畅；关闭省内存
+            "animation_prewarm_enabled": True,  # 动画素材后台预热开关
             "click_show_balance": False,   # 点击显示 DeepSeek 余额
             "click_show_self_talk": False, # 点击随机显示自定义自言自语
             "balance_refresh_minutes": 0,  # DeepSeek 余额自动刷新间隔（分钟，0=关闭）
@@ -635,20 +636,30 @@ class Config:
             "agent_link": _default_agent_link_data(),
             "chat_ui_style": "modern",  # modern / classic（仅聊天窗口保留双实现）
             "chat_follow_pet": False,   # 聊天窗口是否跟随桌宠移动
-            # P3 broker（灰度默认关，不进设置 UI）：多开同角色空闲素材共享解码开关。
-            # 前置条件 = collision_enabled（broker 骑在碰撞 QLocal 通道上）。
-            # ⚠ 平台限定（P3A R2 P0-1 / R3 收口）：本键只在 Windows x86/x64
-            # （AMD64/x86_64，TSO）上生效——共享内存 seqlock 的 seq 提交词只经
-            # ctypes 普通 8B load/store，无 acquire/release/跨进程 barrier，
-            # 弱序平台（ARM macOS/Linux 及 **Windows ARM64**）上协议不作正确性
-            # 声明。非支持平台即使本键为 True，BrokerFacade 的 enabled 判定
-            # （decode_broker.broker_platform_supported()：OS + 架构双重检查）
-            # 也强制为 False：本键只是「用户请求」，平台门禁在启用点收口。
-            "decode_broker_enabled": False,
             "system_notifications_enabled": True,  # 对话完成/失败/需要授权时弹桌面系统通知
             "todo_reminder_enabled": True,   # 待办提醒总开关
             "todo_reminder_lead_minutes": 5,  # 待办提前提醒分钟数（0~60，0=不提前）
             **DEFAULT_COLLISION_SETTINGS,
+            "media_prewarm": "balanced",  # full / balanced / minimal 素材首帧预热力度
+            # 批10-A3：默认 32→8MB。预测式预热（批10-A1）落地后，首帧 LRU 只需
+            # 装「瞬时交互核 pinned（click/turn/drag）+ 1-2 个预测位」；idle/move
+            # 由预测机制与 LRU 热度自然覆盖，不再常驻。
+            "first_frame_cache_max_mb": 8,  # 首帧缓存全局预算（MB），低配机可调小
+            # 批10-A1 预测式接力预热：当前动画墙钟剩余 ≤ 该提前量（毫秒）时，
+            # 帧驱动提前掷骰决定下一动画并在后台预解码其首帧进 LRU（Phase 1）。
+            "predict_prewarm_lead_ms": 350,  # 提前量（ms），范围 200-600
+            # 批11-B1：ffmpeg 圈边界定期回收阈值（分钟）。长寿循环 reader 在圈
+            # 边界驻留时按进程存活时长评估回收：达到该值 → 不 park/re-arm，正常
+            # 退出杀进程、下一次 start() 自然 fresh spawn（把 47→64MB 的 ffmpeg
+            # 内部累积周期性清零）。0 = 关闭回收（回退保险）；否则范围 [2, 120]。
+            "ffmpeg_recycle_minutes": 10,
+            # 批5.2 spike（默认关）：开 = 「生小肥鱼」从 spawn 新进程改为进程内
+            # 创建第二个 PetInstance。关 = 行为与现状逐位一致（回退保险）。
+            "experimental_single_process_spawn": False,
+            # 批5.3：同角色共享解码链（进程内帧扇出）开关，默认开。仅当
+            # experimental_single_process_spawn（多窗）也为开时才真正激活——
+            # 单窗无共享可言，双门关任一即回每窗独立解码（批5.2 形态）。
+            "experimental_shared_decode": True,
             "chat": _default_chat_data(),
         }
         self.reload()
@@ -674,17 +685,16 @@ class Config:
         except OSError:
             pass
 
-    def _seed_slot_config_from_main(self, *, force: bool = False) -> None:
+    def _seed_slot_config_from_main(self) -> None:
         """新建副槽时继承主配置（issue #69-6），避免“生小肥鱼恢复默认设置”。
 
-        只在该槽位还没有个体配置文件、或本次是通过“生小肥鱼”显式孵化的
-        新进程（DSH_PET_SPAWN_FRESH=1）时执行；普通重启已有 slot-N 配置
-        仍保持独立记忆。复制主 config.json 后做副槽化处理：位置回到自动
-        摆放、开机自启仍只归主槽所有。写盘副本沿用主配置的脱敏策略，
-        不把明文 API Key 复制进副槽。
+        只在该槽位还没有个体配置文件时执行；已有存档的 slot-N 配置（用户
+        改过的）一律保持独立记忆，「生小肥鱼」复用旧槽位也不覆盖。复制主
+        config.json 后做副槽化处理：位置回到自动摆放、开机自启仍只归主槽
+        所有。写盘副本沿用主配置的脱敏策略，不把明文 API Key 复制进副槽。
         """
         main_path = self.dir / "config.json"
-        if (not force and self.path.exists()) or not main_path.is_file():
+        if self.path.exists() or not main_path.is_file():
             return
         try:
             raw = json.loads(main_path.read_text(encoding="utf-8"))
@@ -847,7 +857,12 @@ class Config:
             "collision_enabled", "collision_restitution", "collision_friction",
             "collision_mass_scale", "collision_impulse_cap",
             "collision_sound_enabled", "collision_sound_volume",
-            "decode_broker_enabled",
+            "media_prewarm",
+            "first_frame_cache_max_mb",
+            "predict_prewarm_lead_ms",
+            "ffmpeg_recycle_minutes",
+            "experimental_single_process_spawn",
+            "experimental_shared_decode",
         ):
             if key in raw and raw[key] is not None:
                 self.data[key] = raw[key]
@@ -856,6 +871,7 @@ class Config:
         if "agent_link" in raw:
             self.data["agent_link"] = _merge_agent_link_data(raw["agent_link"])
         self._migrate_click_sound_config(raw)
+        self._migrate_decode_broker_config(raw)
         self.data["version"] = 4
         self._migrate_plaintext_keys_to_keyring()
 
@@ -917,6 +933,20 @@ class Config:
                 }
             else:
                 self.data["click_sound_pack"] = _default_click_sound_pack()
+
+    def _migrate_decode_broker_config(self, raw: dict) -> None:
+        """批5.3：decode_broker_enabled 退役（shm broker 下线，共享解码改由
+        进程内 DecodeFanoutHub 承担）。迁移语义（SETTINGS-CHANGE-GATES）：读旧值
+        → 记一次 info → 忽略（键从 defaults/白名单移除，不再归一/进入 self.data）。"""
+        if getattr(self, "_decode_broker_migrated", False):
+            return
+        if "decode_broker_enabled" in raw:
+            old = raw.get("decode_broker_enabled")
+            logging.getLogger(__name__).info(
+                "配置键 decode_broker_enabled 已退役（批5.3 共享解码改为进程内 "
+                "fan-out），忽略旧值 %r", old)
+            raw.pop("decode_broker_enabled", None)
+        self._decode_broker_migrated = True
 
     def _normalize_pet_settings(self):
         dialogue_mode = str(self.data.get("dialogue_mode") or "legacy").lower()
@@ -1027,26 +1057,12 @@ class Config:
         self.data["throw_max_speed"] = physics_mod.throw_speed_cap(strength)
         # 闲置降帧（性能调研 §4.3）：开关默认关（灰度）；阈值夹到 [1, 3600] 秒
         # 终审 P1-3：必须用 _bool_or_default——bool("false") is True，字符串
-        # 布尔（外部手改配置/旧版导出）会被误开；与 decode_broker_enabled 同规。
+        # 布尔（外部手改配置/旧版导出）会被误开；与其它布尔键同规。
         self.data["idle_low_fps_enabled"] = _bool_or_default(
             self.data.get("idle_low_fps_enabled"), False
         )
         self.data["idle_low_fps_threshold"] = _float_or_default(
             self.data.get("idle_low_fps_threshold"), 30.0, 1.0, 3600.0
-        )
-        # 动画预热（Phase 2，默认开）：关闭后不再后台预载大量动画首帧。
-        self.data["animation_prewarm_enabled"] = _bool_or_default(
-            self.data.get("animation_prewarm_enabled"), True
-        )
-        # P3 broker（灰度默认关）：多开同角色空闲素材共享解码开关。
-        # ⚠ 平台限定（P3A R2 P0-1 / R3，与 defaults 声明一致）：本键只在
-        # Windows x86/x64（AMD64/x86_64 TSO）上生效——非支持平台（非 Windows，
-        # 或 Windows ARM64 弱序）即使归一后为 True，BrokerFacade 的 enabled
-        # 判定也会与 broker_platform_supported()（Windows 且 AMD64/x86_64）
-        # 做与而强制关闭；此处归一只保证「类型为 bool」，「是否启用」由启用点
-        # 的平台门禁收口。
-        self.data["decode_broker_enabled"] = _bool_or_default(
-            self.data.get("decode_broker_enabled"), False
         )
         # 上游 #60 系统通知开关：同规防字符串布尔误开（bool("false") is True）。
         self.data["system_notifications_enabled"] = _bool_or_default(
@@ -1060,6 +1076,28 @@ class Config:
             self.data.get("todo_reminder_lead_minutes"), 5.0, 0.0, 60.0
         ))
         self.data["agent_link"] = _clean_agent_link_data(self.data.get("agent_link"))
+        prewarm = str(self.data.get("media_prewarm", "balanced") or "balanced").strip().lower()
+        self.data["media_prewarm"] = prewarm if prewarm in {"full", "balanced", "minimal"} else "balanced"
+        # 批10-A3：默认 32→8（预测式预热使能）；32 是批9 引入仅一天的旧默认，
+        # 视为遗留值一并迁移（想调大可设 16/64 等非 32 值，32 本身被保留为迁移哨兵）。
+        _ffb = _float_or_default(self.data.get("first_frame_cache_max_mb"), 8, 4, 64)
+        self.data["first_frame_cache_max_mb"] = 8 if int(_ffb) == 32 else int(_ffb)
+        # 批10-A1 预测式预热提前量：夹到 [200, 600] 毫秒（默认 350）。
+        self.data["predict_prewarm_lead_ms"] = int(_float_or_default(
+            self.data.get("predict_prewarm_lead_ms"), 350, 200, 600
+        ))
+        # 批11-B1：ffmpeg 圈边界回收阈值（分钟）。0 = 关闭回收；否则夹到
+        # [2, 120]（默认 10）。
+        _ffr = _float_or_default(self.data.get("ffmpeg_recycle_minutes"), 10, 0, 120)
+        self.data["ffmpeg_recycle_minutes"] = 0 if _ffr <= 0 else int(max(2.0, _ffr))
+        # 批5.2 spike 开关：同其它布尔键规约，防字符串布尔误开。
+        self.data["experimental_single_process_spawn"] = _bool_or_default(
+            self.data.get("experimental_single_process_spawn"), False
+        )
+        # 批5.3 共享解码链开关：同规防字符串布尔误开（默认开）。
+        self.data["experimental_shared_decode"] = _bool_or_default(
+            self.data.get("experimental_shared_decode"), True
+        )
         self.data.update(_clean_collision_data(self.data))
 
     def get(self, key, default=None):
@@ -1134,7 +1172,8 @@ class Config:
             "collision_sound_enabled", "collision_sound_volume",
             "slingshot_enabled", "throw_strength", "agent_link",
             "idle_low_fps_enabled", "idle_low_fps_threshold",
-            "animation_prewarm_enabled",
+            "media_prewarm", "first_frame_cache_max_mb", "predict_prewarm_lead_ms",
+            "ffmpeg_recycle_minutes",
             "spawn_inherit_size", "spawn_scale", "spawn_inherit_dynamic_island",
             "todo_reminder_enabled", "todo_reminder_lead_minutes",
             "character_profiles", "chat_always_on_top", "dynamic_island",

@@ -29,42 +29,43 @@ def _disabled_config(tmp_path):
 
 
 def test_petapp_disabled_optional_services_not_constructed(tmp_path):
-    from pet.app import PetApp
+    from pet.app import AppShell
 
     app = _qapp()
     cfg = _disabled_config(tmp_path)
-    owner = PetApp(app, cfg, enable_chat=False)
-    assert owner.collision_ipc is None
-    assert owner.broker_facade is None
-    assert owner.todo_service is None
+    shell = AppShell(app, cfg, enable_chat=False)
+    # 本分支架构差异：碰撞会话为每窗自持（批5.2 P1-1，恒建），broker 已由
+    # 进程内 fan-out hub 取代（批5.3）；上游断言的 collision/broker 门控不适用。
+    # todo 服务走 Phase 1 懒门控（挂 AppShell 进程级）。
+    assert shell.todo_service is None
 
 
 def test_petapp_enabled_default_services_still_constructed(tmp_path):
-    """默认配置（碰撞/待办开）保持既有 PetApp 构造行为。"""
-    from pet.app import PetApp
+    """默认配置（待办开）保持既有构造行为。"""
+    from pet.app import AppShell
 
     app = _qapp()
-    owner = PetApp(app, Config(tmp_path), enable_chat=False)
-    assert owner.collision_ipc is not None
-    assert owner.todo_service is not None
-    # broker 默认关，不应凭空创建 facade。
-    assert owner.broker_facade is None
+    shell = AppShell(app, Config(tmp_path), enable_chat=False)
+    assert shell.todo_service is not None
+    # 碰撞会话每窗自持（恒建）；共享解码 hub 进程级（默认 enabled 取决于 flag）。
+    assert shell.instance.collision_ipc is not None
+    assert shell._decode_hub is not None
 
 
 def test_petapp_start_disabled_services_stay_stopped(tmp_path, monkeypatch):
     import pet.app as app_mod
-    from pet.app import PetApp
+    from pet.app import AppShell
 
     app = _qapp()
     monkeypatch.setattr(app_mod.QTimer, "singleShot", lambda *a, **k: None)
     cfg = _disabled_config(tmp_path)
-    owner = PetApp(app, cfg, enable_chat=False)
-    owner._create_ui = lambda cid: None
-    owner._apply_spawn_offset = lambda: None
-    owner._apply_balance_timer = lambda: None
-    owner.start()
-    assert owner.collision_ipc is None
-    assert owner.todo_service is None
+    shell = AppShell(app, cfg, enable_chat=False)
+    shell.instance._create_ui = lambda cid: None
+    shell.instance._apply_spawn_offset = lambda: None
+    shell._apply_balance_timer = lambda: None
+    shell.instance.collision_ipc = type("FakeCollision", (), {"start": lambda self: None})()
+    shell.start()
+    assert shell.todo_service is None
 
 
 def test_petwindow_disabled_optional_services_not_constructed(tmp_path):

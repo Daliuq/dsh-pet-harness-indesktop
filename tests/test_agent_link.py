@@ -635,8 +635,11 @@ class TestAgentMenuRebound:
             assert act.checked is False  # 回滚
             assert cfg.data["agent_link"]["claude"] is False  # 配置未开启
         finally:
+            # 窗口必须关闭：否则泄漏的真实窗口会在共享事件循环上继续推进动画链，
+            # 后续测试 processEvents 时持续拉起 reader 线程（跨测试干扰）。
             win.close()
             win.deleteLater()
+            # 处理 deleteLater 投递的 Qt 清理事件，避免窗口的动画/reader 事件泄漏到后续测试。
             app.processEvents()
 
     def test_bom_prefixed_file_tolerated(self, tmp_path):

@@ -330,12 +330,33 @@ pythonw -m pet
 - 点击桌宠触发 Q 弹时播放短促音效（内置合成音，可在桌宠设置中关闭）。
 - 可自定义声音：把 `click.wav` 放到桌宠数据目录 `sounds/` 下即可替换内置音效。
 
-### 多开共享解码（实验特性，默认关闭）
+### 省电模式
 
-- 多开同一角色时，所有实例空闲状态播的是同一份待机素材；开启后由协调者实例统一解码、其他实例经共享内存读帧——双开待机时 ffmpeg 解码进程从 2 个减到 1 个，待机解码 CPU 约减半。
-- 开启方式（暂无设置 UI）：编辑数据目录下的 `config.json`，把 `decode_broker_enabled` 改为 `true`（前置条件：`collision_enabled` 保持开启——broker 复用碰撞的实例间通道）。
-- 仅 Windows x86/x64 可用（跨进程共享内存的时序协议只在 x86/x64 强内存序下可靠；Windows ARM64 与其他平台即使开启也会自动按关闭处理）。
-- 失败无感回退：无协调者、授权超时、共享内存异常、对方退出等任何情况下，消费端都会自动回退本地解码，播放行为与关闭时一致（杀协调者实例后消费端约 0.6 秒内从帧 0 重新起播，可见一次跳变）。
+- 在「设置 → 常规 → 动画与移动」开启「省电模式」后：桌宠一段时间无交互时动画按半帧率呈现（24fps 素材 → 12fps 效果），任何交互立即恢复全帧率；同时停止后台动画预热（不再预载非核心动画的首帧，进一步省 CPU 与内存）。
+- 默认关闭；多开时每只各自独立设置。
+
+### 单进程多开与共享解码
+
+- 在「设置 → 常规 → 多开」开启「单进程多开（省内存）」并重启后，「生小肥鱼」在同一进程内创建新桌宠：多只宠物只占一个进程，且空闲时多只播的是同一份待机素材，由进程内帧扇出（`DecodeFanoutHub`）统一解码——待机时 ffmpeg 解码进程从 N 个减到 1 个，解码 CPU 与内存显著降低；机制与平台无关。
+- 每只桌宠的设置存档（含位置、外观）在多开模式间通用，切换开关不会丢配置。
+- 失败无感回退：无发布者、断流等任何情况下，消费端都会自动回退本地解码，播放行为与关闭时一致。
+
+**单进程多开下的设置作用域**：
+
+- **每只独立**（右键某只 → 桌宠设置，改哪只影响哪只）：形象/缩放/透明度/置顶、拖拽物理/弹射/音效、自言自语、省电降帧、AI 对话内容与各自会话、位置。各只设置存于各自的 `config-slot-N.json`。
+- **进程级互通**（全窗共用一份，随主配置生效）：托盘与灵动岛、DeepSeek 余额查询、更新检查、待办提醒、共享解码链、Agent 联动与主动识屏（dsh 等 agent 只有一条连接，全部窗共享状态）、单进程多开开关本身。
+- 注意：进程级开关以**主桌宠（第一只）**的配置为准——请在第一只的设置里修改「单进程多开」，在其它只的设置里改不会生效；首帧缓存预算同理（建议只改主配置 `config.json`）。
+- 切换「单进程多开」后需重启生效。
+
+### 内存调节（高级，改 config.json）
+
+以下键暂无设置 UI，编辑数据目录下的 `config.json` 后重启生效：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `first_frame_cache_max_mb` | 8 | 首帧缓存总预算（MB，4-64）。多开时按进程共享一份预算 |
+| `predict_prewarm_lead_ms` | 350 | 预测式预热：动画播到结尾前提前多少毫秒预解码预测的下一段首帧；0=关 |
+| `ffmpeg_recycle_minutes` | 10 | ffmpeg 解码子进程在圈边界的定期回收间隔（分钟，2-120）；0=不回收 |
 
 
 </details>
@@ -734,15 +755,15 @@ pet/
 ├── collision_codec.py     # 碰撞 IPC 帧编解码 + 水位去重 + 协议 TypedDict（纯 Python）
 ├── collision_ipc.py       # 碰撞协调者选举与成员协议（QLocalServer 控制面）
 ├── collision_debug.py     # 碰撞调试日志
-├── decode_broker.py       # 多开共享解码 broker（共享内存 ring + seqlock，灰度默认关）
-├── frame_cache.py         # 帧预缩放缓存（字节硬预算 LRU）
+├── decode_fanout.py       # 同角色共享解码链（进程内帧扇出 DecodeFanoutHub）
+├── frame_cache.py         # 通用字节预算 LRU（webm 元数据缓存等小缓存用）
 ├── perfstats.py           # 性能打点（PET_PERF_STATS=1 启用，atexit 落盘）
+├── predictive_prewarm.py  # 预测式预解码预热（切动画前预拉下一段）
 ├── platform_win.py        # Windows 平台层（鼠标穿透/全屏判定/PerPixel 输入）
 ├── platform_mac.py        # macOS 平台层（NSWindow level/激活策略）
 ├── catalog.py             # 角色和动画素材发现
 ├── library.py             # 动画库访问（懒加载 + 优先级预热）
-├── webm_clip.py           # WebM 播放（reader 线程/解码节流/broker 钩子）
-├── gif_clip.py            # GIF/QMovie 播放
+├── webm_clip.py           # WebM 播放（reader 线程/解码节流/fan-out 钩子）
 ├── speech_bubble.py       # 气泡绘制与交互
 ├── speech_bubble_text.py  # 气泡分页/定位纯函数
 ├── click_sound.py         # 点击音效（ClickSoundPool 单例封装）
@@ -754,12 +775,13 @@ pet/
 ├── agent_link.py          # Agent 联动监视器（多 Agent 事件源：CLI/IDE/SQLite 轮询）
 ├── agent_link_reducer.py  # 联动状态机（去抖/节流/完成确认，纯状态）
 ├── agent_link_presentation.py # 联动表现层（气泡/音效）
+├── multi_window_shared.py # 进程级多窗共享子系统（agent_link/proactive/全屏 watcher）
 ├── vision.py              # 视觉模型调用（看看屏幕/主动识屏）
 ├── harness_launcher.py    # DeepSeek Harness 一键启动
 ├── instance_launcher.py   # 「生小肥鱼」多开孵化
 ├── modern_settings_dialog.py  # 新版侧边栏设置对话框
-├── settings_widgets.py    # 设置页共享控件库（ToggleSwitch 等 13 类）
-├── settings_dialog.py     # 旧版设置对话框
+├── todo_reminder.py      # 待办提醒调度（气泡/桌面通知，PR72 合入）
+├── todo_panel.py         # 待办管理面板（右键菜单「待办提醒」打开）
 ├── context_menus/         # 新旧菜单模板、图标、彩蛋入口
 ├── chat/                  # 独立 AI 对话子系统（现代双栏 + 经典手机式）
 │   ├── models.py          # 数据模型（ProviderConfig/ChatSession/...）
@@ -771,7 +793,7 @@ pet/
 │   ├── themes.py          # 聊天窗背景主题
 │   ├── widgets.py         # 新版聊天窗
 │   ├── legacy_widgets.py  # 经典手机式聊天窗
-│   ├── modern_styles.qss / legacy_styles.qss / styles.qss
+│   ├── modern_styles.qss / legacy_styles.qss
 │   └── ...
 └── updater.py             # 检查更新与发布资产解析
 
@@ -791,32 +813,13 @@ scripts/
 └── cleanup_mei_cache.py   # 检查/清理旧 onefile 版本遗留的 _MEI 缓存（默认预览）
 
 tests/                     # 单元测试、Qt offscreen 测试和构建相关验证
-                           # （含 test_architecture.py 依赖方向与窗口私有面护栏）
+                           # （含 test_architecture.py 架构红线：依赖方向 /
+                           #  window 私有面冻结 / window.py 行数预算）
 ```
 
-**window.py 演进参考**：[docs/WINDOW_PY_SPLIT_GUIDE.md](docs/WINDOW_PY_SPLIT_GUIDE.md)
-——按功能边界拆分是可选的维护建议。
-
-
-integrations/dsh-pet-bridge/  # DSH 桥接插件（Agent 联动）
-packaging/
-├── pet_entry.py           # Chat 构建入口
-├── pet_entry_no_chat.py   # 无 Chat 构建入口
-└── dsh-pet.iss            # Inno Setup 通用安装包脚本（/D 参数编译各变体）
-
-scripts/
-├── build_onedir.ps1       # Windows onedir 构建 + zip 绿色版打包（本地与 CI 共用入口）
-├── build_macos.sh         # macOS .app 构建（本地与 CI 共用入口）
-├── build_linux.sh         # Linux onedir 构建（本地与 CI 共用入口）
-├── check_bundle_encoding.py # 产物中文编码自检（issue #26，构建脚本内自动调用）
-├── make_icon.py           # 从待机动画提取封面帧生成应用图标（assets/icon.ico）
-├── convert_to_gif.py      # WebM → GIF 全量同步脚本
-└── cleanup_mei_cache.py   # 检查/清理旧 onefile 版本遗留的 _MEI 缓存（默认预览）
-
-tests/                     # 单元测试、Qt offscreen 测试和构建相关验证
-```
-
-
+**给 window.py 加功能前必读**：[docs/WINDOW_PY_SPLIT_GUIDE.md](docs/WINDOW_PY_SPLIT_GUIDE.md)
+——window.py 处于「只许瘦不许胖」的增量拆分公约下（CI 有行数预算红线），
+新功能先按公约拆对应控制器再动手。
 </details>
 
 <details>
@@ -836,12 +839,6 @@ python -m compileall pet packaging scripts
 最近一轮记录（v4.0.1）：
 
 - `pytest`：完整测试套件见 CI / 本地运行 `pytest -q`。
-- 本轮 Windows 收口验证：先运行不含压力项的主套件，再单独运行
-  `tests/test_decode_broker_shm.py::test_cross_process_concurrent_publish_read_stress`；
-  结果分别为 `1421 passed, 7 skipped, 1 deselected` 和 `1 passed`。
-- Qt 生命周期专项见 [`docs/QT-LIFECYCLE-FULL-SUITE-STABILIZATION-2026-09.md`](docs/QT-LIFECYCLE-FULL-SUITE-STABILIZATION-2026-09.md)：
-  外置气泡由 `PetWindow.closeEvent()` 定向同步销毁，测试不全局冲刷
-  `DeferredDelete` 队列。
 - `compileall`：通过。
 - WebM Chat、WebM 无 Chat 两个 onedir 构建均完成启动冒烟验证：进程存活超过 8 秒，系统临时目录与程序目录**均无新增 `_MEI` 缓存**。
 
@@ -981,7 +978,7 @@ python scripts/cleanup_mei_cache.py --delete
 
 - **点击音效连续播放修复**：每次 `QSoundEffect` 播放前显式 `stop()`，解决“首次点击有音效、后续点击无声”的问题（源码版/试听均验证）。
 - **issue #69 修复**：后台音乐检测从 4s 提速到 1s，并在窗口显示时立即检测，唱歌动画响应更快；减少透明窗口偶发频闪。
-- **生小肥鱼继承主配置**：通过“生小肥鱼”显式孵化时，即使旧 slot 配置已存在也会重新继承主设置，不再出现新鱼恢复默认配置。
+- **生小肥鱼继承主配置**：通过“生小肥鱼”孵化的新槽位在首次创建时继承主设置，不再出现新鱼恢复默认配置；已有存档的槽位（用户改过的设置）复用时一律保留，不被主配置覆盖。
 - **生小肥鱼大小设置**：新增“继承主肥鱼大小”开关（默认开启）；关闭后可为小肥鱼独立选择大小。
 - **生小肥鱼灵动岛设置**：新增“继承灵动岛”开关（默认关闭）；关闭时小肥鱼不会打开自己的灵动岛。
 - **一键清除子肥鱼**：设置页新增“一键清除子肥鱼”，可关闭所有运行中的小肥鱼并删除其 slot 配置/会话/待办数据，主肥鱼数据不受影响。

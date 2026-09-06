@@ -403,41 +403,44 @@ def test_service_once_archive_persists(tmp_path):
 # ------------------------------------------------------------ PetApp 接线
 
 def test_petapp_creates_service_and_wires_callback(tmp_path):
-    from pet.app import PetApp
+    from pet.app import AppShell
 
     qapp = _qapp()
-    owner = PetApp(qapp, Config(tmp_path))
-    assert owner.todo_service is not None
+    shell = AppShell(qapp, Config(tmp_path))
+    assert shell.todo_service is not None
 
     class _Win:
         pass
 
     win = _Win()
-    owner._wire_window(win)
-    assert win.on_open_todo_panel == owner.open_todo_panel
+    shell.instance._wire_window(win)
+    # 回调经 _slot_wrap 包了一层（日志槽位），断言已接线且可调用即可
+    assert callable(win.on_open_todo_panel)
 
 
 def test_petapp_settings_finish_applies_todo_prefs(tmp_path, monkeypatch):
     import pet.app as app_mod
-    from pet.app import PetApp
+    from pet.app import AppShell, PetInstance
 
     qapp = _qapp()
     monkeypatch.setattr(app_mod, "_mac_set_dock_icon_visible", lambda *a, **k: None)
-    owner = PetApp.__new__(PetApp)
+    owner = PetInstance.__new__(PetInstance)
+    owner.shell = AppShell.__new__(AppShell)
     owner.modern_settings_dialog = None
     owner.chat_settings_dialog = None
     owner.win = None
     owner.config = Config(tmp_path)
-    owner._apply_balance_timer = lambda: None
+    owner.shell.config = owner.config
+    owner.shell._apply_balance_timer = lambda: None
+    owner.shell._sync_dynamic_island = lambda: None
     owner._refresh_chat_windows = lambda: None
-    owner._sync_dynamic_island = lambda: None
-    owner.todo_service = TodoReminderService(owner)
-    # Phase 1：设置保存也会同步可选服务；此测试只关注 todo，避免碰撞服务被拉起。
-    owner.config.set("collision_enabled", False)
+    # 本分支 todo_service 是进程级单例，挂在 AppShell 上
+    owner.shell.todo_service = TodoReminderService(owner.shell)
+    owner.shell.todo_panel = None
     owner.config.set("todo_reminder_enabled", False)
-    PetApp._modern_settings_finished(owner, 0)
-    # Phase 1：待办总开关关闭且无面板打开时，服务对象应被释放。
-    assert owner.todo_service is None
+    PetInstance._modern_settings_finished(owner, 0)
+    # Phase 1 门控：待办总开关关闭且无面板打开时，服务对象应被释放
+    assert owner.shell.todo_service is None
 
 
 # ------------------------------------------------------------ 管理面板

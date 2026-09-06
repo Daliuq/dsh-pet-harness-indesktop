@@ -22,7 +22,8 @@
 之上保留两类架构边界检查（`tests/test_architecture.py`）：
 
 1. 纯逻辑层（collision / physics / collision_codec）不依赖 Qt；
-2. decode_broker 不反向依赖 window / webm_clip，并限制窗口私有面跨模块回潮。
+2. decode_fanout 不反向依赖 window / webm_clip；并限制窗口私有面跨模块回潮。
+3. window.py 行数不超过预算值（超出即测试失败）。
 
 这些检查约束依赖关系。
 
@@ -101,7 +102,7 @@
   `_connect_movie` / `_on_clip_finished` / `_on_anim_ended` / `_pick` /
   `_pick_next` / `_start_animation_gap` / `_cancel_animation_gap` /
   `_play_animation_gap_step` / `_on_animation_gap_timeout` /
-  `set_animation_gap` / `set_playback_speed`
+  `set_playback_speed`
 - 相关字段：`self.anim` / `self.movie` / `self.idles` / 各分类动作池 /
   `_switch_retry_timer` 等
 - 注意：该状态机是联动、碰撞、菜单等多方的汇聚点（外部模块经公开 seam
@@ -129,7 +130,7 @@
   `_try_open_quick_chat_from_bubble` / `_schedule_self_talk` /
   `_show_self_talk_text` / `_show_random_self_talk` /
   `_show_click_self_talk` / `_on_self_talk_timeout` / `_read_self_talk_texts` /
-  `set_self_talk_settings` / `_check_music_sing`
+  `_check_music_sing`
 - 注意：气泡绘制本体位于 speech_bubble.py；窗口侧除调度与定位外，
   还保留公开气泡 API、气泡占用状态（`_bubble_busy_until`）与交互回调，
   实际边界比「纯调度层」更宽。
@@ -150,7 +151,7 @@
 | 碰撞客户端（窗口侧为薄委托） | collision_client.py |
 | 碰撞物理 / 协议 / IPC | collision.py / collision_codec.py / collision_ipc.py |
 | 平台层 | platform_win.py / platform_mac.py |
-| 共享解码 broker | decode_broker.py（窗口侧 `_broker_*` 块为接线+首播决策状态机，非纯转发） |
+| 共享解码 fan-out | decode_fanout.py（窗口侧 `_broker_*` 块为接线+首播决策状态机，非纯转发） |
 | 帧缓存 / 性能打点 | frame_cache.py / perfstats.py |
 
 ## 5. 参考范例：collision_client.py 的拆法

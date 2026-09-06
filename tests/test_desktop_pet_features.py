@@ -567,7 +567,6 @@ def test_launch_new_pet_uses_detached_process(monkeypatch):
 
     assert captured["command"] == ["pet-program"]
     assert captured["kwargs"]["env"]["DSH_PET_SPAWN_OFFSET_INDEX"] == "1"
-    assert captured["kwargs"]["env"]["DSH_PET_SPAWN_FRESH"] == "1"
     if sys.platform == "win32":
         assert captured["kwargs"]["creationflags"]
     else:
@@ -578,13 +577,13 @@ def test_pet_app_assigns_distinct_offsets_to_spawned_pets(tmp_path, monkeypatch)
     from PySide6.QtWidgets import QApplication
 
     import pet.app as app_mod
-    from pet.app import PetApp
+    from pet.app import AppShell
     from pet.config import Config
 
     app = QApplication.instance() or QApplication([])
     offsets = []
     monkeypatch.setattr(app_mod, "launch_new_pet", lambda index: offsets.append(index))
-    owner = PetApp(app, Config(tmp_path))
+    owner = AppShell(app, Config(tmp_path))
     owner.spawn_pet()
     owner.spawn_pet()
     assert offsets == [1, 2]
@@ -2353,48 +2352,6 @@ def test_disabled_on_top_does_not_raise_after_context_menu_hides():
     assert pet.levels == []
 
 
-def test_animation_icon_pixmap_reads_named_clip_without_switching_active_animation():
-    from PySide6.QtCore import QRect, Qt
-    from PySide6.QtGui import QPainter, QPixmap
-    from PySide6.QtWidgets import QApplication
-
-    from pet.window import PetWindow
-
-    app = QApplication.instance() or QApplication([])
-    source = QPixmap(100, 80)
-    source.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(source)
-    painter.fillRect(QRect(35, 10, 30, 60), Qt.GlobalColor.blue)
-    painter.end()
-
-    class Clip:
-        def __init__(self): self.jumps = []
-        def frameCount(self): return 50
-        def currentPixmap(self): return source
-        def jumpToFrame(self, frame): self.jumps.append(frame); return True
-
-    clip = Clip()
-
-    class Library:
-        def movie(self, name):
-            assert name == "动画-A"
-            return clip
-
-        def clip_path(self, name):
-            assert name == "动画-A"
-            return "/tmp/动画-A.webm"
-
-    class FakePet:
-        lib = Library()
-        anim = "当前动画"
-
-    icon = PetWindow.animation_icon_pixmap(FakePet(), "动画-A", 32)
-    assert clip.jumps == [30]
-    assert not icon.isNull()
-    assert max(icon.width(), icon.height()) >= 30
-    assert FakePet.anim == "当前动画"
-
-
 def test_representative_animation_frame_uses_the_later_middle():
     from pet.animation_thumbnail import representative_frame_index
 
@@ -2776,7 +2733,7 @@ def test_pet_app_binds_about_to_quit_once_to_current_window(tmp_path, monkeypatc
     from PySide6.QtWidgets import QApplication
 
     import pet.app as app_mod
-    from pet.app import PetApp
+    from pet.app import AppShell
     from pet.config import Config
 
     QApplication.instance() or QApplication([])
@@ -2801,20 +2758,20 @@ def test_pet_app_binds_about_to_quit_once_to_current_window(tmp_path, monkeypatc
             self.saved += 1
 
     monkeypatch.setattr(app_mod.QTimer, "singleShot", lambda *a, **k: None)
-    owner = PetApp(FakeApp(), Config(tmp_path))
-    owner._create_ui = lambda cid: None
-    owner._apply_spawn_offset = lambda: None
+    owner = AppShell(FakeApp(), Config(tmp_path))
+    owner.instance._create_ui = lambda cid: None
+    owner.instance._apply_spawn_offset = lambda: None
     owner._apply_balance_timer = lambda: None
 
     old = FakeWin()
-    owner.win = old
+    owner.instance.win = old
     owner.start()
     owner.start()  # 重复 start 不得叠加 connect
     assert len(owner.app.connections) == 1
     assert owner.app.connections[0] == owner._on_about_to_quit
 
     current = FakeWin()
-    owner.win = current
+    owner.instance.win = current
     owner.app.connections[0]()  # 触发 aboutToQuit
     assert current.saved == 1
     assert old.saved == 0  # 旧窗口不再被保存
@@ -2964,11 +2921,11 @@ def test_check_update_failure_reports_and_reentry_guard(tmp_path, monkeypatch):
     from PySide6.QtWidgets import QApplication
 
     from pet import app as app_mod
-    from pet.app import PetApp
+    from pet.app import AppShell
     from pet.config import Config
 
     app = QApplication.instance() or QApplication([])
-    owner = PetApp(app, Config(tmp_path))
+    owner = AppShell(app, Config(tmp_path))
 
     gate = threading.Event()
 

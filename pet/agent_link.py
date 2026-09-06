@@ -1472,6 +1472,13 @@ def other_instances_use_agent(config, agent_key: str) -> bool:
 class AgentLinkManager(QObject):
     """多 Agent 联动总调度管理器。
 
+    批6-5 拆分后本类只保留装配与编排：
+    - 装配：4 内置 + 配置驱动的自定义监视器、AgentLinkReducer（纯状态机）、
+      AgentLinkPresentation（气泡/音效/动画调度），并完成信号接线；
+    - 监视器生命周期：pause / resume / shutdown / apply_config；
+    - set_enabled 安装/卸载编排（授权弹窗、后台安装、hooks 注入/移除）；
+    - 对既有调用面（PetWindow / AppShell / ProactiveScreenWatcher / 测试）的
+      薄转发。状态机与呈现逻辑分别位于 agent_link_reducer / agent_link_presentation。
     挂载于 PetWindow，持有 4 个 Agent 的监视器，并根据状态驱动桌宠动作与气泡。
     """
 

@@ -10,13 +10,15 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, Qt, QTimer
+from PySide6.QtCore import QEasingCurve, QRect, Qt, QTimer
 
-from .window_effects import eased_progress
+from .window_effects import eased_progress, rotated_region_bounds
 
 EDGE_PROBE_ANGLE = 45.0
-EDGE_PEEK_EXPOSURE = 0.50
-EDGE_ENGAGE_EXPOSURE = 0.62
+# 露出比例以“当前姿态（含 ±45° 旋转）的投影 bbox 宽度”为分母；0.70 保证探头时
+# 整张脸/头完整可见（此前按未旋转宽度 0.50 计算，实际因旋转投影变宽只剩一只眼）。
+EDGE_PEEK_EXPOSURE = 0.70
+EDGE_ENGAGE_EXPOSURE = 0.82
 EDGE_ENTER_MS = 300
 EDGE_STRAIGHTEN_MS = 250
 EDGE_RETURN_MS = 300
@@ -329,7 +331,15 @@ class EdgeProbeController:
         avail = scr.availableGeometry() if scr is not None else None
         if avail is None:
             return
-        x = probe_window_x(self._side, self._exposure, self._vis_local, avail)
+        # 旋转中心与 paint/_sync_mask 一致：帧绘制矩形中心。探头姿态 ±45° 时
+        # 角色水平投影会变宽，必须用旋转后投影 bbox 作为露出量分母，否则实际
+        # 可见像素远小于目标（例如只剩一只眼）。
+        frame_fn = getattr(self.win, "_frame_draw_rect", None)
+        pivot = frame_fn() if callable(frame_fn) else QRect(
+            0, 0, getattr(self.win, "_w", 0), getattr(self.win, "_h", 0)
+        )
+        bounds = rotated_region_bounds(self._vis_local, pivot, self._angle_deg)
+        x = probe_window_x(self._side, self._exposure, bounds, avail)
         if x != self.win.x():
             self.win.move(x, self.win.y())
         try:

@@ -576,6 +576,7 @@ class Config:
             "balance_tier_color_enabled": True,  # 峰谷提示颜色：高峰红/低谷绿
             "music_sing_enabled": False,   # 检测到后台播放音乐时自动播放唱歌动画
             "golden_spin_on_click": False, # 点击回应动画结束后自动接一段黄金回旋
+            "golden_spin_direct": False,   # 点击触发黄金回旋时跳过点击动画，直接回旋并逐圈加速
             "edge_probe_enabled": False,   # 拖到屏幕左右边缘后自动进入探头姿态
             "autostart_wanted": False,     # 用户曾开启过开机自启（用于启动自检：被安全软件清理时提醒）
             "stream_capture_mode": False,  # 直播捕获兼容模式（Windows：Tool 窗口直播姬/OBS 枚举不到）
@@ -794,7 +795,7 @@ class Config:
             "idle_low_fps_enabled", "idle_low_fps_threshold",
             "click_show_balance", "click_show_self_talk",
             "balance_refresh_minutes", "autostart_wanted", "stream_capture_mode",
-            "music_sing_enabled", "golden_spin_on_click", "edge_probe_enabled",
+            "music_sing_enabled", "golden_spin_on_click", "golden_spin_direct", "edge_probe_enabled",
             "balance_tier_labels_mode", "balance_tier_label_peak",
             "balance_tier_label_idle", "balance_tier_color_enabled",
             "chat_background", "modern_chat_background",
@@ -1014,6 +1015,9 @@ class Config:
         # 黄金回旋 / 边缘探头：与其它布尔键同规，防手改字符串布尔误开。
         self.data["golden_spin_on_click"] = _bool_or_default(
             self.data.get("golden_spin_on_click"), False
+        )
+        self.data["golden_spin_direct"] = _bool_or_default(
+            self.data.get("golden_spin_direct"), False
         )
         self.data["edge_probe_enabled"] = _bool_or_default(
             self.data.get("edge_probe_enabled"), False

@@ -7,7 +7,7 @@ from PySide6.QtWidgets import QApplication, QMenu
 
 from pet.config import Config
 from pet.context_menu import populate_context_menu
-from pet.modern_settings_dialog import ModernSettingsDialog
+from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
 from pet.window_optional_services import WindowFeatureGateMixin
 
 
@@ -111,11 +111,20 @@ def test_settings_dialog_has_effect_toggles_and_writes_config(tmp_path):
     cfg = Config(tmp_path)
     dialog = ModernSettingsDialog(cfg, include_ai=False)
     assert dialog.golden_spin_click_check is not None
+    assert dialog.golden_spin_direct_check is not None
     assert dialog.edge_probe_check is not None
+    direct_row = dialog.findChild(SettingRow, "settingRow_golden_spin_direct")
+    assert direct_row is not None
+    # 子开关只在“点击触发黄金回旋”开启后显示。
+    assert dialog.golden_spin_click_check.isChecked() is False
+    assert direct_row.isHidden() is True
     dialog.golden_spin_click_check.setChecked(True)
+    assert direct_row.isHidden() is False
+    dialog.golden_spin_direct_check.setChecked(True)
     dialog.edge_probe_check.setChecked(True)
     assert dialog._write_config() is True
     assert cfg.get("golden_spin_on_click") is True
+    assert cfg.get("golden_spin_direct") is True
     assert cfg.get("edge_probe_enabled") is True
     dialog.reject()
     app.processEvents()
@@ -177,6 +186,36 @@ def test_real_window_paint_with_active_rotation_does_not_raise(tmp_path):
         spin._active = False
         spin._angle_deg = 0.0
         win.grab()
+    finally:
+        win.close()
+        app.processEvents()
+
+
+def test_real_window_direct_golden_spin_on_click_accumulates(tmp_path):
+    """点击直连模式：真实 PetWindow 点击不播动画，直接回旋并累计圈数。"""
+    from tests.test_collision_window import FakeLibrary
+
+    from pet.window import PetWindow
+
+    app = _qapp()
+    cfg = Config(tmp_path)
+    cfg.set("auto_hide_fullscreen", False)
+    cfg.set("collision_enabled", False)
+    cfg.set("golden_spin_on_click", True)
+    cfg.set("golden_spin_direct", True)
+    win = PetWindow(FakeLibrary(), cfg)
+    try:
+        spin = win._golden_spin
+        win._on_click()
+        assert spin.active
+        assert spin.queued_turns == 1
+        # 旋转中再点一次：累计下一圈，不打断当前旋转。
+        win._on_click()
+        assert spin.active
+        assert spin.queued_turns == 2
+        # 真实 paint/mask 路径带旋转调用不应抛错（角度是否已推进取决于定时器调度）。
+        win.grab()
+        spin.cancel()
     finally:
         win.close()
         app.processEvents()

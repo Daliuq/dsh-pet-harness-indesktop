@@ -70,6 +70,9 @@ class FakeWin(QObject):
     def character_local_region(self):
         return QRect(100, 0, 200, 200)
 
+    def _frame_draw_rect(self):
+        return QRect(0, 0, self._w, self._h)
+
     def _switch(self, name):
         self.switched.append(name)
         self.anim = name
@@ -88,12 +91,12 @@ class FakeWin(QObject):
 def test_probe_window_x_left_and_right():
     local = QRect(100, 0, 200, 200)
     avail = QRect(0, 0, 1000, 800)
-    # left：露出 50%，左侧 off-screen = 100px；窗口 x = 0 - 100 - 100 = -200
-    assert probe_window_x("left", EDGE_PEEK_EXPOSURE, local, avail) == -200
-    # left：露出 62%，off-screen = 76px；x = -176
-    assert probe_window_x("left", EDGE_ENGAGE_EXPOSURE, local, avail) == -176
-    # right：露出 50%，右侧 off-screen = 100px；x = 999 + 100 - 299 = 800
-    assert probe_window_x("right", EDGE_PEEK_EXPOSURE, local, avail) == 800
+    # left：露出 70%，左侧 off-screen = 60px；窗口 x = 0 - 60 - 100 = -160
+    assert probe_window_x("left", EDGE_PEEK_EXPOSURE, local, avail) == -160
+    # left：露出 82%，off-screen = 36px；x = -136
+    assert probe_window_x("left", EDGE_ENGAGE_EXPOSURE, local, avail) == -136
+    # right：露出 70%，右侧 off-screen = 60px；x = 999 + 60 - 299 = 760
+    assert probe_window_x("right", EDGE_PEEK_EXPOSURE, local, avail) == 760
 
 
 def test_edge_side_at_rest_detects_left_and_right():
@@ -130,8 +133,25 @@ def test_release_at_left_edge_enters_peek_pose():
     times[0] += EDGE_ENTER_MS / 1000.0
     ctrl._on_timer()
     assert ctrl.mode == PEEKING
-    assert ctrl.win.x() == -200
+    assert ctrl.win.x() == -177
     assert ctrl.current_angle_deg() == EDGE_PROBE_ANGLE
+    assert abs(ctrl.current_exposure() - EDGE_PEEK_EXPOSURE) < 1e-6
+    ctrl.cancel(restore=True)
+
+
+def test_release_at_right_edge_enters_peek_pose():
+    _qapp()
+    ctrl, times = _controller_and_clock()
+    ctrl.win.move(700, 100)
+    ctrl.win.anim = "idle"
+    ctrl.on_release(was_dragging=True)
+    assert ctrl.active
+    assert ctrl.side == "right"
+    times[0] += EDGE_ENTER_MS / 1000.0
+    ctrl._on_timer()
+    assert ctrl.mode == PEEKING
+    assert ctrl.win.x() == 778
+    assert ctrl.current_angle_deg() == -EDGE_PROBE_ANGLE
     assert abs(ctrl.current_exposure() - EDGE_PEEK_EXPOSURE) < 1e-6
     ctrl.cancel(restore=True)
 
@@ -153,7 +173,7 @@ def test_click_straightens_then_returns_after_idle():
     assert ctrl.current_angle_deg() == 0.0
     assert abs(ctrl.current_exposure() - EDGE_ENGAGE_EXPOSURE) < 1e-6
     assert abs(ctrl._idle_remaining - EDGE_IDLE_SECONDS) < 1e-6
-    assert ctrl.win.x() == -176
+    assert ctrl.win.x() == -136
 
     times[0] += EDGE_IDLE_SECONDS + 0.1
     ctrl._on_timer()
@@ -197,10 +217,10 @@ def test_drag_away_cancels_without_snap_back():
     ctrl.on_release(was_dragging=True)
     times[0] += EDGE_ENTER_MS / 1000.0
     ctrl._on_timer()
-    assert ctrl.win.x() == -200
+    assert ctrl.win.x() == -177
     ctrl.on_drag_started()
     assert not ctrl.active
-    assert ctrl.win.x() == -200  # 用户拖离时位置由用户接管，不 snap
+    assert ctrl.win.x() == -177  # 用户拖离时位置由用户接管，不 snap
     ctrl.cancel(restore=True)
 
 
@@ -212,7 +232,7 @@ def test_feature_off_cancels_and_restores_position():
     ctrl.on_release(was_dragging=True)
     times[0] += EDGE_ENTER_MS / 1000.0
     ctrl._on_timer()
-    assert ctrl.win.x() == -200
+    assert ctrl.win.x() == -177
     ctrl.set_enabled(False)
     assert not ctrl.active
     assert ctrl.win.x() == -100

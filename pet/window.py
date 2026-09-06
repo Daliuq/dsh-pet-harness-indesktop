@@ -3356,7 +3356,11 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         return True
 
     def _on_click(self) -> None:
-        """真点击 → 随机一个点击回应动画，并重置当前动画（可连续点击打断）。"""
+        """真点击 → 随机一个点击回应动画，并重置当前动画（可连续点击打断）。
+
+        若“点击触发黄金回旋”处于直连模式，则跳过 Q 弹/点击素材直接开始回旋，
+        连续点击由 GoldenSpinController 累计圈数并逐圈加速。
+        """
         if self._just_dragged:
             return
         consume_click = getattr(self, '_effects_consume_click', None)
@@ -3364,11 +3368,11 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             return  # 边缘探头激活：点击由探头状态机消费（转直/重置倒计时）
         if callable(self.on_restore_fun_windows):
             self.on_restore_fun_windows()
+        # 直连黄金回旋 / 无点击素材时立即旋转；返回 True 表示本次点击已被效果层消费。
+        route_spin = getattr(self, '_effects_route_click_golden_spin', None)
+        if callable(route_spin) and route_spin():
+            return
         if not self.clicks:
-            # 无点击素材时仍可满足“点击触发黄金回旋”：直接接一段旋转。
-            arm_spin = getattr(self, '_effects_arm_golden_spin_after_click', None)
-            if callable(arm_spin):
-                arm_spin()
             return
         # 点击可以打断当前动画（包括正在播放的点击回应），实现连续 Q 弹。
         # 先让 Q 弹/动画立刻开始，音效放到下一轮事件循环，避免任何音频
@@ -3377,9 +3381,6 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._cancel_move()
         self._start_squash()
         self._switch(click_name)
-        arm_spin = getattr(self, '_effects_arm_golden_spin_after_click', None)
-        if callable(arm_spin):
-            arm_spin()
         if resolve_click_sound_pair(self.cfg.get("click_sound_pack"), data_dir=self.cfg.dir) is None:
             self._schedule_click_sound()
         if self.click_show_balance and callable(self.on_show_balance):

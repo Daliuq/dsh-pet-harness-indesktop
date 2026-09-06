@@ -134,14 +134,30 @@ class WindowFeatureGateMixin:
             return True
         return False
 
-    def _effects_arm_golden_spin_after_click(self) -> None:
-        """点击回应动画已开播；若开启“点击触发黄金回旋”则等它播完再接续。"""
+    def _effects_route_click_golden_spin(self) -> bool:
+        """点击触发黄金回旋路由。
+
+        - 直连模式（golden_spin_direct）或角色无点击素材时：立即 spin_direct()
+          并返回 True，调用方不再播放 Q 弹/点击素材。
+        - armed 模式（有点击素材且未开启直连）：arm_after_click() 并返回 False，
+          调用方继续播点击动画，播完后由 _effects_on_click_anim_finished 接续。
+        - 未开启“点击触发黄金回旋”时返回 False，调用方走普通点击链路。
+        """
         if self._effects_probe_active():
-            return
-        if bool(self.cfg.get("golden_spin_on_click", False)):
-            spin = getattr(self, "_golden_spin", None)
-            if spin is not None:
-                spin.arm_after_click()
+            return False
+        if not bool(self.cfg.get("golden_spin_on_click", False)):
+            return False
+        spin = getattr(self, "_golden_spin", None)
+        if spin is None:
+            return False
+        direct = bool(self.cfg.get("golden_spin_direct", False))
+        has_clips = bool(getattr(self, "clicks", None))
+        if not direct and has_clips:
+            spin.arm_after_click()
+            return False
+        spin.cancel_pending()
+        spin.spin_direct()
+        return True
 
     def _effects_on_click_anim_finished(self) -> None:
         spin = getattr(self, "_golden_spin", None)

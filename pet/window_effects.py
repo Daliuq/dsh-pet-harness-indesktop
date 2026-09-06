@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QEasingCurve, QPointF, QRect
+from PySide6.QtCore import QEasingCurve, QPointF, QRect, QRectF
 
 
 def begin_rotation(painter, rect: QRect, angle_deg: float) -> None:
@@ -47,6 +47,41 @@ def unrotate_point(point: QPointF, rect: QRect, angle_deg: float) -> QPointF:
         center.x() + dx * math.cos(rad) - dy * math.sin(rad),
         center.y() + dx * math.sin(rad) + dy * math.cos(rad),
     )
+
+
+def rotated_region_bounds(region: QRect, pivot_rect: QRect, angle_deg: float) -> QRect:
+    """把 region 四角绕 pivot_rect 中心旋转后的轴对齐外接矩形。
+
+    边缘探头在 ±45° 姿态下用该投影宽度计算露出量，避免按未旋转宽度定位导致
+    实际露出远小于目标。angle=0 时返回原区域副本。
+    """
+    angle = float(angle_deg)
+    if abs(angle) < 1e-6:
+        return QRect(region)
+    center = QPointF(pivot_rect.center())
+    rad = math.radians(angle)
+    cos_a = math.cos(rad)
+    sin_a = math.sin(rad)
+    # 用“像素外缘”坐标（left / top / left+width / top+height）旋转，
+    # 避免 QRect.right() 的含入坐标在 90°/45° 边界少算一列。
+    corners = (
+        QPointF(region.left(), region.top()),
+        QPointF(region.left() + region.width(), region.top()),
+        QPointF(region.left(), region.top() + region.height()),
+        QPointF(region.left() + region.width(), region.top() + region.height()),
+    )
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
+    for point in corners:
+        dx = point.x() - center.x()
+        dy = point.y() - center.y()
+        rx = center.x() + dx * cos_a - dy * sin_a
+        ry = center.y() + dx * sin_a + dy * cos_a
+        min_x = min(min_x, rx)
+        max_x = max(max_x, rx)
+        min_y = min(min_y, ry)
+        max_y = max(max_y, ry)
+    return QRectF(min_x, min_y, max_x - min_x, max_y - min_y).toAlignedRect()
 
 
 def eased_progress(

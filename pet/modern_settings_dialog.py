@@ -281,6 +281,11 @@ class ModernSettingsDialog(QDialog):
             SettingRow("lock_position", "锁定位置", "桌宠固定不动，无法拖动（点击互动仍有效）。", self.lock_position_check),
             SettingRow("shift_drag", "SHIFT+左键拖动", "开启后必须按住 SHIFT 再左键才能拖动桌宠。", self.shift_drag_check),
         ], behavior_content))
+        behavior_layout.addWidget(SettingsSection("边缘探头", [
+            SettingRow("edge_probe", "边缘探头",
+                       "拖到屏幕左/右边缘后自动以 45° 探头姿态窥视；点击真实角色会拉直约 5 秒后自动退回。",
+                       self.edge_probe_check),
+        ], behavior_content))
         behavior_layout.addWidget(SettingsSection("生小肥鱼", [
             SettingRow("spawn_inherit_size", "生小肥鱼继承大小",
                        "开启后生成的小肥鱼与主肥鱼大小一致；关闭后使用下方为小肥鱼单独选择的大小。",
@@ -315,6 +320,7 @@ class ModernSettingsDialog(QDialog):
             SettingRow("click_sound_volume", "音效音量", "调整点击音效播放音量。", self.click_sound_volume_spin),
             SettingRow("click_sound_preview", "试听音效", "测试当前选择的点击音效。", self.click_sound_preview_btn),
             SettingRow("click_self_talk", "点击触发自言自语", "点击时随机显示一条自言自语内容。", self.click_self_talk_check),
+            SettingRow("golden_spin_click", "点击触发黄金回旋", "点击回应动画播完后自动接一段原地逆时针 360° 旋转。", self.golden_spin_click_check),
         ]
         if self.click_balance_check is not None:
             click_rows.insert(4, SettingRow(
@@ -658,6 +664,10 @@ class ModernSettingsDialog(QDialog):
         self.click_self_talk_check.setChecked(bool(self.config.get("click_show_self_talk", False)))
         self.music_sing_check = ToggleSwitch(self)
         self.music_sing_check.setChecked(bool(self.config.get("music_sing_enabled", False)))
+        self.golden_spin_click_check = ToggleSwitch(self)
+        self.golden_spin_click_check.setChecked(bool(self.config.get("golden_spin_on_click", False)))
+        self.edge_probe_check = ToggleSwitch(self)
+        self.edge_probe_check.setChecked(bool(self.config.get("edge_probe_enabled", False)))
         self.balance_refresh_spin = None
         self.balance_tier_mode_select = None
         self.balance_tier_peak_edit = None
@@ -1512,13 +1522,14 @@ class ModernSettingsDialog(QDialog):
             ("显示", claim("scale", "pet_opacity")),
             ("动画与移动", claim("playback_speed", "animation_gap", "idle_low_fps", "no_move", "music_sing")),
             ("拖拽与弹射", claim("drag_physics", "throw_strength", "slingshot_enabled", "lock_position", "shift_drag")),
+            ("边缘探头", claim("edge_probe")),
             ("生小肥鱼", claim("spawn_inherit_size", "spawn_scale", "spawn_inherit_dynamic_island", "clear_spawned_pets")),
             ("多开碰撞", collision_primary),
             ("碰撞参数（高级）", collision_advanced, True),
         ])
         interaction = page_content([
             ("输入", claim("mouse_through")),
-            ("点击反馈", claim_prefix("click_")),
+            ("点击反馈", claim_prefix("click_") + claim("golden_spin_click")),
             ("自言自语", claim("self_talk_bubble_style", "self_talk", "self_talk_duration", "self_talk_min", "self_talk_max", "self_talk_texts", "self_talk_images", "self_talk_image_scale")),
         ])
         # click_talk_bindings shares the click_ prefix and remains in interaction.
@@ -1792,6 +1803,8 @@ class ModernSettingsDialog(QDialog):
             self.config.set("click_show_balance", self.click_balance_check.isChecked())
         self.config.set("click_show_self_talk", self.click_self_talk_check.isChecked())
         self.config.set("music_sing_enabled", self.music_sing_check.isChecked())
+        self.config.set("golden_spin_on_click", self.golden_spin_click_check.isChecked())
+        self.config.set("edge_probe_enabled", self.edge_probe_check.isChecked())
         if self.balance_refresh_spin is not None:
             self.config.set("balance_refresh_minutes", int(self.balance_refresh_spin.value()))
             self.config.set(

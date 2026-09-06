@@ -152,3 +152,31 @@ def test_effect_filter_switch_restricts_probe_session_to_idle_turn():
     assert host._edge_probe.clicked == 1
     assert host._effects_probe_active() is True
     assert host._effects_skip_turn_facing() is True
+
+
+def test_real_window_paint_with_active_rotation_does_not_raise(tmp_path):
+    """回归：黄金回旋角度非零时 paintEvent/_sync_mask 的 begin/end 必须配对。
+
+    之前 end_rotation 参数不匹配会在实际靠边/旋转时抛 TypeError，并留下未结束
+    QPainter 导致 QPaintDevice 崩溃。这里直接让真实 PetWindow 带旋转角度 grab。
+    """
+    from tests.test_collision_window import FakeLibrary
+
+    from pet.window import PetWindow
+
+    app = _qapp()
+    cfg = Config(tmp_path)
+    cfg.set("auto_hide_fullscreen", False)
+    cfg.set("collision_enabled", False)
+    win = PetWindow(FakeLibrary(), cfg)
+    try:
+        spin = win._golden_spin
+        spin._active = True
+        spin._angle_deg = 35.0
+        win.grab()  # 触发 paintEvent，若 begin/end 不配对这里会抛错/崩溃
+        spin._active = False
+        spin._angle_deg = 0.0
+        win.grab()
+    finally:
+        win.close()
+        app.processEvents()

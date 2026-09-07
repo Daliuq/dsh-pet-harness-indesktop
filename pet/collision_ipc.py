@@ -16,7 +16,7 @@ import sys
 from dataclasses import asdict
 from typing import Any, cast
 
-from PySide6.QtCore import QMetaObject, QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QEvent, QMetaObject, QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtNetwork import QAbstractSocket, QLocalServer, QLocalSocket
 
 from . import collision
@@ -1087,7 +1087,32 @@ class _CollisionWorker(QObject):
         self._timers.clear()
         slot_manager.release_file_lock(self._coordinator_lock)
         self._coordinator_lock = None
+        # 关闭顺序最后一步：先排空本线程 DeferredDelete，再 quit 线程。
+        # 否则上面的 QLocalServer/QLocalSocket/QTimer deleteLater 事件会随线程
+        # 退出被丢弃，成为孤儿原生对象（Linux 段错误崩溃点漂移的根因之一）。
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        # worker 在本线程同步销毁：deleteLater 后由事件循环在 quit timer 之前
+        # 处理（posted 事件优先于 timer），避免 finished 后跨线程 deleteLater
+        # 投递到已退出的线程永不执行。
+        self.deleteLater()
         QTimer.singleShot(0, self.thread().quit)
+
+
+# 存活会话登记（测试隔离用）：构造时登记、stop 时注销，供 conftest 每测
+# teardown 统一 stop 泄漏的 session（强引用防止「QThread destroyed while
+# running」的过早 GC，崩溃点漂移防线）。
+_live_sessions: set = set()
+
+
+def _stop_live_sessions_for_tests() -> None:
+    """测试隔离：stop 所有仍存活的 CollisionIpcSession（finally 语义）。"""
+    sessions = list(_live_sessions)
+    for session in sessions:
+        try:
+            session.stop()
+        except Exception:
+            pass
+    _live_sessions.clear()
 
 
 class CollisionIpcSession(QObject):
@@ -1103,6 +1128,7 @@ class CollisionIpcSession(QObject):
     def __init__(self, config, parent=None, server_name: str | None = None):
         # AppShell 是普通控制器而非 QObject；生命周期由其属性持有。
         super().__init__(parent if isinstance(parent, QObject) else None)
+        _live_sessions.add(self)
         self.runtime_id = make_runtime_id(getattr(config, "instance_id", ""))
         self._thread = QThread(self)
         policy = {"collision_enabled": bool(config.get("collision_enabled", True)),
@@ -1114,7 +1140,9 @@ class CollisionIpcSession(QObject):
                                         getattr(config, "instance_id", ""), policy,
                                         lock_path=config.dir / "collision-coordinator.lock")
         self._worker.moveToThread(self._thread)
-        self._thread.finished.connect(self._worker.deleteLater)
+        # worker 的销毁不再挂在 finished→deleteLater：该 deleteLater 会投递到
+        # 已退出的线程、永不执行，形成孤儿原生对象。改由 _CollisionWorker.stop()
+        # 末尾在本线程内 deleteLater 并排空 DeferredDelete 完成同步销毁。
         self._thread.started.connect(self._worker.start)
         self._worker.impulse_ready.connect(self.impulse_ready, Qt.ConnectionType.QueuedConnection)
         self._worker.snapshot_ready.connect(self.snapshot_ready, Qt.ConnectionType.QueuedConnection)
@@ -1139,6 +1167,7 @@ class CollisionIpcSession(QObject):
         self.leave_submitted.emit()
 
     def stop(self) -> None:
+        _live_sessions.discard(self)
         if self._thread.isRunning():
             self.state_submitted.disconnect(self._worker.submit_state)
             QMetaObject.invokeMethod(self._worker, "stop", Qt.ConnectionType.QueuedConnection)

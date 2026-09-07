@@ -95,8 +95,17 @@ def _clear_click_sound_pool():
 
 @pytest.fixture(autouse=True)
 def _close_qt_top_level_widgets():
-    """在测试后收口仍存活的应用级后台资源。"""
+    """在测试后收口仍存活的应用级后台资源与 collision IPC 会话。"""
     yield
+    # collision IPC：stop 仍存活的 CollisionIpcSession（finally 语义）。
+    # 会话若在测试里未 stop，其 QThread 被 GC 时仍在跑 → 后续无关测试的
+    # processEvents 处 native abort（QThread: Destroyed while thread is still
+    # running，崩溃点漂移、Linux exit 139 根因）。
+    try:
+        from pet.collision_ipc import _stop_live_sessions_for_tests
+        _stop_live_sessions_for_tests()
+    except Exception:
+        pass
     try:
         from pet.agent_link import AgentLinkManager, BaseAgentMonitor
         AgentLinkManager._shutdown_live_for_tests()

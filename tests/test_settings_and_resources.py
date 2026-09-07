@@ -341,3 +341,41 @@ def test_dialogue_global_edits_read_and_preserve_unified_preset(qapp, tmp_path):
     assert phrases["global"]["start"] == ["新的全局 start"]
     assert phrases["global"]["thinking"] == ["全局默认 thinking"]
     assert phrases["agents"]["dsh"]["thinking"] == ["DSH thinking"]
+
+
+def test_dialogue_scope_switch_edits_agent_delta(qapp, tmp_path):
+    """编辑区切换 scope：选中某 Agent 后编辑其事件，保存落 agents[agent_key]，
+    且只写有差异的事件（空事件不覆盖 global）。
+
+    ticket 04 UI：global 编辑面是默认层，agent scope 是 delta 覆盖层。
+    """
+    cfg = Config(tmp_path / "appdata")
+    cfg.set("dialogue_mode", "custom")
+    cfg.set("dialogue_phrases", {
+        "global": {"start": ["全局 start"], "thinking": ["全局 thinking"]},
+    })
+    cfg.save()
+
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        assert dialog.dialogue_scope_select.currentData() == ""
+        # 切到 DSH 专属层
+        dialog.dialogue_scope_select.setCurrentData("dsh")
+        # flush+load 后编辑区为空（dsh 尚无覆盖）→ 填 start 差异
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == ""
+        dialog.dialogue_phrase_edits["start"].setPlainText("DSH 专属 start")
+        # 切回 global：dsh 层已缓存，global 内容不变
+        dialog.dialogue_scope_select.setCurrentData("")
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "全局 start"
+
+        ok = dialog._write_config()
+        assert ok is True
+    finally:
+        dialog.deleteLater()
+
+    reloaded = Config(tmp_path / "appdata")
+    phrases = reloaded.get("dialogue_phrases")
+    assert phrases["global"]["start"] == ["全局 start"]
+    assert phrases["agents"]["dsh"]["start"] == ["DSH 专属 start"]
+    # 未覆盖的 thinking 不进 dsh delta
+    assert "thinking" not in phrases["agents"]["dsh"]

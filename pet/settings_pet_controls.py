@@ -313,15 +313,33 @@ def build_pet_controls(host) -> None:
     # 统一预设：global 层是编辑区默认面（flat 旧结构 = global；双层取 global）
     configured_phrases = host.config.get("dialogue_phrases", {})
     if isinstance(configured_phrases, dict) and ("global" in configured_phrases or "agents" in configured_phrases):
-        global_phrases = configured_phrases.get("global")
-        if not isinstance(global_phrases, dict):
-            global_phrases = {}
+        preset_global = configured_phrases.get("global")
+        if not isinstance(preset_global, dict):
+            preset_global = {}
+        preset_agents = configured_phrases.get("agents")
+        if not isinstance(preset_agents, dict):
+            preset_agents = {}
     else:
-        global_phrases = configured_phrases if isinstance(configured_phrases, dict) else {}
+        preset_global = configured_phrases if isinstance(configured_phrases, dict) else {}
+        preset_agents = {}
+
+    # 逐 Agent 覆盖层（delta）编辑缓冲：scope（""=global / agent_key）→ {事件: 文本}
+    host.dialogue_scope_select = ModernSelect(host, width=190)
+    host.dialogue_scope_select.addItem("默认（全局文案）", "")
+    for agent_key, agent_name in AgentLinkManager.AGENT_NAMES.items():
+        host.dialogue_scope_select.addItem(f"{agent_name} 专属文案", agent_key)
+    # 自定义 Agent 也支持专属层（跟随 agent_link.custom_agents）
+    for item in (agent_link_cfg.get("custom_agents") or []):
+        if isinstance(item, dict) and str(item.get("key") or "").strip():
+            host.dialogue_scope_select.addItem(
+                f"{str(item.get('name') or item.get('key'))} 专属文案", str(item["key"]).strip())
+    host.dialogue_scope_select.setCurrentData("")
+    host._dialogue_scope = ""  # 当前编辑层（""=global）
+
     host.dialogue_phrase_edits: dict[str, QPlainTextEdit] = {}
     for key in phrase_keys():
         edit = QPlainTextEdit(host)
-        raw_value = global_phrases.get(key, "")
+        raw_value = preset_global.get(key, "")
         if isinstance(raw_value, list):
             edit.setPlainText("\n".join(str(item) for item in raw_value if isinstance(item, str)))
         else:
@@ -335,6 +353,20 @@ def build_pet_controls(host) -> None:
             placeholder = "留空使用基础模式台词；本事件无可替换参数"
         edit.setPlaceholderText(placeholder)
         host.dialogue_phrase_edits[key] = edit
+
+    # 每个 scope 的编辑缓冲快照（切换时 flush/load）
+    host._dialogue_scope_buffer: dict[str, dict[str, str]] = {}
+    host._dialogue_scope_buffer[""] = {
+        key: edit.toPlainText() for key, edit in host.dialogue_phrase_edits.items()
+    }
+    for agent_key, agent_events in preset_agents.items():
+        if not isinstance(agent_events, dict):
+            continue
+        host._dialogue_scope_buffer[str(agent_key)] = {
+            key: ("\n".join(str(i) for i in value) if isinstance(value, list) else str(value or ""))
+            for key, value in agent_events.items()
+        }
+    host.dialogue_scope_select.currentIndexChanged.connect(host._on_dialogue_scope_changed)
 
     host.dialogue_template_import_edit = QPlainTextEdit(host)
     host.dialogue_template_import_edit.setObjectName("dialogueTemplateImportEdit")

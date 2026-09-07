@@ -431,6 +431,7 @@ class ModernSettingsDialog(QDialog):
         labels = DIALOGUE_LABELS
         behavior_layout.addWidget(SettingsSection("表达风格", [
             SettingRow("dialogue_mode", "表达风格", "控制桌宠自言自语、候选内容和主动气泡的说话方式；同时覆盖 Agent 状态、审批、提问、错误、限流等所有气泡。内置「原有模式」与「鲸鱼娘女仆模式」不可编辑；选择「自定义台词」后，可粘贴下方 JSON 一键导入全部弹窗文案。", self.dialogue_mode_select),
+            SettingRow("dialogue_scope", "专属文案对象", "下方逐事件编辑针对的对象：默认（全局文案）或某 Agent 的专属文案。留空的事件自动沿用全局（或原有模式）文案。", self.dialogue_scope_select, stacked=True),
         ], behavior_content))
         behavior_layout.addWidget(SettingsCard([
             SettingRow(
@@ -1065,11 +1066,42 @@ class ModernSettingsDialog(QDialog):
         self.dialogue_template_import_edit.clear()
         QMessageBox.information(self, "导入成功", "已导入全部弹窗内容模板；点击“保存并退出”后生效。")
 
-    def _dialogue_phrase_values(self) -> dict[str, list[str]]:
-        return {
-            key: [line.strip() for line in edit.toPlainText().splitlines() if line.strip()]
-            for key, edit in self.dialogue_phrase_edits.items()
+    def _dialogue_flush_scope(self, scope: str | None = None) -> None:
+        """把当前编辑区的文本快照写回 scope buffer（切换/保存前调用）。
+
+        scope 缺省取内部追踪的当前层（self._dialogue_scope），而不是
+        select.currentData()——切换信号触发时下拉已是新值，用它 flush 会把
+        编辑内容误写进目标层。
+        """
+        if not hasattr(self, "dialogue_scope_select") or not hasattr(self, "dialogue_phrase_edits"):
+            return
+        scope = self._dialogue_scope if scope is None else scope
+        self._dialogue_scope_buffer[str(scope)] = {
+            key: edit.toPlainText() for key, edit in self.dialogue_phrase_edits.items()
         }
+
+    def _on_dialogue_scope_changed(self, index: int) -> None:
+        """切换 global/某 Agent 专属文案编辑层：flush 当前层后载入目标层内容。"""
+        if not hasattr(self, "dialogue_scope_select"):
+            return
+        self._dialogue_flush_scope()
+        target = str(self.dialogue_scope_select.currentData() or "")
+        self._dialogue_scope = target
+        buf = self._dialogue_scope_buffer.get(target) or {}
+        for key, edit in self.dialogue_phrase_edits.items():
+            edit.setPlainText(str(buf.get(key, "") or ""))
+
+    def _dialogue_scope_values(self, scope: str) -> dict[str, list[str]]:
+        """scope buffer 某层的非空事件 → list[str]（供保存/导出）。"""
+        buf = self._dialogue_scope_buffer.get(scope) or {}
+        return {
+            key: [line.strip() for line in str(text).splitlines() if line.strip()]
+            for key, text in buf.items()
+            if str(text or "").strip()
+        }
+
+    def _dialogue_phrase_values(self) -> dict[str, list[str]]:
+        return self._dialogue_scope_values("")
 
     def _current_dialogue_template(self) -> dict:
         # 导出 = 纯字段参考模板：phrases 一律留空（不携带当前已配置的台词），
@@ -1630,16 +1662,23 @@ class ModernSettingsDialog(QDialog):
         self.config.set("self_talk_image_scale", self.self_talk_image_scale_spin.value())
         # Agent 联动：自定义 thinking 文案与音效（合并写回，不覆盖 agent_link 其他开关）
         self.config.set("dialogue_mode", str(self.dialogue_mode_select.currentData() or "legacy"))
-        new_global = {
-            key: lines for key, lines in self._dialogue_phrase_values().items() if lines
-        }
-        # 统一预设：编辑区 = global 层；若已是双层则保留 agents delta，仅替换 global
+        # 统一预设：编辑区当前层 flush 后，global 层 + agents delta 分层写回
+        self._dialogue_flush_scope()
+        new_global = self._dialogue_scope_values("")
+        agents_delta: dict[str, dict[str, list[str]]] = {}
+        for scope in self._dialogue_scope_buffer:
+            if scope == "":
+                continue
+            values = self._dialogue_scope_values(str(scope))
+            if values:
+                agents_delta[str(scope)] = values
+        # 兼容旧扁平存储：双层仅当存在 agents delta 或原配置已是双层时启用
         current_phrases = self.config.get("dialogue_phrases", {})
-        if isinstance(current_phrases, dict) and ("global" in current_phrases or "agents" in current_phrases):
-            self.config.set("dialogue_phrases", {
-                "global": new_global,
-                "agents": current_phrases.get("agents", {}) if isinstance(current_phrases.get("agents"), dict) else {},
-            })
+        was_preset = isinstance(current_phrases, dict) and (
+            "global" in current_phrases or "agents" in current_phrases
+        )
+        if agents_delta or was_preset:
+            self.config.set("dialogue_phrases", {"global": new_global, "agents": agents_delta})
         else:
             self.config.set("dialogue_phrases", new_global)
         # Agent 联动：自定义 thinking 文案（合并写回，不覆盖 agent_link 其他开关）

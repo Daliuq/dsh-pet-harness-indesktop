@@ -190,6 +190,35 @@ except (OSError, ValueError):
     pass
 
 
+def phrase_for_agent(phrases: Mapping[str, Any] | None, agent_key: str, key: str) -> list[str] | None:
+    """Resolve a phrase event in a unified preset (ticket 02).
+
+    Preset shapes accepted:
+    - ``{global: {key: [...]}, agents: {agent_key: {key: [...]}}}``（统一预设）
+    - flat ``{key: [...]}``（旧自定义台词，等价于 global 单层）
+
+    Resolution: ``agents[agent_key][key]`` → ``global[key]``（agent_key 为空时跳过
+    agents 层，即非 Agent 场景只读 global）。找不到返回 None。
+    """
+    if not isinstance(phrases, dict):
+        return None
+    global_part = phrases.get("global") if isinstance(phrases.get("global"), dict) else None
+    if agent_key:
+        agents_part = phrases.get("agents") if isinstance(phrases.get("agents"), dict) else None
+        if isinstance(agents_part, dict):
+            agent_phrases = agents_part.get(agent_key)
+            if isinstance(agent_phrases, dict) and key in agent_phrases:
+                return agent_phrases[key]
+    if global_part is not None:
+        if key in global_part:
+            return global_part[key]
+        return None
+    # Flat legacy preset: the whole mapping is the global layer.
+    if "global" not in phrases and "agents" not in phrases:
+        return phrases.get(key)
+    return None
+
+
 class PhrasePicker:
     """Small deterministic picker which avoids immediate repeats per phrase key."""
 

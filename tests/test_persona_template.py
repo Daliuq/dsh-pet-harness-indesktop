@@ -55,7 +55,9 @@ def test_all_advertised_fields_reach_presentation_layer():
             if callee not in ("_dialogue", "_persona_text") or not node.args:
                 continue
             key_arg = node.args[0] if callee == "_dialogue" else node.args[1]
-            kws = {kw.arg for kw in node.keywords if kw.arg}
+            # agent_key 是 _dialogue 的统一预设路由参数（ticket 05），不是模板注入
+            # 字段：模板不宣称它，AST 收集时排除，避免与 PARAMETERS 严格对齐误报。
+            kws = {kw.arg for kw in node.keywords if kw.arg and kw.arg != "agent_key"}
             has_expansion = any(kw.arg is None for kw in node.keywords)
             if isinstance(key_arg, ast.Constant) and isinstance(key_arg.value, str):
                 delivered.setdefault(key_arg.value, set()).update(kws)

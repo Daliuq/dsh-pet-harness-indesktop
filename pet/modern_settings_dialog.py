@@ -1323,7 +1323,6 @@ class ModernSettingsDialog(QDialog):
             ("输入", claim("mouse_through")),
             ("点击反馈", claim_prefix("click_") + claim("golden_spin_click", "golden_spin_direct")),
             ("自言自语", claim("self_talk_bubble_style", "self_talk", "self_talk_duration", "self_talk_min", "self_talk_max", "self_talk_texts", "self_talk_images", "self_talk_image_scale")),
-            ("表达风格", claim_prefix("dialogue_")),
         ])
         # click_talk_bindings shares the click_ prefix and remains in interaction.
         menu = SettingsTabContainer(self)
@@ -1377,6 +1376,7 @@ class ModernSettingsDialog(QDialog):
         watchdog_rows = list(self.watchdog_page.findChildren(SettingRow))
         claimed.update(watchdog_rows)
         automation = page_content([
+            ("Agent 联动文案风格", claim_prefix("dialogue_")),
             ("Agent 文案", claim_prefix("agent_thinking_")),
             ("Agent 提示音", claim_prefix("agent_sound_")),
             ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
@@ -1404,7 +1404,7 @@ class ModernSettingsDialog(QDialog):
             "菜单": menu,
             "桌面组件": desktop_components,
             "AI 与对话": ai_sections,
-            "自动化与联动": automation,
+            "Agent 联动": automation,
         }
         for label, icon in SETTINGS_DOMAIN_NAV:
             content = domain_content.get(label)

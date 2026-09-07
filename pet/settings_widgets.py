@@ -80,7 +80,7 @@ SETTINGS_DOMAIN_NAV = (
     ("菜单", "application"),
     ("桌面组件", "island"),
     ("AI 与对话", "chat"),
-    ("自动化与联动", "automation"),
+    ("Agent 联动", "automation"),
 )
 
 BROWSER_CONTROL_STYLESHEET = """

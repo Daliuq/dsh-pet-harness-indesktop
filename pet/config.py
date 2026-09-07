@@ -947,20 +947,45 @@ class Config:
             raw.pop("decode_broker_enabled", None)
         self._decode_broker_migrated = True
 
+    @staticmethod
+    def _clean_phrase_events(events) -> dict:
+        """清洗单层 dialogue 事件映射 {event: list[str] | str}（值上限 8 条/240 字符）。"""
+        if not isinstance(events, dict):
+            return {}
+        cleaned = {}
+        for key, value in events.items():
+            if not str(key).strip():
+                continue
+            if isinstance(value, list):
+                items = [item.strip()[:240] for item in value if isinstance(item, str) and item.strip()]
+                if not items:
+                    continue
+                cleaned[str(key)] = items[:8]
+            elif isinstance(value, str) and value.strip():
+                cleaned[str(key)] = value.strip()[:240]
+        return cleaned
+
     def _normalize_pet_settings(self):
         dialogue_mode = str(self.data.get("dialogue_mode") or "legacy").lower()
         self.data["dialogue_mode"] = dialogue_mode if dialogue_mode in {"legacy", "whale_maid", "custom"} else "legacy"
         raw_phrases = self.data.get("dialogue_phrases")
-        self.data["dialogue_phrases"] = (
-            {str(k): ([item.strip()[:240] for item in v if isinstance(item, str) and item.strip()][:8]
-                       if isinstance(v, list) else str(v).strip()[:240])
-             for k, v in raw_phrases.items()
-             if str(k).strip() and (
-                 (isinstance(v, list) and any(isinstance(item, str) and item.strip() for item in v))
-                 or (isinstance(v, str) and v.strip())
-             )}
-            if isinstance(raw_phrases, dict) else {}
-        )
+        if isinstance(raw_phrases, dict) and ("global" in raw_phrases or "agents" in raw_phrases):
+            # 统一预设双层 {global: events, agents: {agent_key: events}}
+            preset = {}
+            global_events = raw_phrases.get("global")
+            preset["global"] = self._clean_phrase_events(global_events)
+            agents = {}
+            raw_agents = raw_phrases.get("agents")
+            if isinstance(raw_agents, dict):
+                for agent_key, events in raw_agents.items():
+                    agent_cleaned = self._clean_phrase_events(events)
+                    if str(agent_key).strip() and agent_cleaned:
+                        agents[str(agent_key)] = agent_cleaned
+            preset["agents"] = agents
+            self.data["dialogue_phrases"] = preset
+        else:
+            # 旧单层 {event: [...]}：视为 global
+            self.data["dialogue_phrases"] = self._clean_phrase_events(raw_phrases)
         from . import physics as physics_mod
 
         self.data["playback_speed"] = _float_or_default(self.data.get("playback_speed"), 1.0, 0.1, 8.0)

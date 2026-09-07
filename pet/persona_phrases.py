@@ -256,6 +256,30 @@ class PhrasePicker:
         index = (last + 1) % len(variants)
         self._last[key] = index
         return render_template(variants[index], values, autohide=autohide)
+
+    def custom_for_agent(self, phrases: Mapping[str, Any] | None, route_agent: str, key: str,
+                         fallback: str, autohide=None, **values) -> str:
+        """Render a custom phrase with agent routing (ticket 02/05).
+
+        Resolution: ``agents[route_agent][key]`` → ``global[key]``（route_agent="" 只查
+        global）→ fallback。与 ``custom()`` 共享轮换与渲染语义。
+
+        ``route_agent`` 命名避开 ``agent_key``：后者可能是渲染模板字段
+        （_dialogue_context 注入），不参与路由以免关键字冲突。
+        """
+        raw = phrase_for_agent(phrases, route_agent, key)
+        if raw is None:
+            return fallback
+        if isinstance(raw, list):
+            variants = [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
+        else:
+            variants = [str(raw).strip()] if isinstance(raw, str) and raw.strip() else []
+        if not variants:
+            return fallback
+        last = self._last[key]
+        index = (last + 1) % len(variants)
+        self._last[key] = index
+        return render_template(variants[index], values, autohide=autohide)
 def phrase_keys() -> tuple[str, ...]:
     return tuple(sorted(_PHRASES))
 

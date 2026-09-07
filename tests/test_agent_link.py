@@ -1014,6 +1014,36 @@ class TestAgentLinkBubbles:
         mgr2._on_agent_state("dsh", "thinking")
         assert "大肥鱼正在深度思考" in bubbles2[0]
 
+    def test_thinking_uses_agent_delta_preset(self, tmp_path):
+        """thinking 文案走统一预设 agents delta：dsh 有覆盖时命中，其它 Agent 回退 global。
+
+        ticket 02/05：dialogue_mode=custom + {global, agents} 双层。
+        """
+        mgr, win, bubbles, clock = self._make_mgr(
+            tmp_path, agent_link_cfg={"notify_state": True}
+        )
+        cfg = mgr.cfg
+        cfg.data["dialogue_mode"] = "custom"
+        cfg.data["dialogue_phrases"] = {
+            "global": {"thinking": ["{name} 全局思考……"]},
+            "agents": {
+                "dsh": {"thinking": ["{name} 大肥鱼深度思考中……"]},
+                "claude": {},
+            },
+        }
+        cfg.save()
+
+        mgr._on_agent_state("dsh", "thinking")
+        assert len(bubbles) == 1
+        assert "大肥鱼深度思考中" in bubbles[0]
+        assert "全局思考" not in bubbles[0]
+
+        # claude 无 agents 覆盖 → 回退 global
+        mgr._on_agent_state("dsh", "idle")
+        clock[0] += 3.0
+        mgr._on_agent_state("claude", "thinking")
+        assert any("Claude Code 全局思考" in b for b in bubbles)
+
     def test_jitter_cancel_done_check(self, tmp_path):
         """4. working→idle→working 抖动：idle 后 pending 存在，
         再来 working 后 pending 被清空（_cancel_done_check 生效），此后 _fire_done 不弹气泡。"""

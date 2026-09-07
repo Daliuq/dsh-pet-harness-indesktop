@@ -1991,11 +1991,11 @@ class AgentLinkManager(QObject):
             # 避免「需要看一眼」和「完成通知」双气泡；独立出现的才立即提醒
             if prev_raw not in self._BUSY_STATES:
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
-                self._show_link_bubble(self._dialogue("agent.attention", "主人，Agent 这边需要你看一眼～", name=name), important=True)
+                self._show_link_bubble(self._dialogue("agent.attention", "主人，Agent 这边需要你看一眼～", agent_key=agent_key, name=name), important=True)
         elif state == "error":
             if prev_raw not in self._BUSY_STATES:
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
-                self._show_link_bubble(self._dialogue("agent.error", "Agent 执行好像遇到报错了…", name=name), important=True)
+                self._show_link_bubble(self._dialogue("agent.error", "Agent 执行好像遇到报错了…", agent_key=agent_key, name=name), important=True)
         elif state in ("sleeping", "idle"):
             # 回到待机：一次性动作播完自然回，待机/移动中立即回
             if hasattr(self.win, "request_link_idle"):
@@ -2101,8 +2101,13 @@ class AgentLinkManager(QObject):
         if str(context.get("tool") or "").strip() or str(context.get("event") or "") == "tool/call":
             self._last_tool_records[agent_key] = context
 
-    def _dialogue(self, key: str, fallback: str, **values) -> str:
-        """Render an event with explicit aliases plus latest upstream fields."""
+    def _dialogue(self, key: str, fallback: str, *, agent_key: str = "", **values) -> str:
+        """Render an event with explicit aliases plus latest upstream fields.
+
+        ``agent_key``（默认 ""=非 Agent/全局场景）用于统一预设路由：
+        custom 模式下按 ``agents[agent_key][key] → global[key] → 内置`` 取文案；
+        传空时只读 global（兼容旧单层自定义台词）。
+        """
         merged = dict(self._dialogue_context)
         merged.update(values)
         # 条件参数（CONDITIONAL_PARAMETERS）：上游未提供/为空/为 null 时渲染端
@@ -2110,8 +2115,8 @@ class AgentLinkManager(QObject):
         autohide = CONDITIONAL_PARAMETERS.get(key, ())
         mode = str(self.cfg.get("dialogue_mode", "legacy") or "legacy")
         if mode == "custom":
-            return self._phrase_picker.custom(self.cfg.get("dialogue_phrases", {}), key, fallback,
-                                              autohide=autohide, **merged)
+            return self._phrase_picker.custom_for_agent(self.cfg.get("dialogue_phrases", {}), agent_key, key,
+                                                        fallback, autohide=autohide, **merged)
         return self._phrase_picker.get(mode, key, fallback, autohide=autohide, **merged)
 
     def _session_conditional(self, record: dict) -> dict[str, str]:
@@ -2135,28 +2140,41 @@ class AgentLinkManager(QObject):
         return vals
 
     def _thinking_text(self, agent_key: str) -> str:
-        """thinking 气泡文案：按 Agent 自定义 > 旧全局自定义 > 按 Agent 默认。"""
+        """thinking 气泡文案：统一预设 agents delta/global > 旧 per-Agent 自定义 > 内置默认。"""
         agent_cfg = self.cfg.get("agent_link", {})
-        custom = (agent_cfg.get("thinking_texts") or {}).get(agent_key, "").strip()
-
-        if not custom:
-            custom = str(agent_cfg.get("thinking_text", "") or "").strip()
-
         name = self.agent_names.get(
             agent_key,
             self.AGENT_NAMES.get(agent_key, agent_key),
         )
 
+        # 1) 统一预设（dialogue_mode=custom 且配置了 agents/global 时优先）
+        mode = str(self.cfg.get("dialogue_mode", "legacy") or "legacy")
+        if mode == "custom":
+            preset = self.cfg.get("dialogue_phrases", {})
+            if isinstance(preset, dict) and ("global" in preset or "agents" in preset):
+                custom = self._phrase_picker.custom_for_agent(
+                    preset, agent_key, "thinking", "",
+                    name=name,
+                )
+                if custom:
+                    return custom
+
+        # 2) 旧 per-Agent / 全局自定义（agent_link.thinking_texts / thinking_text）
+        custom = (agent_cfg.get("thinking_texts") or {}).get(agent_key, "").strip()
+        if not custom:
+            custom = str(agent_cfg.get("thinking_text", "") or "").strip()
         if custom:
             return custom.replace("{name}", name)
 
+        # 3) 内置默认
         if agent_key in self._THINKING_DEFAULTS:
             fallback = self._THINKING_DEFAULTS[agent_key]
-            return self._dialogue("thinking", fallback, name=name)
+            return self._dialogue("thinking", fallback, agent_key=agent_key, name=name)
 
         return self._dialogue(
             "thinking",
             f"{name} 正在深度烧烤……",
+            agent_key=agent_key,
             name=name,
         )
 
@@ -2173,7 +2191,7 @@ class AgentLinkManager(QObject):
             self._show_link_bubble(self._thinking_text(agent_key), important=False, duration_ms=3000)
         else:
             self._show_link_bubble(
-                self._dialogue("start", f"{name} 开始干活啦～", name=name),
+                self._dialogue("start", f"{name} 开始干活啦～", agent_key=agent_key, name=name),
                 important=False, duration_ms=3000,
             )
 
@@ -2228,7 +2246,7 @@ class AgentLinkManager(QObject):
         values["name"] = name
         values["tool"] = str(tool).strip()
         values["label"] = label
-        text = self._dialogue(key, f"{name} {label}…", **values)
+        text = self._dialogue(key, f"{name} {label}…", agent_key=agent_key, **values)
         self._show_link_bubble(text, important=False, duration_ms=2600)
 
     def _on_approval_request(self, agent_key: str, payload: dict) -> None:
@@ -2855,9 +2873,9 @@ class AgentLinkManager(QObject):
         name = self.agent_names.get(agent_key, agent_key)
         if agent_key in self._saw_alert:
             # busy 期间出现过 attention/error：不暗示"成功完成"
-            text = self._dialogue("done.attention", f"{name} 那边停了，结果怎么样要主人自己看一眼哦", name=name)
+            text = self._dialogue("done.attention", f"{name} 那边停了，结果怎么样要主人自己看一眼哦", agent_key=agent_key, name=name)
         else:
-            text = self._dialogue("done.success", f"{name} 干完活啦，去看看成果吧～", name=name)
+            text = self._dialogue("done.success", f"{name} 干完活啦，去看看成果吧～", agent_key=agent_key, name=name)
         self._saw_alert.discard(agent_key)
         # 恢复待机动画：Claude 回合结束没有 idle 事件，不靠这步会一直停在干活动作。
         # 仅当没有其他 Agent 仍在忙时恢复（避免 A 完成顶掉 B 的工作动画）。

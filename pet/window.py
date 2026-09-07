@@ -1108,6 +1108,29 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self.on_hidden()
         self._arm_dock_reactivate_restore()
 
+    def _stop_all_timers(self) -> None:
+        """停止全部活动定时器并清空关联状态（隐藏/关闭共用的收口）。
+
+        closeEvent 与 _pause_activity 此前各自收口、已出现分叉：closeEvent
+        漏停 _move_timer/_squash_timer/_physics_timer/_music_sing_timer。这些
+        QTimer(self) 子对象虽随窗口 C++ 销毁而销毁，但 win.close() 只隐藏不
+        销毁窗口，Python 包装存活期内残留的单次 timeout 仍可对已停播/半销毁
+        窗口触发（全量套件崩溃点漂移、Linux exit 139 的来源之一）。统一在此
+        收口，避免两类路径再次分叉。
+        """
+        self._cancel_pending_switch_retry()
+        self._cancel_animation_gap()
+        self._clear_drag_move()
+        self._cancel_move()
+        self._self_talk_timer.stop()
+        self._music_sing_timer.stop()
+        self._squash_timer.stop()
+        self._squash_active = False
+        self._physics_timer.stop()
+        jank = getattr(self, "_jank_timer", None)  # 仅 perfstats 观测模式存在
+        if jank is not None:
+            jank.stop()
+
     def _pause_activity(self) -> None:
         """暂停动画解码与所有活动定时器（窗口不可见时没有任何可见效果）。"""
         if not hasattr(self, 'movie'):
@@ -1117,22 +1140,13 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             # 共享解码：窗口停播（隐藏/暂停）→ shareable idle 会话中止
             # （订阅者回绕合成 end，消费端本地回退）；broker 关 = no-op。
             self._broker_unregister(self.anim, self.movie, natural=False)
-        # 隐藏期间不重试被拒动画：停掉待重试并清空状态（恢复显示时重新切换）
-        self._cancel_pending_switch_retry()
-        self._move_timer.stop()
-        self._physics_timer.stop()
-        self._drag_move_timer.stop()
-        self._drag_move_pending = None
+        # 停掉全部活动定时器并清空关联状态（含待重试被拒动画）。
+        self._stop_all_timers()
         # 全屏 watcher 不能在"全屏自动隐藏"期间停：它是退出全屏后
         # 重新 show() 的唯一检测路径，停了桌宠就再也回不来。
         # 只有手动隐藏（托盘/右键，_auto_hidden 为 False）才停它。
         if not self._auto_hidden:
             self._stop_fs_watch()
-        self._self_talk_timer.stop()
-        self._music_sing_timer.stop()
-        self._animation_gap_timer.stop()
-        self._squash_timer.stop()
-        self._squash_active = False
         if hasattr(self, 'proactive_watcher') and self.proactive_watcher is not None:
             self.proactive_watcher.pause()
         if hasattr(self, 'agent_link_manager') and self.agent_link_manager is not None:
@@ -1144,8 +1158,6 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         # 按住状态一并复位（含闸门释放），恢复显示后由 _switch →
         # _update_interaction_hold 重新同步。
         self._reset_press_hold_state()
-        self._cancel_move()
-        self._cancel_animation_gap()
         pp = getattr(self, 'predictive_prewarm', None)
         if pp is not None:
             pp.clear()
@@ -4192,15 +4204,18 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         QTimer.singleShot(0, self, self._sync_position_debounced)
 
     def _sync_position_debounced(self) -> None:
-        if not self._position_sync_pending:
-            return  # 拖拽开始/松手已立即同步，丢弃过期的去抖回调
+        if self._closing or not self._position_sync_pending:
+            return  # 已关闭或拖拽开始/松手已同步，丢弃过期的去抖回调
         self._position_sync_pending = False
         self._position_sync_now()
 
     def _position_sync_now(self) -> None:
         """立即同步气泡重定位与 position listeners（拖拽开始/松手关键帧）。"""
         self._position_sync_pending = False
-        self._speech_bubble.reposition(self.visible_content_rect())
+        bubble = getattr(self, "_speech_bubble", None)
+        if bubble is None:
+            return  # 窗口已关闭/气泡已销毁：丢弃迟到回调
+        bubble.reposition(self.visible_content_rect())
         for listener in tuple(self._position_listeners):
             try:
                 listener(self)
@@ -4256,9 +4271,10 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self._input_controller.stop()
             self._input_controller = None
         # 不在这里覆盖记忆位置：避免自动移动/抛掷后的随机终点被存下来。
-        self._self_talk_timer.stop()
-        self._cancel_animation_gap()
-        self._clear_drag_move()  # 生命周期兜底：停拖拽合帧 timer、丢 pending
+        # 关闭即停掉全部活动定时器（含待重试被拒动画、移动/挤压/物理/唱歌），
+        # 否则 win.close() 只隐藏不销毁窗口，残留单次 timeout 会在后续测试的
+        # processEvents 触发悬空指针（全量套件崩溃点漂移、exit 139 的来源之一）。
+        self._stop_all_timers()
         self._position_sync_pending = False  # 丢弃 moveEvent 同帧合并的在途去抖
         # 关闭即销毁：暂停预热并对称释放交互让路闸门，避免库侧计数泄漏。
         lib = getattr(self, 'lib', None)

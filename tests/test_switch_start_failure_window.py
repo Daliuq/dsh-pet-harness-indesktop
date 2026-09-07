@@ -186,6 +186,56 @@ def test_switch_rejected_start_no_previous_falls_back_to_idle(app, tmp_path):
     app.processEvents()
 
 
+def test_close_drops_pending_switch_retry(app, tmp_path):
+    """P1-1：窗口关闭（closeEvent）必须停掉被拒动画的待重试计时器。
+
+    回归背景：closeEvent 此前只停 self_talk 等计时器，漏掉 _switch_retry_timer。
+    被拒动画登记的 1500ms 单次定时器在窗口关闭后仍留在事件队列，后续测试的
+    processEvents 会触发悬空指针，全量套件偶发 exit 139 段错误（崩溃点漂移）。
+    """
+    lib = FakeLibrary(failing={"写代码"})
+    win = _make_win(tmp_path, lib)
+    win._switch("写代码")  # 被拒 → 待重试
+    assert win._pending_switch == "写代码"
+    assert win._switch_retry_timer.isActive()
+
+    win.close()
+
+    assert win._switch_retry_timer.isActive() is False, "关闭窗口必须停掉待重试计时器"
+    assert win._pending_switch is None, "关闭窗口必须清空待重试状态"
+    app.processEvents()
+
+
+def test_close_stops_all_activity_timers(app, tmp_path):
+    """P1-1（生命周期）：closeEvent 必须停掉全部活动定时器，而非只停 self_talk/retry。
+
+    回归背景：closeEvent 此前漏停 _move_timer/_squash_timer/_physics_timer/
+    _music_sing_timer。这些 QTimer(self) 子对象在 win.close()（只隐藏不销毁）
+    之后仍残留单次 timeout，后续测试的 processEvents 触发悬空指针
+    （崩溃点漂移、exit 139 的来源之一）。统一由 _stop_all_timers 收口。
+    """
+    lib = FakeLibrary()
+    win = _make_win(tmp_path, lib)
+    # 直接置为活跃以覆盖 closeEvent 的计时器收口面（不依赖真实鼠标/物理事件时序）
+    timers = (
+        "_move_timer", "_squash_timer", "_physics_timer", "_music_sing_timer",
+        "_self_talk_timer", "_animation_gap_timer", "_switch_retry_timer",
+        "_drag_move_timer",
+    )
+    for name in timers:
+        getattr(win, name).start(60_000)  # 长间隔：测试期间不会自然 timeout
+        assert getattr(win, name).isActive(), name
+    win._pending_switch = "写代码"
+    assert win._pending_switch == "写代码"
+
+    win.close()
+
+    for name in timers:
+        assert getattr(win, name).isActive() is False, f"关闭窗口必须停掉 {name}"
+    assert win._pending_switch is None, "关闭窗口必须清空待重试状态"
+    app.processEvents()
+
+
 def test_pause_activity_drops_pending_switch_retry(app, tmp_path):
     """P1-1：窗口隐藏（pause_activity）时停止待重试，避免隐藏期间反复重试。"""
     lib = FakeLibrary(failing={"写代码"})

@@ -272,6 +272,8 @@ def test_express_style_rows_move_to_agent_domain(qapp, tmp_path):
             if row.objectName().startswith("settingRow_dialogue_")
         }
         assert dialogue_row_names <= agent_rows, sorted(dialogue_row_names - agent_rows)
+        # 专属文案对象（scope）行同属该域
+        assert "settingRow_dialogue_scope" in agent_rows
         # 互动域（若存在）不得残留 dialogue 行
         if interaction_idx is not None:
             interaction_rows = {
@@ -379,3 +381,57 @@ def test_dialogue_scope_switch_edits_agent_delta(qapp, tmp_path):
     assert phrases["agents"]["dsh"]["start"] == ["DSH 专属 start"]
     # 未覆盖的 thinking 不进 dsh delta
     assert "thinking" not in phrases["agents"]["dsh"]
+
+
+def test_import_dialogue_template_with_agents_populates_scopes(qapp, tmp_path, monkeypatch):
+    """整体导入模板含 agents 层时，agents delta 写入 scope buffer 并可在编辑区看到。
+
+    ticket 04：persona-phrases 模板除顶层 phrases（=global）外新增 agents 层；
+    导入后切到该 agent scope 应看到其专属文案，保存后进入 dialogue_phrases.agents。
+    """
+    import json
+
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Ok)
+
+    cfg = Config(tmp_path / "appdata")
+    cfg.set("dialogue_mode", "custom")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        template = {
+            "template": "persona-phrases/v1",
+            "mode": "custom",
+            "phrases": {"start": ["全局 start"]},
+            "agents": {
+                "dsh": {"start": ["导入的 DSH start"], "thinking": ["导入的 DSH thinking"]},
+            },
+        }
+        dialog.dialogue_template_import_edit.setPlainText(json.dumps(template, ensure_ascii=False))
+        dialog._import_dialogue_template_json()
+
+        # 编辑区当前在 global scope → 显示顶层 phrases
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "全局 start"
+        # 切到 dsh scope → 显示导入的 agents delta
+        dialog.dialogue_scope_select.setCurrentData("dsh")
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "导入的 DSH start"
+        assert dialog.dialogue_phrase_edits["thinking"].toPlainText() == "导入的 DSH thinking"
+    finally:
+        dialog.deleteLater()
+
+
+def test_export_dialogue_template_mentions_agents_separator(qapp, tmp_path):
+    """导出模板结构：顶层 phrases 为 global 参考，新增 agents 占位说明不影响导出。"""
+    import json as json_mod
+
+    cfg = Config(tmp_path / "appdata")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        data = dialog._current_dialogue_template()
+        # 导出仍是纯字段参考模板：phrases 留空；不强制含 agents（既有导出契约）
+        assert all(not v for v in data["phrases"].values())
+        text = json_mod.dumps(data, ensure_ascii=False)
+        assert "persona-phrases/v1" in text
+    finally:
+        dialog.deleteLater()

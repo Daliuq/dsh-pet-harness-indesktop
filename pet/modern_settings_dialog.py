@@ -1063,6 +1063,17 @@ class ModernSettingsDialog(QDialog):
                     if text:
                         edit.setPlainText(text)
         self.dialogue_mode_select.setCurrentData("custom")
+        # agents delta（整体导入）：写入 scope buffer，供切换专属层编辑
+        self._dialogue_flush_scope()
+        raw_agents = document.get("agents")
+        if isinstance(raw_agents, dict):
+            for agent_key, agent_events in raw_agents.items():
+                if not isinstance(agent_events, dict):
+                    continue
+                self._dialogue_scope_buffer[str(agent_key)] = {
+                    str(k): ("\n".join(str(i) for i in v) if isinstance(v, list) else str(v or ""))
+                    for k, v in agent_events.items()
+                }
         self.dialogue_template_import_edit.clear()
         QMessageBox.information(self, "导入成功", "已导入全部弹窗内容模板；点击“保存并退出”后生效。")
 

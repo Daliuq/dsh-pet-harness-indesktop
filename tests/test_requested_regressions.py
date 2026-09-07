@@ -475,15 +475,21 @@ def test_ojingjing_entry_hover_survives_widget_children(monkeypatch):
     from pet.context_menus.fun_entry import OjingjingMenuEntry
 
     app = QApplication.instance() or QApplication([])
-    # offscreen QPA 的 QCursor.setPos 不生效（光标位置由平台管理），
-    # 固定模拟光标悬在菜单项内部，验证不依赖 enter 事件的合成高亮。
-    monkeypatch.setattr(fun_entry.QCursor, "pos", staticmethod(lambda: QPoint(20, 20)))
     menu = QMenu()
     entry = OjingjingMenuEntry(menu, {"title": "厉害了我的鲸", "hint": "请点击"})
+    # offscreen QPA 的 QCursor.setPos 不生效（光标位置由平台管理）。
+    # 模拟光标悬在项内时用项自身的全局坐标（mapToGlobal），而不是绝对屏幕点：
+    # 菜单实际弹出位置受任务栏/DPI/多屏约束可能不在 (0, 0)，绝对点一旦落在
+    # 项外，showEvent 合成 _hovered=False 反而是正确行为，测试就变成环境耦合。
+    # 几何相对点保证任何 QPA/窗口管理器下合成高亮都能命中项内，验证的是
+    # “不依赖 enter 事件”本身，而非菜单弹出的绝对位置。
+    monkeypatch.setattr(
+        fun_entry.QCursor,
+        "pos",
+        staticmethod(lambda: entry.mapToGlobal(QPoint(10, 10))),
+    )
     # 用 popup(0, 0) 而不是 show()：Windows QPA 上 QMenu.show() 跟随真实系统
-    # 光标落点（Qt C++ 内部调用不受 Python 层 QCursor.pos mock 影响），
-    # 会把菜单弹到模拟点 (20, 20) 之外，导致合成高亮无法命中；锚定弹窗位置
-    # 后，showEvent 按模拟光标合成高亮的坐标耦合在任何 QPA 上都确定。
+    # 光标落点（Qt C++ 内部调用不受 Python 层 QCursor.pos mock 影响）。
     menu.popup(QPoint(0, 0))
     app.processEvents()
     try:

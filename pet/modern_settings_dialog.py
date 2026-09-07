@@ -1447,7 +1447,7 @@ class ModernSettingsDialog(QDialog):
             "菜单": menu,
             "桌面组件": desktop_components,
             "AI 与对话": ai_sections,
-            "Agent 联动": automation,
+            "自动化与联动": automation,
         }
         for label, icon in SETTINGS_DOMAIN_NAV:
             content = domain_content.get(label)

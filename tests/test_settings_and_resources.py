@@ -248,7 +248,7 @@ def _nav_item_indexes(dialog) -> dict[str, int]:
 
 
 def test_express_style_rows_move_to_agent_domain(qapp, tmp_path):
-    """表达风格（dialogue_* rows）应从「互动」域迁入「Agent 联动」域，互动域无残留。
+    """表达风格（dialogue_* rows）应从「互动」域迁入「自动化与联动」域的文案风格组。
 
     ticket 01：现代设置重排后 dialogue 模式/模板卡片/逐事件编辑所属页面。
     """
@@ -256,8 +256,8 @@ def test_express_style_rows_move_to_agent_domain(qapp, tmp_path):
     dialog = ModernSettingsDialog(cfg, include_ai=False)
     try:
         nav = _nav_item_indexes(dialog)
-        assert "Agent 联动" in nav, f"缺少 Agent 联动导航页，现有: {sorted(nav)}"
-        agent_page = dialog.pages.widget(nav["Agent 联动"])
+        assert "自动化与联动" in nav, f"缺少自动化与联动导航页，现有: {sorted(nav)}"
+        agent_page = dialog.pages.widget(nav["自动化与联动"])
         interaction_idx = nav.get("互动")
         dialogue_row_names = {
             row.objectName()
@@ -265,7 +265,7 @@ def test_express_style_rows_move_to_agent_domain(qapp, tmp_path):
             if row.objectName().startswith("settingRow_dialogue_")
         }
         assert dialogue_row_names, "未找到任何 dialogue_* 设置行"
-        # 全部 dialogue 行都应出现在 Agent 联动页内
+        # 全部 dialogue 行都应出现在 automation 域页内
         agent_rows = {
             row.objectName()
             for row in agent_page.findChildren(SettingRow)
@@ -286,24 +286,24 @@ def test_express_style_rows_move_to_agent_domain(qapp, tmp_path):
         dialog.deleteLater()
 
 
-def test_automation_domain_renamed_to_agent_link(qapp, tmp_path):
-    """automation 域顶层导航由「自动化与联动」改名为「Agent 联动」；域内非 Agent 组保留。
+def test_automation_domain_name_stays_stable(qapp, tmp_path):
+    """automation 域顶层导航保持「自动化与联动」；域内非 Agent 组保留。
 
-    ticket 03：改名只影响导航标题与深链文案，不搬动/删除域内功能组。
+    ticket 03（撤销改名）：旧设置回归测试锁定侧边栏文案，域名不改为
+    「Agent 联动」——迁移只作用于域内组名（Agent 联动文案风格）。
     """
     from pet.settings_widgets import SETTINGS_DOMAIN_NAV
 
     labels = [label for label, _ in SETTINGS_DOMAIN_NAV]
-    assert "Agent 联动" in labels
-    assert "自动化与联动" not in labels
+    assert "自动化与联动" in labels
+    assert "Agent 联动" not in labels
 
     cfg = Config(tmp_path / "appdata")
     dialog = ModernSettingsDialog(cfg, include_ai=False)
     try:
         nav = _nav_item_indexes(dialog)
-        assert "Agent 联动" in nav
-        assert "自动化与联动" not in nav
-        agent_page = dialog.pages.widget(nav["Agent 联动"])
+        assert "自动化与联动" in nav
+        agent_page = dialog.pages.widget(nav["自动化与联动"])
         # 非 Agent 组（待办提醒/主动感知/循环检测）仍保留：抽查关键 setting 行存在
         for row_id in ("todo_reminder_enabled",):
             assert agent_page.findChild(SettingRow, f"settingRow_{row_id}") is not None

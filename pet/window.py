@@ -404,7 +404,6 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self.on_look_screen = None
         self.on_open_legacy_settings = None
         self.on_open_modern_settings = None
-        self.on_open_watchdog_settings = None
         self.on_restore_fun_windows = None
         self.on_spawn_pet = None
         self.on_clear_spawned_pets = None
@@ -3836,19 +3835,8 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self.cfg.save()
         # 卡住检测/行为模式检测开关是 AgentLinkManager.apply_config 在启动/切换时
         # 同步的，需要立即触发，否则要等下次设置变更/重启才生效。
-        if key in ('stuck_detect', 'pattern_detect', 'exploration_watchdog_enabled') and hasattr(self, 'agent_link_manager'):
+        if key in ('stuck_detect', 'pattern_detect') and hasattr(self, 'agent_link_manager'):
             self.agent_link_manager.apply_config()
-
-    def set_agent_link_mode(self, mode: str) -> None:
-        """切换循环检测手动/自动模式。"""
-        mode = mode if mode in ('manual', 'auto') else 'manual'
-        ag_data = dict(self.cfg.get('agent_link', {}))
-        ag_data['exploration_watchdog_mode'] = mode
-        self.cfg.set('agent_link', ag_data)
-        self.cfg.save()
-        if hasattr(self, 'agent_link_manager'):
-            self.agent_link_manager.apply_config()
-        self.show_bubble(f'循环检测已切换为{"自动" if mode == "auto" else "手动"}模式', duration_ms=3000)
 
     def _set_dialogue_mode(self, mode: str) -> None:
         """Switch wording for existing desktop-pet events; legacy remains default."""
@@ -3869,8 +3857,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             ("approval.generic", "审批提示"),
             ("question.empty", "无选项问题"), ("question.one", "用户问题"),
             ("question.many", "多个问题"),
-            ("watchdog.warning", "循环警告"), ("watchdog.intervention", "循环干预"),
-            ("watchdog.unknown", "Judge 不可用"), ("rate_limit.one", "限流"),
+            ("watchdog.warning", "循环警告"), ("rate_limit.one", "限流"),
             ("rate_limit.many", "连续限流"),
             ("done.success", "任务完成"), ("done.attention", "任务暂停"),
             ("failure.retry", "重试失败"), ("failure.tool", "工具失败"),

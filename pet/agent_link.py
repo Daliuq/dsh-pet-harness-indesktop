@@ -1485,7 +1485,6 @@ class AgentLinkManager(QObject):
     install_finished = Signal(str, bool, str, int)  # (agent_key, ok, message, install_token)
     # DSH 回写结果（后台线程 emit，队列投递回主线程）：(ok, detail)
     _respond_result = Signal(bool, str)
-    _exploration_control_result = Signal(str, str, bool, str)  # session, operation, ok, detail
 
     # 联动气泡展示名
     AGENT_NAMES = {"dsh": "DSH", "claude": "Claude Code", "cursor": "Cursor", "opencode": "OpenCode"}
@@ -1600,7 +1599,6 @@ class AgentLinkManager(QObject):
         # Agent Exploration Loop Watchdog：按 session/step 聚合全部探索行为。
         from .exploration_watchdog import ExplorationWatchdog
         self._exploration_watchdog = ExplorationWatchdog(self)
-        self._exploration_watchdog.set_judge(self._run_exploration_judge)
         self.monitors["dsh"].raw_record.connect(self._exploration_watchdog.feed_record)
         self.monitors["dsh"].raw_record.connect(self._on_exploration_lifecycle)
         # 阻塞交互兜底清理：会话/turn 结束或 agent 停止时，任何 pending 的
@@ -1608,15 +1606,11 @@ class AgentLinkManager(QObject):
         # 防止真实异常也留下永久弹窗。
         self.monitors["dsh"].raw_record.connect(self._on_interaction_lifecycle)
         self._exploration_watchdog.warning.connect(self._on_exploration_warning)
-        self._exploration_watchdog.judge_required.connect(self._on_exploration_judge_required)
-        self._exploration_watchdog.judge_result.connect(self._on_exploration_judge_result)
         # 会话元数据缓存：sessionId → { label, projectName, agentName }
         self._session_meta_cache: dict[str, dict] = {}
         self._exploration_alerts: dict[str, str] = {}
         self._exploration_names: dict[str, str] = {}
-        self._exploration_active_generation: dict[str, str] = {}
         self._exploration_lifecycle_epoch: dict[str, int] = {}
-        self._exploration_control_result.connect(self._on_exploration_control_result)
 
         for mon in self.monitors.values():
             mon.raw_record.connect(self._remember_dialogue_record)
@@ -3051,14 +3045,9 @@ class AgentLinkManager(QObject):
         elif hasattr(self.win, "show_bubble"):
             self.win.show_bubble(text, duration_ms=self._EXPLORATION_REMINDER_MS)
 
-    def _on_exploration_judge_required(self, session_key: str, payload: dict) -> None:
-        """风险达到 control：交给后台 Judge；无 Judge 时由 watchdog 安全降级。"""
-        self._exploration_active_generation[session_key] = str(payload.get("generation_id") or "")
-        payload["lifecycle_epoch"] = self._exploration_lifecycle_epoch.get(session_key, 0)
-        self._exploration_watchdog.judge_payload(session_key, payload)
 
     def _on_exploration_lifecycle(self, agent_key: str, record: dict) -> None:
-        """Invalidate watchdog UI/Judge work when the real session ends."""
+        """Invalidate watchdog UI work when the real session ends."""
         if not isinstance(record, dict):
             return
         session = str(record.get("sessionId") or record.get("session_id") or agent_key)
@@ -3071,10 +3060,8 @@ class AgentLinkManager(QObject):
             # agent. In that case invalidate every session owned by this agent.
             if event == "AgentStatus" and session == agent_key:
                 sessions.update(self._exploration_alerts)
-                sessions.update(self._exploration_active_generation)
             for key in sessions:
                 self._exploration_lifecycle_epoch[key] = self._exploration_lifecycle_epoch.get(key, 0) + 1
-                self._exploration_active_generation.pop(key, None)
                 self._dismiss_exploration(key)
 
     # 阻塞交互兜底清理（approval / question / cordis 共用）。
@@ -3104,107 +3091,7 @@ class AgentLinkManager(QObject):
                     and (not session or not v.get("session_id") or v.get("session_id") == session)]:
             self._resolve_interaction(iid)
 
-    def _exploration_provider_config(self):
-        from dataclasses import replace
-        from .chat.models import ChatSettings
-        chat = ChatSettings.from_dict(self.cfg.get("chat", {}))
-        agent_cfg = self.cfg.get("agent_link", {})
-        provider_id = str(agent_cfg.get("exploration_watchdog_judge_provider", "") or "")
-        provider_cfg = chat.providers.get(provider_id) if provider_id else None
-        provider_cfg = provider_cfg or chat.active_config
-        override = str(agent_cfg.get("exploration_watchdog_judge_model", "") or "")
-        if override:
-            provider_cfg = replace(provider_cfg, model=override)
-        try:
-            provider_cfg.api_key = self.cfg.resolve_api_key(provider_cfg)
-        except Exception:
-            pass
-        return replace(provider_cfg, temperature=0.0, max_tokens=700,
-                       timeout=float(agent_cfg.get("exploration_watchdog_judge_timeout", 8)))
-
-    def _run_exploration_judge(self, prompt: str) -> str:
-        """使用当前聊天 Provider 执行短 Judge 请求；调用方已在后台线程。"""
-        from .chat.providers import OpenAICompatibleProvider
-        import threading as _threading
-        cfg = self._exploration_provider_config()
-        log.info("watchdog judge provider=%s model=%s timeout=%s", getattr(cfg, "provider", ""), getattr(cfg, "model", ""), getattr(cfg, "timeout", ""))
-        chunks = OpenAICompatibleProvider().stream(
-            [{"role": "system", "content": "你是严格输出 JSON 的 Agent 循环检测 Judge。"},
-             {"role": "user", "content": prompt}],
-            cfg, _threading.Event(),
-        )
-        return "".join(chunks)
-
-    def _run_exploration_replan(self, prompt: str) -> str:
-        """One separate planning call, using the configured Judge API."""
-        from .chat.providers import OpenAICompatibleProvider
-        import threading as _threading
-        chunks = OpenAICompatibleProvider().stream(
-            [{"role": "system", "content": "你是 Agent 重新规划助手，只输出可直接执行的中文规划指令。"},
-             {"role": "user", "content": prompt}],
-            self._exploration_provider_config(), _threading.Event(),
-        )
-        return "".join(chunks).strip()
-
-    def _on_exploration_judge_result(self, session_key: str, payload: dict) -> None:
-        if not hasattr(self.win, "isVisible") or not self.win.isVisible():
-            return
-        payload = payload if isinstance(payload, dict) else {}
-        generation = str(payload.get("generation_id") or "")
-        if generation and self._exploration_active_generation.get(session_key) != generation:
-            return
-        if payload.get("lifecycle_epoch") != self._exploration_lifecycle_epoch.get(session_key, 0):
-            return
-        name = self._exploration_name(payload, session_key)
-        judge = payload.get("judge") or {}
-        verdict = str(judge.get("verdict", "UNKNOWN"))
-        if verdict == "NORMAL":
-            return
-        if verdict == "UNKNOWN":
-            if hasattr(self.win, "show_alert"):
-                self._show_alert_compat(
-                    self._dialogue("watchdog.unknown", f"{name} 检测到重复探索，判断服务暂时不可用，本次仅作提醒。", name=name),
-                    duration_ms=self._EXPLORATION_REMINDER_MS, sticky=False,
-                    alert_id=f"exploration-unknown:{session_key}", priority=2,
-                    alert_type="watchdog-judge-fallback",
-                )
-            return
-        reasons = self._format_exploration_reasons(payload.get("reasons", []), payload.get("steps", []))
-        raw_reason = str(judge.get("reason") or "")[:240]
-        reason = "Judge 暂未返回有效判断，采用保守建议" if "无效 JSON" in raw_reason else (raw_reason or "建议检查当前假设")
-        text = self._dialogue(
-            "watchdog.intervention", f"{name} 可能陷入重复排查\n重复表现：{reasons}\n判断原因：{reason}",
-            name=name, reasons=reasons,
-        )
-        alert_id = f"exploration:{session_key}"
-        self._exploration_alerts[session_key] = alert_id
-        buttons = [
-            ("不管", lambda s=session_key: self._continue_exploration(s)),
-            ("终止", lambda s=session_key: self._stop_exploration(s)),
-        ]
-        show_interactive = self._exploration_watchdog.mode != "auto" or verdict in ("ASK_USER", "STOP")
-        if show_interactive:
-            if hasattr(self.win, "show_alert"):
-                self._show_alert_compat(text, subtitle="请确认是否终止当前执行",
-                                    buttons=buttons, sticky=True, alert_id=alert_id,
-                                    priority=1, alert_type="watchdog-intervention",
-                                    metadata={"sessionId": session_key, "riskScore": payload.get("risk", 0),
-                                              "riskReasons": payload.get("reasons", []),
-                                              "targetCount": payload.get("targetCount", 0),
-                                              "targets": payload.get("targets", [])})
-            elif hasattr(self.win, "show_bubble"):
-                self.win.show_bubble(text, sticky=True, buttons=buttons)
-
-        if self._exploration_watchdog.mode == "auto":
-            if verdict == "REPLAN":
-                self._replan_exploration(session_key, payload)
-            elif verdict == "ASK_USER":
-                self._stop_exploration(session_key, notify=False)
-            elif verdict == "STOP":
-                self._stop_exploration(session_key, notify=True)
-
     def _dismiss_exploration(self, session_key: str) -> None:
-        self._exploration_active_generation.pop(session_key, None)
         alert_id = self._exploration_alerts.pop(session_key, "")
         if alert_id and hasattr(self.win, "resolve_alert"):
             self.win.resolve_alert(alert_id)
@@ -3552,11 +3439,6 @@ class AgentLinkManager(QObject):
         self._exploration_names[session_key] = name
         return name
 
-    def _continue_exploration(self, session_key: str) -> None:
-        """User explicitly allows the current exploration to continue."""
-        self._exploration_watchdog.grant_grace(session_key)
-        self._dismiss_exploration(session_key)
-
     @staticmethod
     def _format_exploration_reasons(reasons, steps=None) -> str:
         labels = {
@@ -3598,92 +3480,6 @@ class AgentLinkManager(QObject):
         elif evidence and "new" in evidence:
             values.append("近期至少获得过新的结果证据")
         return "；".join(dict.fromkeys(values[:3])) or "探索目标和调用方式重复"
-
-    def _exploration_control(self, operation: str, session_key: str, text: str = "",
-                             *, goal: str = "", context: str = "", provider: str = "",
-                             model: str = "") -> None:
-        def worker():
-            try:
-                from . import dsh_control
-                ok, detail = dsh_control.request(
-                    operation, session_key, text, self._dsh_candidate_ports(),
-                    goal=goal, context=context, provider=provider, model=model,
-                    timeout=float(self.cfg.get("agent_link", {}).get("exploration_watchdog_judge_timeout", 8)) + 12,
-                    alert_id=f"exploration:{session_key}",
-                )
-            except Exception:
-                log.exception("DSH exploration control failed")
-                ok, detail = False, "control-error"
-            try:
-                self._exploration_control_result.emit(session_key, operation, bool(ok), str(detail))
-            except Exception:
-                pass
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_exploration_control_result(self, session_key: str, operation: str,
-                                       ok: bool, detail: str) -> None:
-        """只在 DSH 确认控制请求到达后收起提醒；失败则保留按钮。"""
-        if ok:
-            if operation == "replan":
-                self._exploration_watchdog.grant_grace(session_key)
-            self._dismiss_exploration(session_key)
-            if hasattr(self.win, "show_bubble"):
-                name = self._exploration_names.get(session_key, "DSH")
-                message = (self._dialogue("control.interrupt.success", "终止请求已回传给 DSH。", name=name)
-                           if operation == "interrupt" else
-                           self._dialogue("control.replan.success", "重新规划提示已发送给 DSH。", name=name))
-                self.win.show_bubble(message, duration_ms=4000)
-            return
-        log.warning("DSH exploration control rejected/unavailable: %s", detail)
-        if hasattr(self.win, "show_alert") and self.win.isVisible():
-            alert_id = self._exploration_alerts.get(session_key, f"exploration:{session_key}")
-            retry_buttons = ([
-                ("重试终止", lambda s=session_key: self._stop_exploration(s)),
-            ] if operation == "interrupt" else None)
-            name = self._exploration_names.get(session_key, "DSH")
-            self.win.show_alert(
-                self._dialogue("control.failed", "控制请求暂未送达 DSH，当前按钮仍可继续操作。", name=name),
-                subtitle="请检查 DSH 是否正在运行",
-                buttons=retry_buttons, sticky=bool(retry_buttons), duration_ms=0 if retry_buttons else 5000,
-                alert_id=f"{alert_id}:error",
-            )
-
-    def _replan_exploration(self, session_key: str, payload: dict) -> None:
-        # 将当前检测批次原样交给 bridge。bridge 先暂停真实 Agent，再用
-        # 指定模型做一次无工具诊断，并把生成的计划直接 steer 回 Agent。
-        # 按钮点击后立即收起永久弹窗；等待 bridge/模型返回期间只显示短提示，
-        # 避免用户误以为按钮没有生效。
-        self._dismiss_exploration(session_key)
-        if hasattr(self.win, "show_bubble") and self.win.isVisible():
-            name = self._exploration_names.get(session_key, "DSH")
-            self.win.show_bubble(self._dialogue("control.replan.pending", f"正在暂停 {name}，生成下一步规划…", name=name), duration_ms=5000)
-        judge = payload.get("judge") or {}
-        context = json.dumps({
-            "judge": judge,
-            "risk": payload.get("risk"),
-            "reasons": payload.get("reasons", []),
-            "steps": payload.get("steps", []),
-        }, ensure_ascii=False)
-        try:
-            cfg = self._exploration_provider_config()
-            provider = str(getattr(cfg, "provider", "") or "")
-            model = str(getattr(cfg, "model", "") or "")
-        except Exception:
-            provider = model = ""
-        self._exploration_control(
-            "replan", session_key, "", goal=str(payload.get("goal", "")),
-            context=context, provider=provider, model=model,
-        )
-
-    def _stop_exploration(self, session_key: str, notify: bool = True) -> None:
-        # 终止是立即生效的 UI 操作；不要等待 bridge 回执才收起 sticky 弹窗。
-        self._dismiss_exploration(session_key)
-        if hasattr(self.win, "resolve_alert"):
-            self.win.resolve_alert(f"exploration:{session_key}:error")
-        self._exploration_control("interrupt", session_key)
-        if notify and hasattr(self.win, "show_bubble"):
-            name = self._exploration_names.get(session_key, "DSH")
-            self.win.show_bubble(self._dialogue("control.interrupt.pending", f"已请求终止 {name} 当前执行。", name=name), duration_ms=5000)
 
     # ------------------------------------------------------------------
     # 硬失败（execution/failed）：DSH 已决定本轮不再继续，直接提醒

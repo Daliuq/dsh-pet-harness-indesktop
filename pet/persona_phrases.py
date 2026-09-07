@@ -164,8 +164,6 @@ _PHRASES = {
     "question.one": ["主人，这里有个问题需要你决定：{body}", "我需要主人的选择，确认后就继续。问题是：{body}"],
     "question.many": ["主人，这里有 {count} 个问题需要决定。", "还有 {count} 个问题等主人确认。"],
     "watchdog.warning": ["好像在同一片海域绕圈圈了……主人先留意一下。"],
-    "watchdog.intervention": ["{name} 可能在重复排查。最近表现：{reasons}。要不要换一条路线？"],
-    "watchdog.unknown": ["判断服务暂时不可用，这次先提醒主人留意。"],
     "rate_limit.one": ["呜，通信有点拥挤，暂时被限流了，请稍后再试。"],
     "rate_limit.many": ["呜，通信有点拥挤，已经连续限流 {count} 次了，请稍后再试。"],
     "llm_error.api": ["AI 服务出错了，主人看看是怎么回事吧。", "AI 服务暂时没有回应，主人稍后再试一次吧。"],
@@ -179,8 +177,7 @@ _PHRASES = {
 # Stable schema keys reserved for newer event integrations.  Empty built-ins
 # remain compatible with the legacy JSON while making exports complete.
 for _key in (
-    "control.replan.pending", "control.replan.success", "control.interrupt.pending",
-    "control.interrupt.success", "control.failed", "stuck.reminder", "pattern.warning",
+    "stuck.reminder", "pattern.warning",
     "pattern.control", "balance.loading", "balance.result",
 ):
     _PHRASES.setdefault(_key, [])

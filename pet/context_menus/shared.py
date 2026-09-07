@@ -378,13 +378,6 @@ def add_agent_link_menu(menu: QMenu, pet) -> None:
     act.setCheckable(True)
     act.setChecked(bool(agent_cfg.get('exploration_watchdog_enabled', True)))
     act.toggled.connect(lambda on: pet.set_agent_link_option('exploration_watchdog_enabled', on))
-    mode = str(agent_cfg.get('exploration_watchdog_mode', 'manual')).lower()
-    manual = pattern.addAction('手动模式')
-    manual.setCheckable(True); manual.setChecked(mode != 'auto')
-    manual.triggered.connect(lambda: pet.set_agent_link_mode('manual'))
-    auto = pattern.addAction('自动模式')
-    auto.setCheckable(True); auto.setChecked(mode == 'auto')
-    auto.triggered.connect(lambda: pet.set_agent_link_mode('auto'))
     pattern.addSeparator()
     _add_pattern_config_rows(pattern, pet, agent_cfg)
 
@@ -431,18 +424,10 @@ def _add_pattern_config_rows(pattern: QMenu, pet, agent_cfg: dict) -> None:
 
     _int_row('exploration_watchdog_warning_threshold', 'Warning threshold', '分', 3, 1, 20)
     _int_row('exploration_watchdog_control_threshold', 'Control threshold', '分', 5, 1, 30)
-    _int_row('exploration_watchdog_judge_timeout', 'Judge timeout', '秒', 8, 1, 120)
     _int_row('exploration_watchdog_cooldown_steps', 'Cooldown steps', '步', 3, 1, 20)
     _int_row('exploration_watchdog_early_grace_minutes', '早期宽限', '分钟', 5, 1, 30)
     _int_row('exploration_watchdog_long_run_minutes', '长时间运行', '分钟', 10, 2, 240)
     _int_row('exploration_watchdog_long_think_seconds', '单次超长 Think', '秒', 120, 10, 1800)
-    model = pattern.addAction(f"Judge model：{agent_cfg.get('exploration_watchdog_judge_model') or '默认'}")
-    model.triggered.connect(lambda: pet.edit_agent_link_text('exploration_watchdog_judge_model', 'Judge model'))
-    provider = pattern.addAction(f"Judge API：{agent_cfg.get('exploration_watchdog_judge_provider') or '当前聊天 API'}")
-    provider.triggered.connect(lambda: pet.edit_agent_link_text('exploration_watchdog_judge_provider', 'Judge API provider ID'))
-    pattern.addSeparator()
-    open_watchdog = pattern.addAction("循环检测设置…")
-    open_watchdog.triggered.connect(lambda: getattr(pet, 'on_open_watchdog_settings', None) and pet.on_open_watchdog_settings())
 
 
 def build_size_menu(menu: QMenu, pet, *, icons: bool = True) -> QMenu:

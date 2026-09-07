@@ -15,7 +15,6 @@ import threading
 import time
 import uuid
 from collections import Counter, OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -43,12 +42,7 @@ class WatchdogMacro(str, Enum):
     OTHER = "OTHER"
 
 
-class JudgeVerdict(str, Enum):
-    UNKNOWN = "UNKNOWN"
-    NORMAL = "NORMAL"
-    REPLAN = "REPLAN"
-    ASK_USER = "ASK_USER"
-    STOP = "STOP"
+
 
 
 _EXPLORATION = frozenset({
@@ -197,62 +191,6 @@ def _think_key(record: dict, target: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()[:20] if text else ""
 
 
-def build_judge_prompt(goal: str, steps: list[dict], risk: dict) -> str:
-    compact = []
-    for step in steps[-10:]:
-        compact.append({
-            "step": step.get("step"),
-            "behaviors": step.get("behaviors", []),
-            "targets": step.get("targets", [])[:4],
-            "think": _text(step.get("think", ""), 160),
-            "evidence": _text(step.get("evidence", ""), 160),
-            "action": bool(step.get("action")),
-        })
-    return (
-        "判断 Agent 是否陷入低信息增益的重复探索循环。只输出 JSON，不要 Markdown。\n"
-        "verdict 必须是 NORMAL、REPLAN、ASK_USER、STOP 之一；同时返回 reason、next_action、confidence。\n"
-        f"用户目标：{_text(goal, 600)}\n"
-        f"近期步骤：{json.dumps(compact, ensure_ascii=False)}\n"
-        f"风险：{json.dumps(risk, ensure_ascii=False)}"
-    )
-
-
-def build_replan_prompt(goal: str, steps: list[dict], judge: dict | None = None) -> str:
-    """Build the one-shot context sent when the user presses Replan.
-
-    Unlike the detector Judge, this deliberately includes every compact event
-    captured in the recent steps, so the planning call can see the actual
-    tool arguments/results rather than only the risk summary.
-    """
-    return (
-        "你是 Agent 的重新规划助手。请基于下面完整的近期步骤，输出一段给 Agent 的可执行重新规划指令。\n"
-        "要求：总结当前目标、最强假设、支持/反对证据，并指定一个最小可证伪实验；在实验完成前不要继续重复 Search/Read。\n"
-        f"当前用户目标：{_text(goal, 800)}\n"
-        f"近期步骤完整上下文：{json.dumps(steps[-10:], ensure_ascii=False)[:10000]}\n"
-        f"检测原因：{json.dumps(judge or {}, ensure_ascii=False)[:1200]}"
-    )
-
-
-def parse_judge_result(value) -> dict:
-    if isinstance(value, dict):
-        data = value
-    else:
-        raw = _text(value, 3000)
-        try:
-            data = json.loads(raw)
-        except Exception:
-            return {"verdict": JudgeVerdict.UNKNOWN.value, "reason": "judge-invalid-response", "next_action": "", "confidence": 0.0}
-    verdict = str(data.get("verdict", "UNKNOWN")).upper()
-    if verdict not in {v.value for v in JudgeVerdict}:
-        verdict = JudgeVerdict.UNKNOWN.value
-    try:
-        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    return {"verdict": verdict, "reason": _text(data.get("reason"), 300),
-            "next_action": _text(data.get("next_action"), 300), "confidence": confidence}
-
-
 class _Step:
     def __init__(self, step):
         self.step = step
@@ -295,26 +233,19 @@ class _Step:
 
 class ExplorationWatchdog(QObject):
     warning = Signal(str, object)
-    judge_required = Signal(str, object)
-    judge_result = Signal(str, object)
     resolved = Signal(str)
 
-    def __init__(self, parent=None, *, judge=None, goal_provider=None, timeout=8.0, cooldown_steps=3):
+    def __init__(self, parent=None, *, goal_provider=None, cooldown_steps=3):
         super().__init__(parent)
         log.info("watchdog version=%s source=%s", WATCHDOG_VERSION, __file__)
         self.enabled = True
-        self.mode = "manual"
         self.warning_threshold = 3
         self.control_threshold = 5
-        self.timeout = float(timeout)
         self.cooldown_steps = int(cooldown_steps)
         self.early_grace_seconds = 5 * 60
         self.long_run_seconds = 10 * 60
         self.long_think_seconds = 120
-        self.judge = judge
-        self.goal_provider = goal_provider
         self._states = {}
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dsh-watchdog")
         self._lock = threading.RLock()
         self._think_timer = QTimer(self)
         self._think_timer.setInterval(1000)
@@ -323,22 +254,12 @@ class ExplorationWatchdog(QObject):
 
     def close(self):
         self._think_timer.stop()
-        self._executor.shutdown(wait=False, cancel_futures=True)
-
-    def set_judge(self, judge):
-        self.judge = judge
 
     def configure(self, config: dict):
         config = config if isinstance(config, dict) else {}
-        # 缺少新字段的旧配置按新功能默认值处理；旧 pattern_detect 不应把
-        # 新 Watchdog 默默关掉，避免升级后功能状态取决于历史实验开关。
         self.enabled = bool(config.get("exploration_watchdog_enabled", True))
-        self.mode = str(config.get("exploration_watchdog_mode", "manual")).lower()
-        if self.mode not in {"manual", "auto"}:
-            self.mode = "manual"
         self.warning_threshold = int(config.get("exploration_watchdog_warning_threshold", 3))
         self.control_threshold = int(config.get("exploration_watchdog_control_threshold", 5))
-        self.timeout = float(config.get("exploration_watchdog_judge_timeout", 8.0))
         self.cooldown_steps = int(config.get("exploration_watchdog_cooldown_steps", 3))
         self.early_grace_seconds = max(60, int(config.get("exploration_watchdog_early_grace_minutes", 5)) * 60)
         self.long_run_seconds = max(self.early_grace_seconds, int(config.get("exploration_watchdog_long_run_minutes", 10)) * 60)
@@ -477,7 +398,7 @@ class ExplorationWatchdog(QObject):
                 current_seq = state["seq"] + 1
                 pending.append((session, {
                     "type": "pet/exploration-watchdog",
-                    "level": "judge",
+                    "level": "warning",
                     "risk": 0,
                     "reasons": ["单次 Think 持续超过阈值"],
                     "steps": [s.payload() for s in self._window(state, 10)],
@@ -495,7 +416,7 @@ class ExplorationWatchdog(QObject):
                     "current_step": current_seq,
                 }))
         for session, payload in pending:
-            self.judge_required.emit(session, payload)
+            self.warning.emit(session, payload)
 
     def _window(self, state, n):
         items = list(state["steps"].values())
@@ -655,7 +576,7 @@ class ExplorationWatchdog(QObject):
         score, reasons = self._score(w6, w10)
         if score < warning_threshold:
             return None
-        level = "warning" if score < control_threshold else "judge"
+        level = "warning"
         state["last_inspected_seq"] = current_seq
         payload = {"type": "pet/exploration-watchdog", "level": level, "risk": score,
                    "generation_id": uuid.uuid4().hex,
@@ -672,33 +593,6 @@ class ExplorationWatchdog(QObject):
         return payload
 
     def _emit_decision(self, session, payload):
-        if payload["level"] == "warning":
-            self.warning.emit(session, payload)
-            return
-        self.judge_required.emit(session, payload)
+        self.warning.emit(session, payload)
 
-    def judge_payload(self, session: str, payload: dict):
-        """Run the injected judge off the Qt thread and emit its structured result."""
-        if self.judge is None:
-            payload["judge"] = {"verdict": JudgeVerdict.UNKNOWN.value, "reason": "judge-unavailable", "next_action": "", "confidence": 0.0, "goal": payload.get("goal", "")}
-            self.judge_result.emit(session, payload)
-            return
-        goal = self.goal_provider(session) if callable(self.goal_provider) else payload.get("goal", "")
-        payload.setdefault("goal", _text(goal, 600))
-        prompt = build_judge_prompt(goal, payload.get("steps", []), {"risk": payload.get("risk"), "reasons": payload.get("reasons", [])})
-        future = self._executor.submit(self.judge, prompt)
 
-        def done(f):
-            try:
-                raw = f.result(timeout=self.timeout)
-                log.info("watchdog judge response generation=%s session=%s raw=%s",
-                         payload.get("generation_id", ""), session, _text(raw, 300))
-                payload["judge"] = parse_judge_result(raw)
-            except Exception as exc:
-                log.warning("exploration watchdog judge failed generation=%s session=%s error=%s",
-                            payload.get("generation_id", ""), session, exc)
-                payload["judge"] = parse_judge_result("")
-            self.judge_result.emit(session, payload)
-        # callback 本身只会在 future 完成后运行；另起等待线程，才能让
-        # timeout 真正限制 Judge，不把 Qt/Watchdog 线程卡住。
-        threading.Thread(target=done, args=(future,), daemon=True).start()

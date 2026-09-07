@@ -310,11 +310,18 @@ def build_pet_controls(host) -> None:
     for label, value in (("原有模式", "legacy"), ("鲸鱼娘女仆模式", "whale_maid"), ("自定义台词", "custom")):
         host.dialogue_mode_select.addItem(label, value)
     host.dialogue_mode_select.setCurrentData(str(host.config.get("dialogue_mode", "legacy") or "legacy"))
+    # 统一预设：global 层是编辑区默认面（flat 旧结构 = global；双层取 global）
     configured_phrases = host.config.get("dialogue_phrases", {})
+    if isinstance(configured_phrases, dict) and ("global" in configured_phrases or "agents" in configured_phrases):
+        global_phrases = configured_phrases.get("global")
+        if not isinstance(global_phrases, dict):
+            global_phrases = {}
+    else:
+        global_phrases = configured_phrases if isinstance(configured_phrases, dict) else {}
     host.dialogue_phrase_edits: dict[str, QPlainTextEdit] = {}
     for key in phrase_keys():
         edit = QPlainTextEdit(host)
-        raw_value = configured_phrases.get(key, "")
+        raw_value = global_phrases.get(key, "")
         if isinstance(raw_value, list):
             edit.setPlainText("\n".join(str(item) for item in raw_value if isinstance(item, str)))
         else:

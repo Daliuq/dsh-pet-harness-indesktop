@@ -307,3 +307,37 @@ def test_automation_domain_renamed_to_agent_link(qapp, tmp_path):
             assert agent_page.findChild(SettingRow, f"settingRow_{row_id}") is not None
     finally:
         dialog.deleteLater()
+
+
+def test_dialogue_global_edits_read_and_preserve_unified_preset(qapp, tmp_path):
+    """global 逐事件编辑读取/写回统一预设：编辑 global.start 只改 global，agents delta 保留。
+
+    ticket 04 数据层：config.dialogue_phrases 为 {global, agents} 双层时，编辑区
+    读 global 层；_write_config 保存后 agents 不被破坏。
+    """
+    cfg = Config(tmp_path / "appdata")
+    cfg.set("dialogue_mode", "custom")
+    cfg.set("dialogue_phrases", {
+        "global": {"start": ["全局默认 start"], "thinking": ["全局默认 thinking"]},
+        "agents": {"dsh": {"thinking": ["DSH thinking"]}},
+    })
+    cfg.save()
+
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        # 编辑区初始展示 global 层内容
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "全局默认 start"
+        assert dialog.dialogue_phrase_edits["thinking"].toPlainText() == "全局默认 thinking"
+
+        # 修改 global.start；保存后 agents delta 不受影响
+        dialog.dialogue_phrase_edits["start"].setPlainText("新的全局 start")
+        ok = dialog._write_config()
+        assert ok is True
+    finally:
+        dialog.deleteLater()
+
+    reloaded = Config(tmp_path / "appdata")
+    phrases = reloaded.get("dialogue_phrases")
+    assert phrases["global"]["start"] == ["新的全局 start"]
+    assert phrases["global"]["thinking"] == ["全局默认 thinking"]
+    assert phrases["agents"]["dsh"]["thinking"] == ["DSH thinking"]

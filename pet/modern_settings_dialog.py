@@ -1630,9 +1630,18 @@ class ModernSettingsDialog(QDialog):
         self.config.set("self_talk_image_scale", self.self_talk_image_scale_spin.value())
         # Agent 联动：自定义 thinking 文案与音效（合并写回，不覆盖 agent_link 其他开关）
         self.config.set("dialogue_mode", str(self.dialogue_mode_select.currentData() or "legacy"))
-        self.config.set("dialogue_phrases", {
+        new_global = {
             key: lines for key, lines in self._dialogue_phrase_values().items() if lines
-        })
+        }
+        # 统一预设：编辑区 = global 层；若已是双层则保留 agents delta，仅替换 global
+        current_phrases = self.config.get("dialogue_phrases", {})
+        if isinstance(current_phrases, dict) and ("global" in current_phrases or "agents" in current_phrases):
+            self.config.set("dialogue_phrases", {
+                "global": new_global,
+                "agents": current_phrases.get("agents", {}) if isinstance(current_phrases.get("agents"), dict) else {},
+            })
+        else:
+            self.config.set("dialogue_phrases", new_global)
         # Agent 联动：自定义 thinking 文案（合并写回，不覆盖 agent_link 其他开关）
         agent_cfg = dict(self.config.get("agent_link", {}))
         agent_cfg["thinking_texts"] = {

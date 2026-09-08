@@ -45,7 +45,8 @@ RELOAD_WHITELIST_SNAPSHOT = frozenset({
     "menu_easter_egg", "media_prewarm", "first_frame_cache_max_mb", "predict_prewarm_lead_ms", "ffmpeg_recycle_minutes",
     "modern_chat_background", "modern_chat_background_fill",
     "cursor_hidden_passthrough", "drag_physics",
-    "dynamic_island", "facing",
+    "dynamic_island", "edge_probe_enabled", "facing",
+    "golden_spin_on_click", "golden_spin_direct",
     "idle_low_fps_enabled", "idle_low_fps_threshold", "lock_position",
     "animation_prewarm_enabled",
     "dialogue_mode", "dialogue_phrases",
@@ -66,7 +67,7 @@ RELOAD_WHITELIST_SNAPSHOT = frozenset({
 # 默认值 dict 里不走普通白名单、由 reload() 专门路径处理的键（现状文档化）。
 SPECIAL_CASED_KEYS = frozenset({"version", "proactive_screen", "agent_link", "chat"})
 
-# 默认值 dict 键集合现状快照（79 键）= 白名单 ∪ 特例键。
+# 默认值 dict 键集合现状快照（80 键）= 白名单 ∪ 特例键。
 DEFAULTS_SNAPSHOT = RELOAD_WHITELIST_SNAPSHOT | SPECIAL_CASED_KEYS
 
 

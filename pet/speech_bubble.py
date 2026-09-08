@@ -28,7 +28,15 @@ from PySide6.QtGui import (
     QColor, QFontMetrics, QGuiApplication, QPainter, QPainterPath, QPen,
     QPixmap, QTransform,
 )
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QFrame,
+    QLabel,
+    QLayout,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 # 批6-2 拆分后纯函数区 re-export（维持既有 import 兼容；外部调用点本批不改）
 from .speech_bubble_text import (

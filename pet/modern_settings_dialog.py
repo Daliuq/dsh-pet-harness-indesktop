@@ -275,6 +275,10 @@ class ModernSettingsDialog(QDialog):
         autostart_desc = "登录系统后自动启动桌宠。" if not self.config.instance_id else "登录系统后自动启动桌宠。（仅主桌宠可设置）"
         launch_rows = [
             SettingRow("autostart", "开机自启", autostart_desc, self.autostart_check),
+            SettingRow("harness_autostart", "随桌宠启动 dsh 服务",
+                       "桌宠启动后自动在后台静默拉起 dsh web 服务（只起服务，不开浏览器、不弹窗口；"
+                       "需要使用时点「启动 DeepSeek Harness」秒开页面）。仅主桌宠生效。",
+                       self.harness_autostart_check),
         ]
         if sys.platform == "darwin":
             launch_rows.append(SettingRow(
@@ -1341,7 +1345,7 @@ class ModernSettingsDialog(QDialog):
             return content
 
         general = page_content([
-            ("应用启动", claim("autostart")),
+            ("应用启动", claim("autostart", "harness_autostart")),
             ("窗口与系统", claim("dock_icon", "on_top", "auto_hide_fullscreen", "cursor_hidden_passthrough", "stream_capture")),
             ("多开", claim("single_process_spawn")),
         ])
@@ -1792,6 +1796,7 @@ class ModernSettingsDialog(QDialog):
             })
             self.config.set("proactive_screen", pro_data)
         self.config.set("autostart_wanted", self.autostart_check.isChecked())
+        self.config.set("harness_autostart", self.harness_autostart_check.isChecked())
         ok = self.config.save()
         if not ok:
             QMessageBox.warning(

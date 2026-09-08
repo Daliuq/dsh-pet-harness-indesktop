@@ -152,6 +152,12 @@ def build_pet_controls(host) -> None:
     if host.config.instance_id:
         host.autostart_check.setEnabled(False)
         host.autostart_check.setToolTip("仅主桌宠可设置")
+    host.harness_autostart_check = ToggleSwitch(host)
+    host._harness_autostart_initial = bool(host.config.get("harness_autostart", False))
+    host.harness_autostart_check.setChecked(host._harness_autostart_initial)
+    if host.config.instance_id:
+        host.harness_autostart_check.setEnabled(False)
+        host.harness_autostart_check.setToolTip("仅主桌宠可设置")
     host.dock_icon_check = None
     if sys.platform == "darwin":
         host.dock_icon_check = ToggleSwitch(host)

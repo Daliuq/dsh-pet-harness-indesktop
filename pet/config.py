@@ -597,12 +597,10 @@ class Config:
             "quick_launch_apps": [dict(item) for item in DEFAULT_QUICK_LAUNCH_APPS],
             "auto_hide_fullscreen": True,  # 全屏应用自动隐藏（Windows）
             "click_sound_enabled": True,   # 点击 Q 弹音效
-            "click_sound_path": "",        # 自定义点击音效文件绝对路径（空=内置默认）
             "click_sound_pack": _default_click_sound_pack(),
             "click_sound_volume": 0.70,
             "slingshot_enabled": True,     # 弹弓弹射
             "throw_strength": "standard",  # gentle / standard / strong / crazy
-            "throw_max_speed": 4800.0,     # 由 throw_strength 导出
             "idle_low_fps_enabled": False,  # 闲置降帧（灰度默认关）：长时间无交互时动画隔帧呈现
             "idle_low_fps_threshold": 30.0,  # 闲置阈值（秒）：超过该时长无交互且窗口可见才降帧
             "animation_prewarm_enabled": True,  # 动画素材后台预热开关
@@ -618,6 +616,7 @@ class Config:
             "golden_spin_direct": False,   # 点击触发黄金回旋时跳过点击动画，直接回旋并逐圈加速
             "edge_probe_enabled": False,   # 拖到屏幕左右边缘后自动进入探头姿态
             "autostart_wanted": False,     # 用户曾开启过开机自启（用于启动自检：被安全软件清理时提醒）
+            "harness_autostart": False,    # 随桌宠启动自动拉起 dsh web 服务（只起服务，不开浏览器）
             "stream_capture_mode": False,  # 直播捕获兼容模式（Windows：Tool 窗口直播姬/OBS 枚举不到）
             "chat_background": "",  # 肥鱼牌小手机背景：空=纯色；builtin:* = 内置主题；否则为图片路径
             "modern_chat_background": "",  # 肥鱼版 DeepSeek 背景：空=纯色；否则为自定义图片路径
@@ -708,6 +707,7 @@ class Config:
         seed["ry"] = None
         seed["screen_name"] = None
         seed["autostart_wanted"] = False
+        seed["harness_autostart"] = False
         # 生小肥鱼大小策略：开启继承 → 保留主配置 scale；
         # 关闭继承 → 用主配置里给“小肥鱼”单独选择的 spawn_scale。
         inherit_size = _bool_or_default(seed.get("spawn_inherit_size"), True)
@@ -830,12 +830,12 @@ class Config:
             "lock_position", "shift_drag", "pet_opacity",
             "context_menu_appearance", "quick_launch_apps",
             "menu_easter_egg", "auto_hide_fullscreen",
-            "click_sound_enabled", "click_sound_path",
+            "click_sound_enabled",
             "click_sound_pack", "click_sound_volume",
-            "slingshot_enabled", "throw_strength", "throw_max_speed",
+            "slingshot_enabled", "throw_strength",
             "idle_low_fps_enabled", "idle_low_fps_threshold",
             "click_show_balance", "click_show_self_talk",
-            "balance_refresh_minutes", "autostart_wanted", "stream_capture_mode",
+            "balance_refresh_minutes", "autostart_wanted", "harness_autostart", "stream_capture_mode",
             "music_sing_enabled", "golden_spin_on_click", "golden_spin_direct", "edge_probe_enabled",
             "balance_tier_labels_mode", "balance_tier_label_peak",
             "balance_tier_label_idle", "balance_tier_color_enabled",
@@ -1078,7 +1078,6 @@ class Config:
         self.data["slingshot_enabled"] = bool(self.data.get("slingshot_enabled", True))
         strength = physics_mod.normalize_throw_strength(str(self.data.get("throw_strength") or "standard"))
         self.data["throw_strength"] = strength
-        self.data["throw_max_speed"] = physics_mod.throw_speed_cap(strength)
         # 闲置降帧（性能调研 §4.3）：开关默认关（灰度）；阈值夹到 [1, 3600] 秒
         # 终审 P1-3：必须用 _bool_or_default——bool("false") is True，字符串
         # 布尔（外部手改配置/旧版导出）会被误开；与其它布尔键同规。

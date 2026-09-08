@@ -87,6 +87,108 @@ def test_supports_no_open_probe_failure_defaults_false(monkeypatch):
     assert hl._supports_no_open(["dsh"]) is False
 
 
+def test_launch_harness_reuses_existing_instance_on_alt_port(monkeypatch):
+    """已有 dsh web 跑在官方默认 3080 时，直接复用打开，不再新起 38080。"""
+    from pet import harness_launcher as hl
+
+    opened = []
+    monkeypatch.setattr(hl.webbrowser, "open", lambda url: opened.append(url))
+    # 38080 无监听，3080 有
+    monkeypatch.setattr(hl, "is_running", lambda port=None: int(port or 38080) == 3080)
+
+    def _no_spawn(command):  # 不应走到启动分支
+        raise AssertionError("已有实例运行时不应再 spawn")
+
+    monkeypatch.setattr(hl, "_spawn", _no_spawn)
+    status, url = hl.launch_harness()
+    assert status == "already"
+    assert url == "http://127.0.0.1:3080"
+    assert opened == ["http://127.0.0.1:3080"]
+
+
+def test_launch_harness_prefers_configured_port(monkeypatch):
+    """配置端口已有实例时优先复用它，不再探测 3080。"""
+    from pet import harness_launcher as hl
+
+    opened = []
+    probed = []
+    monkeypatch.setattr(hl.webbrowser, "open", lambda url: opened.append(url))
+
+    def _probe(port=None):
+        probed.append(int(port or 38080))
+        return True  # 第一个候选（配置端口）即有监听
+
+    monkeypatch.setattr(hl, "is_running", _probe)
+    status, url = hl.launch_harness(port=38080)
+    assert status == "already"
+    assert probed == [38080]
+    assert opened == ["http://127.0.0.1:38080"]
+
+
+def test_launch_harness_no_browser_when_autostart(monkeypatch):
+    """open_browser=False（随桌宠自启动）：只起服务，任何分支都不开浏览器。"""
+    from pet import harness_launcher as hl
+
+    opened = []
+    monkeypatch.setattr(hl.webbrowser, "open", lambda url: opened.append(url))
+
+    # 分支1：已有实例 → 直接返回，不开浏览器
+    monkeypatch.setattr(hl, "is_running", lambda port=None: True)
+    status, url = hl.launch_harness(open_browser=False)
+    assert status == "already"
+    assert opened == []
+
+    # 分支2：新起（带 --no-open）→ 不起等待线程、不开浏览器
+    monkeypatch.setattr(hl, "is_running", lambda port=None: False)
+    monkeypatch.setattr(hl, "_spawn", lambda command: None)
+    monkeypatch.setattr(
+        hl, "_find_launch_command",
+        lambda port=None: ["dsh", "web", "--host", "127.0.0.1", "--port", "38080", "--no-open"],
+    )
+    threads = []
+
+    def fake_thread(target=None, daemon=None, **kwargs):
+        threads.append(target)
+        return SimpleNamespace(start=lambda: None)
+
+    monkeypatch.setattr(hl.threading, "Thread", fake_thread)
+    status, url = hl.launch_harness(open_browser=False)
+    assert status == "started"
+    assert opened == []
+    assert threads == [], "open_browser=False 不应启动等待开浏览器的线程"
+
+
+def test_harness_autostart_hook_gates(monkeypatch):
+    """AppShell._maybe_autostart_harness：配置关/无 Chat 不触发；已有实例不重复拉起。"""
+    from pet import app as app_mod
+    from pet import harness_launcher as hl
+
+    spawned = []
+    monkeypatch.setattr(
+        app_mod.threading, "Thread",
+        lambda target=None, daemon=None, name=None: SimpleNamespace(start=lambda: spawned.append(target)),
+    )
+
+    def _make(enable_chat, flag):
+        return SimpleNamespace(
+            enable_chat=enable_chat,
+            config=SimpleNamespace(get=lambda k, d=None: flag if k == "harness_autostart" else d),
+        )
+
+    app_mod.AppShell._maybe_autostart_harness(_make(True, False))
+    app_mod.AppShell._maybe_autostart_harness(_make(False, True))
+    assert spawned == []
+
+    app_mod.AppShell._maybe_autostart_harness(_make(True, True))
+    assert len(spawned) == 1
+
+    launched = []
+    monkeypatch.setattr(hl, "is_running", lambda port=None: True)
+    monkeypatch.setattr(hl, "launch_harness", lambda **kw: launched.append(kw))
+    spawned[0]()
+    assert launched == [], "已有 dsh 实例在跑时不得重复拉起"
+
+
 def test_launch_harness_browser_ownership(monkeypatch):
     from pet import harness_launcher as hl
 

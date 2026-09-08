@@ -19,7 +19,6 @@
    StandardButton、会改变调用方分支语义，因此默认返回 StandardButton.No
    （安全拒绝，等同用户点“否”）。需要 Yes/No 特定答案的测试必须局部
    monkeypatch（test_agent_link / test_proactive 已如此）。
-
 """
 
 import pytest

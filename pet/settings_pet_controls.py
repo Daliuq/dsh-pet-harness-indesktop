@@ -307,7 +307,7 @@ def build_pet_controls(host) -> None:
         host.thinking_text_edits[agent_key] = edit
 
     host.dialogue_mode_select = ModernSelect(host, width=190)
-    for label, value in (("原有模式", "legacy"), ("鲸鱼娘女仆模式", "whale_maid"), ("自定义台词", "custom")):
+    for label, value in (("默认模式", "legacy"), ("鲸鱼娘女仆模式", "whale_maid"), ("自定义台词", "custom")):
         host.dialogue_mode_select.addItem(label, value)
     host.dialogue_mode_select.setCurrentData(str(host.config.get("dialogue_mode", "legacy") or "legacy"))
     # 统一预设：global 层是编辑区默认面（flat 旧结构 = global；双层取 global）

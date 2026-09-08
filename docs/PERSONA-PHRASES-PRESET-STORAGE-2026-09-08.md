@@ -17,7 +17,7 @@
 
 ## 2. 内置预设：数据文件 + 注册表
 
-- 数据：`pet/persona_presets/legacy.json`（原有模式/正式口吻）、
+- 数据：`pet/persona_presets/legacy.json`（默认模式/正式口吻）、
   `whale_maid.json`（鲸鱼娘女仆模式）。均为扁平
   `{event_key: [文案…]}`，35 个事件 key，每 key ≤8 条、每条 ≤240 字
   （载入时清洗）。键集合即事件词表（无独立硬编码词表）。
@@ -42,7 +42,7 @@
 
 取值 `legacy / whale_maid / custom`（`config.py` 归一化，非法回 `legacy`）。
 
-- `legacy`（原有模式）：命中 `persona_presets/legacy.json` 的预设文案。
+- `legacy`（默认模式）：命中 `persona_presets/legacy.json` 的预设文案。
   ⚠️ 2026-09-08 起**不再透传调用方原文案**——legacy 与 whale_maid 一样是
   JSON 预设（用户拍板），默认模式可见气泡文案因此由数据文件决定。
 - `whale_maid`（鲸鱼娘）：命中 `persona_presets/whale_maid.json`（2026-09-08

@@ -3863,7 +3863,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         reload_builtin_presets()
         self.cfg.set("dialogue_mode", mode)
         self.cfg.save()
-        label = {"legacy": "原有模式", "whale_maid": "鲸鱼娘女仆模式", "custom": "自定义台词"}[mode]
+        label = {"legacy": "默认模式", "whale_maid": "鲸鱼娘女仆模式", "custom": "自定义台词"}[mode]
         self.show_bubble(f"台词风格已切换为{label}", duration_ms=3000)
 
     def _edit_dialogue_phrases(self) -> None:

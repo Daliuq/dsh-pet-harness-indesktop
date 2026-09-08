@@ -2128,7 +2128,7 @@ class AgentLinkManager(QObject):
                 vals[field] = value
         session_id = str(record.get("sessionId") or "").strip()
         if session_id:
-            session_name = self.get_session_display_name(session_id)
+            session_name = self._session_display_name_or_empty(session_id)
             if session_name and session_name.strip():
                 vals["sessionName"] = session_name.strip()
         return vals
@@ -3212,7 +3212,7 @@ class AgentLinkManager(QObject):
             value = entry.get(field)
             if value not in (None, ""):
                 conditional[field] = value
-        session_name = self.get_session_display_name(session_key)
+        session_name = self._session_display_name_or_empty(session_key)
         if session_name and session_name.strip():
             conditional["sessionName"] = session_name.strip()
         text = self._dialogue(key, fallback, count=count, **conditional)
@@ -3441,6 +3441,20 @@ class AgentLinkManager(QObject):
         # 降级：截短 sessionId，避免暴露完整内部标识
         short_id = session_id[:8] if len(session_id) > 8 else session_id
         return f"DSH · {short_id}"
+
+    def _session_display_name_or_empty(self, session_id: str) -> str:
+        """供台词注入的真实会话显示名。
+
+        get_session_display_name() 在没有任何会话元数据时会回退成 id 截短占位
+        （"DSH · <sessionId[:8]>"）——那是兜底展示名，不是「会话显示名」。台词
+        模板的 {sessionName} 只该拿到真实可读名称：落到占位时返回空串，由条件
+        渲染（autohide）隐藏占位符，绝不把 sessionId 冒充会话名露出来。
+        """
+        display = self.get_session_display_name(session_id)
+        short = session_id[:8] if len(session_id) > 8 else session_id
+        if display == f"DSH · {short}":
+            return ""
+        return display
 
     def _exploration_name(self, payload: dict, session_key: str) -> str:
         """返回探索气泡中显示的会话名称，优先使用元数据缓存。"""

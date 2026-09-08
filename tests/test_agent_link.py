@@ -2918,3 +2918,65 @@ class TestRateLimitAlert:
                                          "retryExhausted": True})
         assert len(mgr.win.alerts) == before, "429 活跃时抑制通用失败横幅"
 
+
+class TestSessionNameTruthfulness:
+    """{sessionName} 只注入真实会话显示名，绝不把 sessionId 截短占位冒充（字段真实性）。
+
+    会话元数据（session/meta）未到达时，get_session_display_name() 会回退成
+    "DSH · <id8>" 兜底占位——它不是「会话显示名」，不得注入台词模板（渲染端
+    对缺失的条件字段会自动隐藏 {sessionName} 占位符）。
+    """
+
+    class _Win:
+        cats = {"acts": ["写代码"]}
+        idles = ["待机呼吸"]
+
+        def isVisible(self):
+            return True
+
+        def show_bubble(self, *_args, **_kwargs):
+            pass
+
+    class _AlertWin:
+        def __init__(self):
+            self.alerts = []
+            self.resolved = []
+            # 有意不带 _bubble_busy_until：_schedule_429_dismiss 据此跳过 QTimer
+
+        def isVisible(self):
+            return True
+
+        def show_alert(self, text, **_kwargs):
+            self.alerts.append(str(text))
+
+        def resolve_alert(self, alert_id):
+            self.resolved.append(str(alert_id))
+
+        def show_bubble(self, *_args, **_kwargs):
+            pass
+
+    def _make(self, tmp_path, win=None):
+        return AgentLinkManager(win or self._Win(), Config(base=tmp_path))
+
+    def test_id_fallback_is_not_injected_as_session_name(self, tmp_path):
+        mgr = self._make(tmp_path)
+        sid = "session-0123456789"
+        assert mgr.get_session_display_name(sid) == f"DSH · {sid[:8]}"
+        cond = mgr._session_conditional({"sessionId": sid})
+        assert "sessionName" not in cond, "无元数据时不得把 id 截短占位注入为会话名"
+        assert not any("session-" in str(v) for v in cond.values())
+
+    def test_real_session_name_from_meta_is_injected(self, tmp_path):
+        mgr = self._make(tmp_path)
+        sid = "session-0123456789"
+        mgr._on_session_meta("dsh", {"sessionId": sid, "projectName": "深海项目", "label": "排障对话"})
+        cond = mgr._session_conditional({"sessionId": sid})
+        assert cond["sessionName"] == "深海项目 · 排障对话"
+        assert mgr._session_display_name_or_empty(sid) == "深海项目 · 排障对话"
+
+    def test_429_alert_does_not_inject_session_name_without_meta(self, tmp_path):
+        mgr = self._make(tmp_path, win=self._AlertWin())
+        captured = {}
+        mgr._dialogue = lambda key, fallback, **kw: (captured.update(kw), fallback)[1]
+        mgr._show_429_alert("session-abcdef12", 1)
+        assert "sessionName" not in captured, "429 无会话元数据时不得注入 sessionName"

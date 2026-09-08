@@ -48,9 +48,7 @@ WINDOW_PY_LINE_BUDGET = 4350
 # re-export 留守本文件；控件库 / 菜单布局编辑器 / AI 设置页 / 主题 QSS 已分别拆至
 # settings_widgets / settings_menu_layout_editor / chat/ai_settings_page /
 # settings_theme_qss。预算 = 实测 + 50 行余量；再往上帝类里塞新页面时只许降不涨。
-#
 # 2026-09-05 建立（perf/memory-footprint 拆分批）。
-#
 # 2026-09-06 上调到 1992：合入上游 main（PR73）带来动画预热开关等 +85 行
 # （实测 1942），预算随实测校准。
 MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 1992

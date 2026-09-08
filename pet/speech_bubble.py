@@ -29,7 +29,12 @@ from PySide6.QtGui import (
     QPixmap, QTransform,
 )
 from PySide6.QtWidgets import (
-    QFrame, QLabel, QLayout, QPushButton, QSizePolicy, QVBoxLayout,
+    QFrame,
+    QLabel,
+    QLayout,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
     QWidget,
 )
 

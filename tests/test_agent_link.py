@@ -416,16 +416,16 @@ class TestRealFileTailEndToEnd:
         assert "吃Token" in switched_anims
 
         mgr._on_agent_state("claude", "attention")
-        # busy 后的 attention（Claude Stop=回合结束）不再立即弹「看一眼」，
+        # busy 后的 attention（Claude Stop=回合结束）不再立即弹「确认」气泡，
         # 改由完成确认流程接管（防双气泡）；确认后弹中性完成文案
-        assert not any("需要你看一眼" in b for b in bubbles)
+        assert not any("确认一下" in b for b in bubbles)
         assert "claude" in mgr._done_pending
         mgr._fire_done("claude")
-        assert any("自己看一眼" in b for b in bubbles)
+        assert any("已停止" in b for b in bubbles)
 
         # 非 busy 后独立出现的 attention 仍立即提醒
         mgr._on_agent_state("dsh", "attention")
-        assert any("需要你看一眼" in b for b in bubbles)
+        assert any("需要你确认" in b for b in bubbles)
 
 
 # ============================================================================
@@ -955,7 +955,7 @@ class TestAgentLinkBubbles:
         assert "dsh" in mgr._done_pending
 
         mgr._fire_done("dsh")
-        assert any("干完活啦" in b for b in bubbles)
+        assert any("已完成本轮任务" in b for b in bubbles)
 
     def test_notify_done_false_no_bubble(self, tmp_path):
         """2. 同样流程但 cfg 里 agent_link.notify_done=False → _fire_done 后无气泡。"""
@@ -982,20 +982,21 @@ class TestAgentLinkBubbles:
         mgr_on, win_on, bubbles_on, clock_on = self._make_mgr(tmp_path, agent_link_cfg={"notify_state": True})
         mgr_on._on_agent_state("dsh", "thinking")
         assert len(bubbles_on) == 1
-        assert "正在深度思考" in bubbles_on[0]
+        # legacy 内置预设 thinking 首句（此前为 DSH 专属原文案「大肥鱼正在深度思考」）
+        assert "DSH 正在思考" in bubbles_on[0]
 
         clock_on[0] += 3.0
         mgr_on._on_agent_state("dsh", "working")
         # 连续 busy 状态，thinking→working 互跳不重复弹
         assert len(bubbles_on) == 1
 
-        # idle 后再 working → 弹「开始干活啦」
+        # idle 后再 working → 弹「开始干活」气泡（legacy 预设 start 首句）
         clock_on[0] += 3.0
         mgr_on._on_agent_state("dsh", "idle")
         clock_on[0] += 3.0
         mgr_on._on_agent_state("dsh", "working")
         assert len(bubbles_on) == 2
-        assert "开始干活啦" in bubbles_on[1]
+        assert "已开始执行任务" in bubbles_on[1]
 
     def test_thinking_text_custom_override(self, tmp_path):
         """自定义 thinking 文案：agent_link.thinking_text 非空时优先使用，支持 {name} 占位符。"""
@@ -1007,12 +1008,12 @@ class TestAgentLinkBubbles:
         assert "DSH 大脑飞速运转中……" == bubbles[0]
         assert "深度思考" not in bubbles[0]
 
-        # 空字符串 → 回退默认
+        # 空字符串 → 回退默认（legacy 内置预设 thinking 首句）
         mgr2, win2, bubbles2, _ = self._make_mgr(
             tmp_path / "b", agent_link_cfg={"notify_state": True, "thinking_text": ""}
         )
         mgr2._on_agent_state("dsh", "thinking")
-        assert "大肥鱼正在深度思考" in bubbles2[0]
+        assert "DSH 正在思考" in bubbles2[0]
 
     def test_thinking_uses_agent_delta_preset(self, tmp_path):
         """thinking 文案走统一预设 agents delta：dsh 有覆盖时命中，其它 Agent 回退 global。
@@ -1068,7 +1069,7 @@ class TestAgentLinkBubbles:
         mgr._on_agent_state("dsh", "idle")
         mgr._fire_done("dsh")
         assert len(bubbles) == 1
-        assert "干完活啦" in bubbles[0]
+        assert "已完成本轮任务" in bubbles[0]  # done.success 预设首句
 
         # 再次进入 busy -> idle
         clock[0] += 3.0  # 3s < 5s 冷却
@@ -1084,7 +1085,7 @@ class TestAgentLinkBubbles:
         mgr._on_agent_state("dsh", "idle")
         mgr._fire_done("dsh")
         assert len(bubbles) == 2
-        assert "干完活啦" in bubbles[1]
+        assert "执行完成" in bubbles[1]  # 第二次 done.success 轮换到第二句
 
     def test_error_during_busy_done_bubble_text(self, tmp_path):
         """6. busy 期间出现 error 再 idle：完成气泡文案含「自己看一眼」而不是「干完活啦」。"""
@@ -1097,10 +1098,10 @@ class TestAgentLinkBubbles:
         mgr._fire_done("dsh")
 
         # error 状态本身不立即弹气泡（由完成流程接管，防双气泡）；
-        # 完成气泡应当含有「自己看一眼」且不含「干完活啦」
-        done_bubbles = [b for b in bubbles if "自己看一眼" in b]
+        # 完成气泡应走 done.attention 预设（中性收尾），不误说成功完成
+        done_bubbles = [b for b in bubbles if "已停止" in b]
         assert len(done_bubbles) == 1
-        assert not any("干完活啦" in b for b in bubbles)
+        assert not any("已完成本轮任务" in b or "执行完成" in b for b in bubbles)
 
     def test_bubble_busy_until_occupancy(self, tmp_path, monkeypatch):
         """7. _show_link_bubble 在 win._bubble_busy_until 为未来时间时：
@@ -1127,15 +1128,15 @@ class TestAgentLinkBubbles:
         assert bubbles == []  # 不弹立即 attention 气泡（防双气泡）
 
         mgr._fire_done("claude")
-        assert any("自己看一眼" in b for b in bubbles)
-        assert not any("干完活啦" in b for b in bubbles)
+        assert any("已停止" in b for b in bubbles)
+        assert not any("已完成本轮任务" in b or "执行完成" in b for b in bubbles)
 
     def test_standalone_attention_immediate_bubble(self, tmp_path):
         """9. 非 busy 后独立出现的 attention：立即提醒，不进完成流程。"""
         mgr, win, bubbles, clock = self._make_mgr(tmp_path)
         mgr._on_agent_state("claude", "attention")
         assert "claude" not in mgr._done_pending
-        assert any("看一眼" in b for b in bubbles)
+        assert any("确认一下" in b for b in bubbles)
 
     def test_done_restores_idle_anim_unless_others_busy(self, tmp_path):
         """10. 完成确认后恢复待机动画（Claude 没有 idle 事件，靠这步回待机）；
@@ -1435,10 +1436,12 @@ class TestAgentLinkChainingAndActivity:
 
         clock[0] += 10.0
         mgr._on_agent_activity("dsh", "pwsh")
-        assert "正在跑命令" in bubbles[-1]
+        assert len(bubbles) == 4
+        assert "pwsh" in bubbles[-1]  # activity.run 轮换到含工具名的变体
         clock[0] += 10.0
         mgr._on_agent_activity("dsh", "memory_search")
-        assert "正在翻记忆" in bubbles[-1]
+        assert len(bubbles) == 5
+        assert bubbles[-1].strip()  # activity.default 轮换文案，仅断言有气泡
 
     def test_activity_bubble_receives_tool_record_fields(self, tmp_path):
         """过程汇报气泡必须拿到上游 tool/call 记录的字段（显式注入，非隐式上下文）。
@@ -2076,7 +2079,8 @@ class TestApprovalStickyBubble:
         assert mgr.win._sticky_bubble_active is True
         text, sticky = mgr.win.sticky_shown[-1]
         assert sticky is True
-        assert "审批" in text
+        # legacy 内置预设 approval.tool 首句：请求使用工具名（原 fallback 含「审批」字样）
+        assert "请求使用工具" in text and "bash" in text
         assert mgr.win.shown_buttons == [], "无 rpcId 时不得出按钮（纯提示）"
 
     def test_approval_request_shows_full_command(self, tmp_path):
@@ -2112,7 +2116,7 @@ class TestApprovalStickyBubble:
         mgr._on_approval_request("dsh", {"tool": "write", "approvalId": "ap-w", "sessionId": "s-1"})
         text, _sticky = mgr.win.sticky_shown[-1]
         assert "请求执行" not in text
-        assert "审批" in text
+        assert "请求使用工具" in text
 
     def test_approval_resolved_dismisses(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
@@ -2267,7 +2271,9 @@ class TestApprovalStickyBubble:
         text, sticky = mgr.win.sticky_shown[-1]
         assert sticky is True
         assert "请补充上下文" in text
-        assert "需要你输入" in text
+        assert "正在询问" in text
+        # 无选项=自由输入：即使 preset 文案被覆盖，结构引导也必须保留
+        assert "请到 DSH 界面输入文本回答" in text
         assert mgr.win.shown_buttons == [], "自由输入问题不出可点按钮"
 
     def test_question_multi_question(self, tmp_path):
@@ -2385,8 +2391,9 @@ class TestApprovalStickyBubble:
         )
         text, sticky = mgr.win.sticky_shown[-1]
         assert sticky is True
-        assert "需要你输入" in text
-        assert "DSH 界面输入文本回答" in text
+        assert "请补充上下文" in text
+        assert "正在询问" in text
+        assert "请到 DSH 界面输入文本回答" in text
         assert mgr.win.shown_buttons == []
 
     def test_hint_upgraded_to_interactive(self, tmp_path):
@@ -2802,21 +2809,20 @@ class TestExecutionFailed:
         mgr = self._make_mgr(tmp_path)
         mgr._on_execution_failed("dsh", {"source": "model_request", "retryExhausted": True, "retries": 4})
         assert mgr.win.alerts, "应入队失败提醒"
-        assert "运行失败" in mgr.win.alerts[-1]["text"]
-        assert "重试" in mgr.win.alerts[-1]["text"]
+        assert "重试" in mgr.win.alerts[-1]["text"]  # failure.retry 预设（多次重试后仍未成功）
         assert mgr.win.alerts[-1]["sticky"] is False, "失败提醒是限时气泡（非 sticky）"
 
     def test_tool_failure_shows_reminder(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
         mgr._on_execution_failed("dsh", {"source": "tool", "retryExhausted": False})
         assert mgr.win.alerts
-        assert "工具执行最终失败" in mgr.win.alerts[-1]["text"]
+        assert "工具执行失败" in mgr.win.alerts[-1]["text"]  # failure.tool 预设首句
 
     def test_generic_failure(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
         mgr._on_execution_failed("dsh", {})
         assert mgr.win.alerts
-        assert "运行失败" in mgr.win.alerts[-1]["text"]
+        assert "执行失败" in mgr.win.alerts[-1]["text"]  # failure.generic 预设首句
 
     def test_picks_fail_anim(self, tmp_path):
         """角色动作池含「失败/冒烟」类动作时选择它。"""
@@ -2875,7 +2881,8 @@ class TestRateLimitAlert:
         assert mgr.win.alerts, "应弹出 429 提醒"
         alert = mgr.win.alerts[-1]
         assert alert["alert_id"] == "429-rate-limit:sess-1", "alert_id 必须带 sessionId 隔离"
-        assert "429" in alert["text"] and "限流" in alert["text"]
+        # 可见文案走 legacy rate_limit.one 预设（不含 429 字样）；429 语义由 alert_id/alert_type 承载
+        assert "限流" in alert["text"]
         assert alert["priority"] == mgr._429_PRIORITY and alert["priority"] == 1
 
     def test_consecutive_429_merged_same_session(self, tmp_path):
@@ -2883,7 +2890,7 @@ class TestRateLimitAlert:
         mgr._on_rate_limit("dsh", {"sessionId": "sess-2"})
         mgr._on_rate_limit("dsh", {"sessionId": "sess-2"})  # 8s 冷却窗口内 → 合并
         assert mgr._429_cache["sess-2"]["count"] == 2
-        assert "已连续限流 2 次" in mgr.win.alerts[-1]["text"]
+        assert "限流" in mgr.win.alerts[-1]["text"] and "2 次" in mgr.win.alerts[-1]["text"]
         assert mgr.win.alerts[-2]["alert_id"] == mgr.win.alerts[-1]["alert_id"], "同 session 复用同一 alert_id"
 
     def test_multi_session_isolated(self, tmp_path):

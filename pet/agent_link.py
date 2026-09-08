@@ -2386,12 +2386,13 @@ class AgentLinkManager(QObject):
             if self._questions_all_have_options(questions):
                 return self._dialogue("question.many", f"{prefix}{name} 有 {len(questions)} 个问题等你回答，快去看一下～",
                                       count=len(questions), name=name, **conditional)
-            return self._dialogue(
+            # 含自由文本分支：整批必须回 DSH 界面输入，引导不随台词被覆盖
+            return self._with_dsh_input_hint(self._dialogue(
                 "question.many",
                 f"{prefix}{name} 有 {len(questions)} 个问题等你回答"
                 "（含文本输入，请到 DSH 界面输入文本回答）～",
                 count=len(questions), name=name, **conditional,
-            )
+            ))
         q = questions[0]
         if not isinstance(q, dict):
             q = {}
@@ -2410,11 +2411,20 @@ class AgentLinkManager(QObject):
             return f"{name} 在问你：{body}（{' / '.join(labels)}）{multi}请选择一个："
         if multi:
             return f"{name} 在问你：{body}（可多选）快去选一下～"
-        return self._dialogue(
+        # 无选项 = 需要自由输入文本：气泡必须明确引导回 DSH 界面输入。
+        # 引导是结构性操作提示，不随表达风格台词（legacy/whale_maid/custom）被覆盖。
+        text = self._dialogue(
             "question.one",
             f"{name} 在问你：{body}，需要你输入，请到 DSH 界面输入文本回答～",
             body=body, name=name, **conditional,
         )
+        return self._with_dsh_input_hint(text)
+
+    def _with_dsh_input_hint(self, text: str) -> str:
+        """台词缺「回 DSH 输入」引导时补上，避免自定义/预设文案丢掉操作指引。"""
+        if "DSH 界面输入" in str(text):
+            return text
+        return f"{text}（请到 DSH 界面输入文本回答）"
 
     def _interaction_key(self, agent_key: str, kind: str, rpc_id) -> str:
         """生成稳定交互 id：有 rpcId 用 rpcId（同一审批/问题的稳定标识），

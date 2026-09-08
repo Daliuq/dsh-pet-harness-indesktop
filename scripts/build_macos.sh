@@ -76,6 +76,7 @@ for variant in "${variant_list[@]}"; do
         --add-data "assets/chat:assets/chat"
         --add-data "assets/sounds:assets/sounds"
         --add-data "pet/menu_templates:pet/menu_templates"
+        --add-data "pet/persona_presets:pet/persona_presets"
         --add-data "integrations:integrations"
     )
     # 设置页样式表：已在 modern_settings_dialog.py 内联（_settings_stylesheet）

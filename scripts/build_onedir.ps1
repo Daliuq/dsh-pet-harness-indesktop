@@ -191,7 +191,7 @@ if (-not $SkipBuild) {
         @keyringCollect `
         --add-data $datas `
         --add-data "assets\big_blue_fat_fish;assets\big_blue_fat_fish" `
-        --add-data "pet\persona_phrases.json;pet" `
+        --add-data "pet\persona_presets;pet\persona_presets" `
         --add-data "pet\menu_templates;pet\menu_templates" `
         @chatData `
         --add-data "assets\sounds;assets\sounds" `

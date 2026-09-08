@@ -106,9 +106,9 @@ def _persona_text(win, key: str, fallback: str, **values) -> str:
     picker = _persona_picker(win)
     if mode == "custom":
         return picker.custom(cfg.get("dialogue_phrases", {}), key, fallback, **values)
-    if mode == "whale_maid":
-        return picker.get(mode, key, fallback, **values)
-    return fallback.format(**values)
+    # legacy / whale_maid：命中内置 JSON 预设即渲染，未命中回退调用方原文案
+    text = picker.get(mode, key, fallback, **values)
+    return fallback.format(**values) if text is fallback else text
 
 
 def _show_balance_payload(win, payload) -> None:

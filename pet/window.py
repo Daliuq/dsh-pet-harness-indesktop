@@ -3858,6 +3858,9 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
     def _set_dialogue_mode(self, mode: str) -> None:
         """Switch wording for existing desktop-pet events; legacy remains default."""
         mode = mode if mode in ("legacy", "whale_maid", "custom") else "legacy"
+        # 重设/切换内置风格时重新从磁盘加载内置 JSON 预设（文件改动即时生效）。
+        from .persona_phrases import reload_builtin_presets
+        reload_builtin_presets()
         self.cfg.set("dialogue_mode", mode)
         self.cfg.save()
         label = {"legacy": "原有模式", "whale_maid": "鲸鱼娘女仆模式", "custom": "自定义台词"}[mode]

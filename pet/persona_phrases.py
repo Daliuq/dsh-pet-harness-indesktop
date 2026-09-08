@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Existing-event dialogue variants.
+"""表达风格台词渲染（data-over-code：内置文案全部外置为 JSON 预设）。
 
-The registry deliberately does not define or emit events.  ``legacy`` returns
-the caller's current text verbatim, so changing the selected persona is safe
-for existing installations and easy to roll back.
+内置表达风格（dialogue_mode=legacy / whale_maid）的文案不写死在代码里，而是
+各自对应仓库数据文件 ``pet/persona_presets/<mode>.json``：模块导入（启动）时
+加载一次，调用方可在「重设/恢复内置」时调用 :func:`reload_builtin_presets`
+重新读盘。custom 模式的台词属于用户数据，持久化在 config.json 的
+``dialogue_phrases`` 键（按 agent_key 分层的统一预设），同样不落任何代码文件。
 """
 from __future__ import annotations
 
 from collections import defaultdict
 import json
+import logging
 from pathlib import Path
 from string import Formatter
 from typing import Any, Mapping
@@ -140,54 +143,65 @@ def render_template(template: str, values: Mapping[str, Any] | None = None, auto
     return text
 
 
+# ---------------------------------------------------------------------------
+# 内置台词预设（文案数据全部外置，代码内不保存任何台词文本）
+# ---------------------------------------------------------------------------
+_PRESET_DIR = Path(__file__).with_name("persona_presets")
+_BUILTIN_MODES = ("legacy", "whale_maid")
+_presets: dict[str, dict[str, list[str]]] = {}
 
-_PHRASES = {
-    "start": ["收到啦，{name}开始工作了。", "{name}已经出发，主人稍等一下。"],
-    "thinking": ["正在认真替主人想办法……", "让我再仔细想想，主人稍等一下。"],
-    "activity.read": ["正在帮主人认真翻找资料呢……", "收到，正在仔细查看文件。"],
-    "activity.search": ["正在替主人探索线索……", "我来帮主人继续找找相关线索。"],
-    "activity.edit": ["正在把想法写进代码里……", "收到，正在推进代码修改。"],
-    "activity.run": ["正在替主人执行并验证一下……", "我来跑一遍，看看结果是否符合预期。"],
-    "activity.default": ["正在认真处理这一步……", "收到，正在继续推进。"],
-    "agent.attention": ["主人，这一步需要你看一眼哦。", "这里需要主人的决定，我先停在这里等你。"],
-    "agent.error": ["呜，{name}这边遇到一点问题了。", "{name}好像出错了，主人帮忙看一下吧。"],
-    "agent.missing": ["主人，暂时没有找到{name}，所以我还感知不到它。", "{name}还没有在这台电脑上运行，主人检查一下吧。"],
-    "bridge.install.pending": ["正在给 {name} 接上通信桥，主人稍等一下。", "人家正在安装 {name} 的联动桥接，马上就好～"],
-    "bridge.install.success": ["通信桥接好啦，{name} 的状态现在可以被我感知了。", "{name} 的联动插件安装完成，收到啦～"],
-    "bridge.install.failed": ["呜，{name} 的通信桥没有装好，主人检查一下吧：{detail}", "桥接安装遇到问题啦：{detail}，主人帮我看看～"],
-    "bridge.uninstall.failed": ["{name} 的通信桥没有完全卸载，主人需要手动检查一下。", "桥接收尾没有完成，主人看一下 {name} 的配置吧。"],
-    "dsh.writeback.failed": ["呜，消息没有送回 DSH，主人请到 DSH 界面处理。", "通信回写失败啦，主人去 DSH 看一下吧。"],
-    "approval.command": ["主人，这一步需要你确认：{command}", "请主人确认一下这条操作：{command}"],
-    "approval.tool": ["主人，这里需要你确认一下：{label}", "请主人决定是否允许这一步：{label}"],
-    "approval.generic": ["主人，这里需要你确认一下。", "这一步需要主人的决定，确认后我就继续。"],
-    "question.empty": ["这里需要主人的决定，选好以后我就继续出发啦。"],
-    "question.one": ["主人，这里有个问题需要你决定：{body}", "我需要主人的选择，确认后就继续。问题是：{body}"],
-    "question.many": ["主人，这里有 {count} 个问题需要决定。", "还有 {count} 个问题等主人确认。"],
-    "watchdog.warning": ["好像在同一片海域绕圈圈了……主人先留意一下。"],
-    "rate_limit.one": ["呜，通信有点拥挤，暂时被限流了，请稍后再试。"],
-    "rate_limit.many": ["呜，通信有点拥挤，已经连续限流 {count} 次了，请稍后再试。"],
-    "llm_error.api": ["AI 服务出错了，主人看看是怎么回事吧。", "AI 服务暂时没有回应，主人稍后再试一次吧。"],
-    "done.success": ["主人，{name}这一轮完成啦，去看看成果吧。"],
-    "done.attention": ["{name}这一轮停下来了，结果还请主人确认一下。"],
-    "failure.retry": ["{name}本轮没有完成：多次重试后仍未成功，请检查后再运行。"],
-    "failure.tool": ["{name}本轮没有完成：工具执行失败，请检查后再运行。"],
-    "failure.generic": ["{name}本轮没有完成，请检查后再运行。"],
-}
 
-# Stable schema keys reserved for newer event integrations.  Empty built-ins
-# remain compatible with the legacy JSON while making exports complete.
-for _key in (
-    "stuck.reminder", "pattern.warning",
-    "pattern.control", "balance.loading", "balance.result",
-):
-    _PHRASES.setdefault(_key, [])
+def _clean_preset_events(raw: object) -> dict[str, list[str]]:
+    """把磁盘 JSON 清洗成 {event: [文案…]}（文案 ≤240 字、每 key ≤8 条）。"""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, list[str]] = {}
+    for key, value in raw.items():
+        key = str(key).strip()
+        if not key:
+            continue
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            continue
+        lines = [str(item).strip()[:240] for item in value if isinstance(item, str) and item.strip()]
+        if lines:
+            cleaned[key] = lines[:8]
+    return cleaned
 
-try:
-    _json_phrases = json.loads(Path(__file__).with_name("persona_phrases.json").read_text(encoding="utf-8"))
-    if isinstance(_json_phrases, dict):
-        _PHRASES.update({str(key): value for key, value in _json_phrases.items() if isinstance(value, list)})
-except (OSError, ValueError):
-    pass
+
+def _read_preset_file(mode: str) -> dict[str, list[str]]:
+    path = _PRESET_DIR / f"{mode}.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError:
+        logging.getLogger(__name__).warning("内置台词预设缺失，按空预设处理：%s", path)
+        return {}
+    except ValueError:
+        logging.getLogger(__name__).warning("内置台词预设 JSON 无效，按空预设处理：%s", path)
+        return {}
+    return _clean_preset_events(raw)
+
+
+def load_builtin_presets() -> dict[str, dict[str, list[str]]]:
+    """（启动/模块导入时）读盘加载全部内置预设。
+
+    返回读盘快照；渲染实时读全局注册表，:func:`reload_builtin_presets` 可在
+    「重设/恢复内置」时重新读盘，已持有的 PhrasePicker 无需重建。
+    """
+    global _presets
+    _presets = {mode: _read_preset_file(mode) for mode in _BUILTIN_MODES}
+    return {mode: dict(phrases) for mode, phrases in _presets.items()}
+
+
+def reload_builtin_presets() -> dict[str, dict[str, list[str]]]:
+    """重设入口：重新从磁盘加载内置预设（已持有的 PhrasePicker 立即生效）。"""
+    return load_builtin_presets()
+
+
+def builtin_phrases(mode: str) -> dict[str, list[str]]:
+    """某内置模式当前的预设文案映射（未知模式 / 未加载 → 空，调用方走 fallback）。"""
+    return _presets.get(str(mode or "").lower()) or {}
 
 
 def phrase_for_agent(phrases: Mapping[str, Any] | None, agent_key: str, key: str) -> list[str] | None:
@@ -226,9 +240,12 @@ class PhrasePicker:
         self._last: dict[str, int] = defaultdict(lambda: -1)
 
     def get(self, mode: str, key: str, fallback: str, autohide=None, **values) -> str:
-        if str(mode or "legacy").lower() != "whale_maid":
-            return fallback
-        variants = _PHRASES.get(key)
+        """Render a built-in preset phrase (legacy / whale_maid) for an event.
+
+        mode 对应 pet/persona_presets/<mode>.json；该 key 无文案（预设缺失键 /
+        未知模式 / 未加载）时原样返回 fallback。变体轮换避免同 key 连续重复。
+        """
+        variants = builtin_phrases(mode).get(key)
         if not variants:
             return fallback
         if isinstance(variants, str):
@@ -280,9 +297,26 @@ class PhrasePicker:
         index = (last + 1) % len(variants)
         self._last[key] = index
         return render_template(variants[index], values, autohide=autohide)
+
+
 def phrase_keys() -> tuple[str, ...]:
-    return tuple(sorted(_PHRASES))
+    """事件词表 = 全部内置预设文案键的并集（按数据文件驱动，无硬编码词表）。"""
+    return tuple(sorted({key for phrases in _presets.values() for key in phrases}))
+
 
 def default_phrases() -> dict[str, str]:
-    """Return the default phrase template for each key (first variant)."""
-    return {key: variants[0] if variants else "" for key, variants in _PHRASES.items()}
+    """每个事件的默认模板文案（取内置预设首个非空变体；legacy 优先、whale_maid 兜底）。"""
+    result: dict[str, str] = {}
+    for key in phrase_keys():
+        for mode in ("legacy", "whale_maid"):
+            variants = (_presets.get(mode) or {}).get(key) or []
+            if variants:
+                result[key] = variants[0]
+                break
+        else:
+            result[key] = ""
+    return result
+
+
+# 启动即加载内置预设（此后可经 reload_builtin_presets() 在「重设」时重新读盘）。
+load_builtin_presets()

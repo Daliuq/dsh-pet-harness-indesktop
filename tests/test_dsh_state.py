@@ -18,14 +18,14 @@ def _qapp():
     return QApplication.instance() or QApplication([])
 
 
-def _make_tracker(tmp_path, monkeypatch, online=False):
+def _make_tracker(tmp_path, monkeypatch, online=False, *, name="base"):
     """构造一个指向临时桥目录的跟踪器，并把在线探测钉死到 online。"""
     _qapp()
-    base = tmp_path / "base"
-    config_dir = base / "cfg"
-    config_dir.mkdir(parents=True)
-    bridge_dir = base / "dsh-pet-bridge"
-    bridge_dir.mkdir(parents=True)
+    root = tmp_path / name
+    config_dir = root / "cfg"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    bridge_dir = root / "dsh-pet-bridge"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(harness_launcher, "is_running", lambda port: online)
     tracker = DshStateTracker(config_dir, parent=None, scan_interval=0.0)
     # 关闭 ByteOffsetTailer 的 backfill 防护，让测试能立即读到已写入内容
@@ -222,3 +222,64 @@ def test_unknown_event_ignored(tmp_path, monkeypatch):
     _write(bridge_dir, {"event": "some/unknown", "foo": 1})
     tracker._poll_events()
     assert tracker.current_state is DshState.IDLE
+
+
+def test_stop_drops_inflight_probe_result(tmp_path, monkeypatch):
+    """stop() 后在途在线探测的结果必须被丢弃。
+
+    崩溃族（macOS 全量 teardown segfault）：_probe_worker 是 daemon 线程、
+    可能正阻塞在 socket 探测上；若 stop()/QObject 销毁后它仍跨线程 emit
+    ``_online_checked``，会与 Qt 收尾（conftest deleteLater + processEvents）
+    竞争。修复：stop() 换代，worker 回来后代次不匹配即静默返回。
+    """
+    tracker, _ = _make_tracker(tmp_path, monkeypatch, online=False)
+    # 探测进行中 tracker 被 stop()（模拟测试 teardown）
+    tracker._started = True
+    generation = tracker._probe_generation
+    tracker.stop()
+    assert tracker._probe_generation == generation + 1
+    assert tracker._probe_inflight is False
+
+    applied: list[bool] = []
+    tracker._apply_online = lambda online: applied.append(online)  # type: ignore[method-assign]
+    # 模拟在途 worker 此刻才探测完：is_running 现在会返回 True
+    monkeypatch.setattr(harness_launcher, "is_running", lambda port: True)
+    tracker._probe_worker(generation, [38080, 3080])
+    assert applied == [], "stop() 后的迟到探测结果必须丢弃，不得 emit/_apply_online"
+
+
+def test_probe_worker_applies_result_while_started(tmp_path, monkeypatch):
+    """未 stop 的正常路径：worker 探测结果仍被应用（防止上面丢弃逻辑误伤）。"""
+    tracker, _ = _make_tracker(tmp_path, monkeypatch, online=False)
+    monkeypatch.setattr(harness_launcher, "is_running", lambda port: True)
+    applied: list[bool] = []
+    original = tracker._apply_online
+
+    def spy(online: bool) -> None:
+        applied.append(online)
+        original(online)
+
+    tracker._started = True
+    tracker._apply_online = spy  # type: ignore[method-assign]
+    tracker._probe_worker(tracker._probe_generation, [38080, 3080])
+    assert applied == [True]
+    assert tracker.current_state is DshState.IDLE
+    tracker.stop()
+
+
+def test_shutdown_live_for_tests_stops_trackers(tmp_path, monkeypatch):
+    """conftest 收口入口：_shutdown_live_for_tests() 把存活 tracker 全部 stop。"""
+    from pet import dsh_state as dsh_state_mod
+
+    tracker_a, _ = _make_tracker(tmp_path, monkeypatch, online=False, name="a")
+    tracker_b, _ = _make_tracker(tmp_path, monkeypatch, online=False, name="b")
+    tracker_a._started = True
+    tracker_b._started = True
+    generation_a = tracker_a._probe_generation
+    generation_b = tracker_b._probe_generation
+
+    dsh_state_mod._shutdown_live_for_tests()
+    assert tracker_a._started is False
+    assert tracker_b._started is False
+    assert tracker_a._probe_generation == generation_a + 1
+    assert tracker_b._probe_generation == generation_b + 1

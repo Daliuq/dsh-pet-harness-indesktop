@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import time
+import weakref
 from enum import Enum
 from pathlib import Path
 from threading import Thread
@@ -38,6 +39,12 @@ from . import harness_launcher
 from .agent_link import DirGlobTailer
 
 log = logging.getLogger("dsh-pet-standalone")
+
+# 存活 tracker 登记（弱引用）：供测试/退出路径统一收口在线探测线程。
+# 与 collision_ipc._live_sessions / agent_link 的 _shutdown_live_for_tests
+# 同一防线：QTimer 停了还不够——在途 socket 探测线程必须作废其结果，
+# 否则 teardown 里 QObject 销毁后 worker 仍跨线程 emit（macOS 全量 segfault 族）。
+_LIVE_TRACKERS: "weakref.WeakSet[DshStateTracker]" = weakref.WeakSet()
 
 # 桥目录与桌宠变体无关（与 DshMonitor 同约定）：config.dir.parent 即数据基目录
 BRIDGE_DIR_NAME = "dsh-pet-bridge"
@@ -144,6 +151,7 @@ class DshStateTracker(QObject):
         scan_interval: float = 5.0,
     ) -> None:
         super().__init__(parent)
+        _LIVE_TRACKERS.add(self)
         self.config_dir = Path(config_dir)
         self.port = int(port) if port is not None else harness_launcher.DEFAULT_PORT
         self._clock = clock or time.monotonic
@@ -169,6 +177,7 @@ class DshStateTracker(QObject):
 
         self._online: Optional[bool] = None  # 上次在线探测结果（用于 edge 触发 offline/idle）
         self._probe_inflight = False  # 后台探测是否在途（防并发探测）
+        self._probe_generation = 0    # 探测代次：stop() 自增，作废在途结果
         self._started = False
 
         self._online_timer = QTimer(self)
@@ -199,6 +208,12 @@ class DshStateTracker(QObject):
         self._started = False
         self._online_timer.stop()
         self._event_timer.stop()
+        # 在途在线探测结果作废：worker 可能正阻塞在 socket 连接上，回来后
+        # 若仍跨线程 emit 到已停止/已销毁的 QObject，会与 Qt 收尾竞争
+        # （macOS 全量 teardown segfault：_probe_worker 在 socket.close 里挂起、
+        # 主线程 processEvents 销毁窗口）。换代让迟到结果静默丢弃。
+        self._probe_generation += 1
+        self._probe_inflight = False
 
     def pause(self) -> None:
         """桌宠隐藏时可暂停（低功耗）：事件与在线探测都停。"""
@@ -338,25 +353,41 @@ class DshStateTracker(QObject):
         每 3 秒一次这样探测，会让桌宠画面周期性卡顿。后台线程 + 信号回主线程
         完全消除该阻塞；探测结果经 ``_online_checked`` 队列投递回主线程应用。
         """
+        if not self._started:
+            return  # stop() 后 QTimer 已停；防御旧接线直接调用
         if self._probe_inflight:
             return  # 上一轮探测仍在途，跳过本次（3s 间隔足够，不会漏）
         self._probe_inflight = True
         ports = self._candidate_ports()
+        generation = self._probe_generation
         try:
-            worker = Thread(target=self._probe_worker, args=(ports,), daemon=True)
+            worker = Thread(
+                target=self._probe_worker,
+                args=(generation, ports),
+                daemon=True,
+                name="dsh-online-probe",
+            )
             worker.start()
         except Exception:
             self._probe_inflight = False
             log.exception("DSH 在线探测线程启动失败")
             self._apply_online(False)
 
-    def _probe_worker(self, ports: list[int]) -> None:
-        """后台线程里跑端口探测，结果 emit 回主线程。任何异常都不外抛。"""
+    def _probe_worker(self, generation: int, ports: list[int]) -> None:
+        """后台线程里跑端口探测，结果 emit 回主线程。任何异常都不外抛。
+
+        携带代次：探测期间若 tracker 被 stop()（测试 teardown / 应用退出），
+        回来后代次不匹配直接丢弃结果，绝不对已停止对象跨线程 emit。
+        """
+        if generation != self._probe_generation or not self._started:
+            return  # stop() 后的迟到结果：静默丢弃
         try:
             online = any(harness_launcher.is_running(p) for p in ports)
         except Exception:
             log.exception("DSH 在线探测线程异常")
             online = False
+        if generation != self._probe_generation or not self._started:
+            return  # 探测期间被 stop()：结果作废，不 emit
         try:
             self._online_checked.emit(online)
         except Exception:
@@ -401,3 +432,14 @@ class DshStateTracker(QObject):
             except Exception:
                 # 单条坏事件不影响后续；记日志即可，绝不让 DSH 数据拖垮桌宠
                 log.debug("DSH 桥接事件解析失败: %r", line, exc_info=True)
+
+
+def _shutdown_live_for_tests() -> None:
+    """测试收口：把仍存活的 DshStateTracker 全部 stop()（QTimer 停 + 在途
+    在线探测作废）。与 conftest 里 collision/agent_link/library 的收口同一防线，
+    防止 teardown 时后台 socket 探测线程对已销毁 QObject 跨线程 emit。"""
+    for tracker in list(_LIVE_TRACKERS):
+        try:
+            tracker.stop()
+        except Exception:
+            log.debug("DSH 状态跟踪器测试收口失败", exc_info=True)

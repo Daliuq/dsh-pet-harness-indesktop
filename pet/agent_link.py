@@ -1600,7 +1600,7 @@ class AgentLinkManager(QObject):
         # 防止真实异常也留下永久弹窗。
         self.monitors["dsh"].raw_record.connect(self._on_interaction_lifecycle)
         self._exploration_watchdog.warning.connect(self._on_exploration_warning)
-        # 会话元数据缓存：sessionId → { label, projectName, agentName }
+        # 会话元数据缓存：sessionId → { sessionName, projectName, agentName }
         self._session_meta_cache: dict[str, dict] = {}
         self._exploration_alerts: dict[str, str] = {}
         self._exploration_names: dict[str, str] = {}
@@ -2122,7 +2122,7 @@ class AgentLinkManager(QObject):
         """
         record = record if isinstance(record, dict) else {}
         vals: dict[str, str] = {}
-        for field in ("projectName", "label"):
+        for field in ("projectName", "sessionName", "label"):
             value = str(record.get(field) or "").strip()
             if value:
                 vals[field] = value
@@ -3129,7 +3129,7 @@ class AgentLinkManager(QObject):
         if not session_id:
             return
         self._session_meta_cache[session_id] = {
-            "label": str(record.get("label") or ""),
+            "sessionName": str(record.get("sessionName") or ""),
             "projectName": str(record.get("projectName") or ""),
             "agentName": str(record.get("agentName") or ""),
         }
@@ -3422,19 +3422,18 @@ class AgentLinkManager(QObject):
     def get_session_display_name(self, session_id: str) -> str:
         """解析会话的人类可读显示名。
 
-        降级链：cache 中的 projectName+label → cache.agentName → 截短 sessionId → 完整 sessionId。
+        降级链：cache 中的 projectName+sessionName → cache.agentName → 截短 sessionId → 完整 sessionId。
         控制请求（interrupt/replan）仍严格使用 sessionId，此处仅用于展示。
         """
         meta = self._session_meta_cache.get(session_id)
         if meta:
             project_name = str(meta.get("projectName") or "")
-            label = str(meta.get("label") or "")
-            # 优先用 projectName + label 组合（更精确）
-            if project_name and label:
-                return f"{project_name} · {label}"
-            if label:
-                # 兼容旧格式：label 可能是完整 displayLabel（如 "DSH · proj · conv"）
-                return label
+            session_name = str(meta.get("sessionName") or "")
+            # 优先用 projectName + sessionName 组合（更精确）
+            if project_name and session_name:
+                return f"{project_name} · {session_name}"
+            if session_name:
+                return session_name
             agent_name = str(meta.get("agentName") or "")
             if agent_name:
                 return agent_name

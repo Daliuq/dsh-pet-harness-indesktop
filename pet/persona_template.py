@@ -38,7 +38,7 @@ VARIABLES = {
 
 # 上游记录字段——以桥接插件源码（integrations/dsh-pet-bridge/index.js）逐事件
 # writeRecord/writeRecordDedup 实际写出的字段为准（2026-09-06 核实）：
-#   公共: ts/agent/event 恒有；sessionId 存在时补 projectName/label（session/meta）
+#   公共: ts/agent/event 恒有；sessionId 存在时补 projectName/sessionName（session/meta）
 #   Pet 侧注入: agent_key（_remember_dialogue_record）
 #   tool/call: tool/argsKey/command/callId/step/sessionId —— 无 target/ok（在 tool/result）
 #   approval/request: rpcId/approvalId/toolName/command/sessionId —— 无 requestId/callId/outcome
@@ -46,7 +46,7 @@ VARIABLES = {
 #   execution/failed: source/errorCode/errorMessage/retries/retryExhausted
 # 审批/提问/限流/失败/工具类文案与记录同轮触发，这些字段可靠；状态机与本地
 # 检测触发的文案（start/thinking/agent.*/done.* 等）不保证拿到记录，勿依赖。
-BASE_FIELDS = ("ts", "agent", "agent_key", "event", "sessionId", "projectName", "label")
+BASE_FIELDS = ("ts", "agent", "agent_key", "event", "sessionId", "projectName", "sessionName", "label")
 UPSTREAM_FIELDS = {
     "base": BASE_FIELDS,
     "tool/call": ("tool", "argsKey", "command", "callId", "step"),

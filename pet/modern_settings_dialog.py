@@ -16,6 +16,7 @@ from pathlib import Path
 
 import shiboken6
 
+
 from PySide6.QtCore import QEvent, QFileInfo, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QColor, QClipboard, QFontDatabase, QIcon, QImageReader, QPainter,

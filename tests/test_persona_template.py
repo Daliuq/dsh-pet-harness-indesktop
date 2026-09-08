@@ -99,7 +99,7 @@ def test_all_advertised_fields_reach_presentation_layer():
         "retries", "retryExhausted",
     }
     assert "cordis" not in data["upstream"]["fields"]
-    assert "sessionName" not in UPSTREAM_FIELDS["base"], "桥接从不写出 sessionName"
+    assert "sessionName" in UPSTREAM_FIELDS["base"], "Bridge 必须直接写出 sessionName"
     assert set(PARAMETERS) == set(entries) == set(phrase_keys())
     for key, entry in entries.items():
         assert key in DISPLAY_HINTS and key in EVENT_SOURCES, key

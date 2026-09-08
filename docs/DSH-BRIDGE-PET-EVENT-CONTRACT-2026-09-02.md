@@ -158,7 +158,7 @@ cordis/request-run
 {"ts": 0, "agent": "dsh", "event": "AgentStatus", "sessionId": "..."}
 ```
 
-Bridge 可能补充 `projectName`、`label`。Pet 的 `agent-event/v1` 统一记录字段为：
+Bridge 会直接补充字面字段 `projectName`、`sessionName`。`label` 仅保留给工具标签等业务语义，不再承载会话名称。Pet 的 `agent-event/v1` 统一记录字段为：
 
 ```text
 schema, ts, source, agentName, projectId, projectName,

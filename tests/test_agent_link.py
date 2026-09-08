@@ -2969,7 +2969,7 @@ class TestSessionNameTruthfulness:
     def test_real_session_name_from_meta_is_injected(self, tmp_path):
         mgr = self._make(tmp_path)
         sid = "session-0123456789"
-        mgr._on_session_meta("dsh", {"sessionId": sid, "projectName": "深海项目", "label": "排障对话"})
+        mgr._on_session_meta("dsh", {"sessionId": sid, "projectName": "深海项目", "sessionName": "排障对话"})
         cond = mgr._session_conditional({"sessionId": sid})
         assert cond["sessionName"] == "深海项目 · 排障对话"
         assert mgr._session_display_name_or_empty(sid) == "深海项目 · 排障对话"

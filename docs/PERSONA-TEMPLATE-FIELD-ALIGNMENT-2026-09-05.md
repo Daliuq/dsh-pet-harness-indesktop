@@ -134,8 +134,7 @@
   升级为「显式保证」。
 - 模板常量双向对齐：`PARAMETERS["activity.*"] = (name, tool, label, target, callId, step, ok)`；
   `pattern.warning` 补 `reasons`（运行时与 pattern.control 同点注入）；
-  `UPSTREAM_FIELDS["base"]` 移除桥接从不写出的 `sessionName`（label/projectName/agentName
-  由 writeRecord+session/meta 补充，有据可查）；EVENT_FIELDS 改为由 `BASE_FIELDS` 派生，
+  `UPSTREAM_FIELDS["base"]` 明确包含 Bridge 直接写出的 `sessionName`/`projectName`（`label` 仅用于工具标签）；EVENT_FIELDS 改为由 `BASE_FIELDS` 派生，
   不再逐行复制。
 - `modern_settings_dialog.DIALOGUE_KEY_PARAMS` 改为 `dict(PARAMETERS)` 派生（单一真相源），
   `DIALOGUE_PARAMS` 补 tool/target/callId/step/ok 展示名。

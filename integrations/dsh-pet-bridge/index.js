@@ -28,7 +28,7 @@ const CONTROL_MAX_REQUEST_AGE_MS = 10 * 60 * 1000;
 const agentStates = new Map(); // agent 对象 → "working" | "idle"
 const liveAgents = new Map(); // agent/session id → agent object
 const knownSessions = new Set();
-const sessionMetaCache = new Map(); // sessionId → { label, projectName, agentName }
+const sessionMetaCache = new Map(); // sessionId → { sessionName, projectName, agentName }
 let lastState = null;
 
 function aggregateWrite() {
@@ -413,17 +413,17 @@ function extractSessionMeta(agent, session) {
   if (!sessionId) return null;
 
   // 防御性字段提取，任何字段缺失都不会报错
-  const label = session?.label ?? session?.title ?? session?.name ?? null;
+  const sessionName = session?.label ?? session?.title ?? session?.name ?? null;
   const projectName = session?.parent?.name ?? session?.project?.name ?? session?.workspace?.path ?? null;
   const agentName = agent?.name ?? agent?.displayName ?? null;
 
-  // 构造显示标签
+  // 保留真实的人类可读项目名和会话名；displayLabel 仅用于元数据去重。
   const parts = ["DSH"];
   if (projectName) parts.push(projectName);
-  if (label) parts.push(label);
+  if (sessionName) parts.push(sessionName);
   const displayLabel = parts.join(" · ");
 
-  return { sessionId, label, projectName, agentName, displayLabel };
+  return { sessionId, sessionName, projectName, agentName, displayLabel };
 }
 
 function writeSessionMeta(agent, session) {
@@ -431,7 +431,7 @@ function writeSessionMeta(agent, session) {
   if (!meta) return;
 
   const sid = meta.sessionId;
-  // 去重：仅当 label 或 projectName 变化时才重发
+  // 去重：仅当 sessionName 或 projectName 变化时才重发
   const cached = sessionMetaCache.get(sid);
   if (cached && cached.displayLabel === meta.displayLabel) return;
 
@@ -439,7 +439,8 @@ function writeSessionMeta(agent, session) {
   writeRecord({
     type: "session/meta",
     sessionId: sid,
-    label: meta.label,          // 原始对话名（writeRecord 自动补充 projectName）
+    projectName: meta.projectName || "",
+    sessionName: meta.sessionName || "",
     agentName: meta.agentName || "DSH",
   });
 
@@ -864,13 +865,14 @@ function flushPending() {
 
 function writeRecord(extra) {
   try {
-    // 从 sessionMetaCache 补充 projectName / label（会话所属项目名与对话名）
+    // 从 sessionMetaCache 补充字面上的 projectName / sessionName。
+    // sessionName 不再借用 label，避免下游把工具标签与会话名混淆。
     const sid = extra.sessionId;
     if (sid) {
       const meta = sessionMetaCache.get(sid);
       if (meta) {
         if (meta.projectName) extra.projectName = meta.projectName;
-        if (meta.label) extra.label = meta.label;
+        if (meta.sessionName) extra.sessionName = meta.sessionName;
       }
     }
     writeQueue.push(

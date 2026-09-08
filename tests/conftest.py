@@ -117,6 +117,23 @@ def _close_qt_top_level_widgets():
         MovieLibrary._shutdown_live_for_tests()
     except Exception:
         pass
+    # 销毁残留顶层窗口（QDialog/QWidget）：只用 deleteLater，绝不用 close()。
+    # close() 会触发 closeEvent → _write_config → warm_click_sound_effects 的
+    # 副作用（t4 曾因此崩溃）；deleteLater 走 DeferredDelete，Qt 安全销毁且不
+    # 触发 closeEvent。清理掉泄漏的 C++ 对话框，避免其悬空事件在后续测试的
+    # processEvents 引爆（崩溃点漂移、access violation）。
+    try:
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            for widget in list(app.topLevelWidgets()):
+                try:
+                    widget.deleteLater()
+                except RuntimeError:
+                    pass  # C++ 侧已销毁的半死窗口：跳过
+            app.processEvents()
+    except Exception:
+        pass
 
 
 @pytest.fixture(scope="session", autouse=True)

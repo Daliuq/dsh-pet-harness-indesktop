@@ -2623,6 +2623,9 @@ def test_product_copy_has_no_external_brand_reference():
             if (
                 path.name in {"agent_link.py", "test_agent_link.py"}
                 or path.name.endswith("-RESEARCH.md")
+                # Contributor/change reports are repository evidence, not
+                # user-facing product copy and may mention external brands.
+                or path.name.startswith("README-CHANGE-")
             ):
                 continue
             if forbidden in path.read_text(encoding="utf-8", errors="ignore").lower():

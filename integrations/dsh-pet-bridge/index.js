@@ -15,7 +15,7 @@ const PLUGIN_ID = "dsh-pet-bridge";
 // These services are resolved by DSH when the plugin is loaded.  The bridge
 // uses them only for the watchdog's isolated diagnosis request; normal event
 // forwarding remains usable even when no model is configured.
-const inject = ["llm", "agentDefaultModel"];
+const inject = ["llm", "agentDefaultModel", "apiProxy"];
 const CONTROL_POLL_MS = 150;
 const CONTROL_MAX_CONTEXT = 12000;
 const CONTROL_MAX_REQUEST_AGE_MS = 10 * 60 * 1000;
@@ -29,6 +29,8 @@ const agentStates = new Map(); // agent 对象 → "working" | "idle"
 const liveAgents = new Map(); // agent/session id → agent object
 const knownSessions = new Set();
 const sessionMetaCache = new Map(); // sessionId → { sessionName, projectName, agentName }
+let metadataRefreshPromise = null;
+let metadataRefreshTimer = null;
 let lastState = null;
 
 function aggregateWrite() {
@@ -407,27 +409,92 @@ function agentLabelFor(sessionId) {
   return String(agent.name || agent.displayName || agent.label || agent.id || "DSH");
 }
 
-function extractSessionMeta(agent, session) {
-  if (!session && !agent) return null;
-  const sessionId = String(agent?.id || session?.id || "");
+function basenameOf(value) {
+  const raw = String(value || "").trim().replace(/[\\/]+$/, "");
+  if (!raw) return "";
+  return raw.split(/[\\/]/).pop() || "";
+}
+
+function sessionIdOfAgent(agent, session) {
+  return String(agent?.session?.id || agent?.id || session?.id || "");
+}
+
+function projectionTitle(session) {
+  const values = session?.projections?.values;
+  const title = values && typeof values === "object" ? values.title : "";
+  return typeof title === "string" && title.trim() ? title.trim() : "";
+}
+
+function extractSessionMeta(agent, session, summary = null, workspace = null) {
+  if (!agent && !session && !summary) return null;
+  const sessionId = String(summary?.sessionId || sessionIdOfAgent(agent, session));
   if (!sessionId) return null;
 
-  // 防御性字段提取，任何字段缺失都不会报错
-  const sessionName = session?.label ?? session?.title ?? session?.name ?? null;
-  const projectName = session?.parent?.name ?? session?.project?.name ?? session?.workspace?.path ?? null;
-  const agentName = agent?.name ?? agent?.displayName ?? null;
+  // 运行时 Session 没有 UI 名称；真实标题来自 session.list 的 summary.projections.title。
+  const sessionName = String(
+    summary?.projections?.values?.title || projectionTitle(session) ||
+    session?.title || session?.label || session?.name || "",
+  ).trim();
+  // 真实项目名来自 workspace.list 的 title；cwd 只作最后的真实 basename 降级。
+  const projectName = String(
+    workspace?.title || basenameOf(workspace?.path) || basenameOf(summary?.cwd) ||
+    basenameOf(session?.cwd) || "",
+  ).trim();
+  const agentName = String(agent?.name || agent?.displayName || "DSH").trim() || "DSH";
 
-  // 保留真实的人类可读项目名和会话名；displayLabel 仅用于元数据去重。
   const parts = ["DSH"];
   if (projectName) parts.push(projectName);
   if (sessionName) parts.push(sessionName);
   const displayLabel = parts.join(" · ");
-
   return { sessionId, sessionName, projectName, agentName, displayLabel };
 }
 
-function writeSessionMeta(agent, session) {
-  const meta = extractSessionMeta(agent, session);
+async function refreshSessionMetadata(ctx) {
+  if (metadataRefreshPromise) return metadataRefreshPromise;
+  metadataRefreshPromise = (async () => {
+    try {
+      const api = ctx?.apiProxy;
+      if (!api?.sessions?.list || !api?.workspace?.list) return;
+      const request = () => ({ rpcId: randomUUID(), payload: {} });
+      const [sessionsResponse, workspacesResponse] = await Promise.all([
+        api.sessions.list(request()),
+        api.workspace.list(request()),
+      ]);
+      const sessionItems = sessionsResponse?.result?.ok
+        ? sessionsResponse.result.value?.items || [] : sessionsResponse?.items || [];
+      const workspaceItems = workspacesResponse?.result?.ok
+        ? workspacesResponse.result.value?.items || [] : workspacesResponse?.items || [];
+      const summaries = new Map(sessionItems.map(item => [String(item.sessionId || ""), item]));
+      const workspaces = new Map();
+      for (const workspace of workspaceItems) {
+        for (const id of workspace.sessionIds || []) workspaces.set(String(id), workspace);
+      }
+      for (const [id, agent] of liveAgents) {
+        const summary = summaries.get(String(agent?.session?.id || id));
+        const session = agent?.session;
+        const workspace = workspaces.get(String(summary?.sessionId || id));
+        writeSessionMeta(agent, session, summary, workspace);
+      }
+    } catch (error) {
+      console.warn(`[${PLUGIN_ID}] 获取 session/workspace 元数据失败: ${String(error?.message || error)}`);
+    } finally {
+      metadataRefreshPromise = null;
+    }
+  })();
+  return metadataRefreshPromise;
+}
+
+function scheduleSessionMetadataRefresh(ctx) {
+  if (metadataRefreshTimer) clearTimeout(metadataRefreshTimer);
+  metadataRefreshTimer = setTimeout(() => {
+    metadataRefreshTimer = null;
+    refreshSessionMetadata(ctx);
+  }, 50);
+  if (metadataRefreshTimer.unref) metadataRefreshTimer.unref();
+}
+
+function writeSessionMeta(agent, session, summary = null, workspace = null) {
+  const meta = extractSessionMeta(agent, session, summary, workspace);
   if (!meta) return;
 
   const sid = meta.sessionId;
@@ -996,8 +1063,10 @@ export function apply(ctx) {
         knownSessions.add(String(id));
       }
     }
-    // 输出会话元数据供桌宠显示
+    // 运行时 agent.session 不携带 Web UI 的真实标题/项目名；先写基础记录，
+    // 再通过 DSH 官方 apiProxy 的 session.list/workspace.list 获取真实投影。
     writeSessionMeta(agent, agent.session);
+    scheduleSessionMetadataRefresh(ctx);
     // 注意：创建时不要写 idle——桌宠端本来就默认 idle 态。
     // 实测 dsh 创建 agent 后 4ms 内必发 running，此时若先写一条幻影 idle，
     // 会占住桌宠端 2 秒换帧节流位，把紧跟的真实 working 整个吞掉。
@@ -1077,6 +1146,9 @@ export function apply(ctx) {
       // 只有连续的 llm/retry 才属于同一轮连接异常；切换到任意其他
       // session/event（包括成功结果、工具调用和新的 turn）都开始新一轮统计。
       if (type !== "llm/retry") resetRetryConnection(sessionKeyOf(_session, event));
+      // 标题通常在首条用户消息后异步生成；每个 session/event 都触发一次
+      // 合并刷新，确保生成标题/改名后 Bridge 最终写出真实名称。
+      scheduleSessionMetadataRefresh(ctx);
 
       // 若此 sessionId 尚未见过，尝试补发 session/meta
       if (!sessionMetaCache.has(sessionId) && _session) {

@@ -434,3 +434,158 @@ def test_export_dialogue_template_mentions_agents_separator(qapp, tmp_path):
         assert "persona-phrases/v1" in text
     finally:
         dialog.deleteLater()
+
+
+def test_subfish_settings_save_sets_user_customized(qapp, tmp_path: Path):
+    """批 C：子肥鱼自己的设置界面保存会置位 user_customized=True。"""
+    cfg_root = tmp_path / "appdata"
+    cfg = Config(cfg_root, instance_id="slot-1")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        ok = dialog._write_config()
+        assert ok is True
+    finally:
+        dialog.deleteLater()
+    assert cfg.get("user_customized") is True
+    reloaded = Config(cfg_root, instance_id="slot-1")
+    assert reloaded.get("user_customized") is True
+
+
+def test_main_settings_save_does_not_set_user_customized(qapp, tmp_path: Path):
+    """批 C：主配置（slot 0/主肥鱼）保存不置位 user_customized（保持默认假）。"""
+    cfg_root = tmp_path / "appdata"
+    cfg = Config(cfg_root)
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        ok = dialog._write_config()
+        assert ok is True
+    finally:
+        dialog.deleteLater()
+    assert cfg.get("user_customized") is False
+    reloaded = Config(cfg_root)
+    assert reloaded.get("user_customized") is False
+
+
+def test_position_autosave_does_not_set_user_customized(tmp_path):
+    """批 C：位置自动保存等后台写盘不得置位 user_customized（保留默认假）。"""
+    cfg_root = tmp_path / "appdata"
+    cfg = Config(cfg_root, instance_id="slot-2")
+    # 模拟窗口 _save_position：写位置键 + save()，不经过设置界面。
+    cfg.set("rx", 0.5)
+    cfg.set("ry", 0.5)
+    cfg.set("screen_name", "X")
+    cfg.set("facing", "right")
+    cfg.save()
+    assert cfg.get("user_customized") is False
+    reloaded = Config(cfg_root, instance_id="slot-2")
+    assert reloaded.get("user_customized") is False
+
+
+def test_clear_spawned_pets_button_routes_through_shell_callback(
+        qapp, tmp_path: Path, monkeypatch):
+    """批 E：设置界面「一键清除」优先调 PetWindow 已接线的 on_clear_spawned_pets
+    （= AppShell 路径，自带确认框与进程内子窗前置于关闭）——对话框不再二次确认，
+    也不直接走文件级清理。"""
+    from PySide6.QtWidgets import QMessageBox, QWidget
+
+    import pet.child_pet_cleanup as cleanup_mod
+
+    calls = []
+    parent = QWidget()
+    parent.on_clear_spawned_pets = lambda: calls.append("shell")
+    cfg = Config(tmp_path / "appdata")
+    questions = []
+    cleanup_calls = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *a, **kw: (questions.append(a),
+                          QMessageBox.StandardButton.Cancel)[1])
+    monkeypatch.setattr(
+        cleanup_mod, "clear_spawned_pets",
+        lambda *a, **kw: cleanup_calls.append(a) or
+        {"killed_pids": [], "deleted": []})
+    dialog = ModernSettingsDialog(cfg, parent, include_ai=False)
+    try:
+        dialog.clear_spawned_pets_btn.click()
+        assert calls == ["shell"], "应调用 win.on_clear_spawned_pets 回调"
+        assert questions == [], "走 shell 回调时对话框不应二次确认"
+        assert cleanup_calls == [], "走 shell 回调时不应直接文件级清理"
+    finally:
+        dialog.deleteLater()
+        parent.close()
+        qapp.processEvents()
+
+
+def test_clear_spawned_pets_button_falls_back_without_callback(
+        qapp, tmp_path: Path, monkeypatch):
+    """批 E：拿不到 win.on_clear_spawned_pets（无父窗/旧接线）时回退原有
+    「确认 + 直接文件级清理」路径。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    import pet.child_pet_cleanup as cleanup_mod
+
+    cfg = Config(tmp_path / "appdata")
+    cleaned = []
+    monkeypatch.setattr(
+        cleanup_mod, "clear_spawned_pets",
+        lambda cfg_dir: (cleaned.append(cfg_dir),
+                         {"killed_pids": [1], "deleted": ["a", "b"]})[1])
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *a, **kw: QMessageBox.StandardButton.Yes)
+    infos = []
+    monkeypatch.setattr(
+        QMessageBox, "information", lambda *a, **kw: infos.append(a))
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        dialog._on_clear_spawned_pets()
+        assert cleaned == [cfg.dir]
+        assert infos == [], "批 I：结果弹窗已移除（结果写日志）"
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+
+
+def test_clear_spawned_pets_button_fallback_runs_without_dialogs(
+        qapp, tmp_path: Path, monkeypatch):
+    """批 I：回退路径无确认框无结果框，一键直接静默执行。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    import pet.child_pet_cleanup as cleanup_mod
+
+    cfg = Config(tmp_path / "appdata")
+    cleanup_calls = []
+    monkeypatch.setattr(
+        cleanup_mod, "clear_spawned_pets",
+        lambda *a, **kw: cleanup_calls.append(a) or
+        {"killed_pids": [], "deleted": []})
+    questions = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *a, **kw: (questions.append(1),
+                          QMessageBox.StandardButton.Cancel)[1])
+    infos = []
+    monkeypatch.setattr(
+        QMessageBox, "information", lambda *a, **kw: infos.append(a))
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        dialog._on_clear_spawned_pets()
+        assert questions == [], "批 I：无确认框"
+        assert cleanup_calls != [], "回退路径直接执行清理"
+        assert infos == [], "批 I：无结果框"
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+
+
+def test_clear_spawned_pets_button_disabled_for_child_config(qapp, tmp_path):
+    """批 G：子肥鱼（slot-N）的设置对话框禁用「一键退出」按钮——该操作只对
+    主肥鱼开放（子鱼进程执行会把主鱼当子鱼杀掉）。"""
+    cfg = Config(tmp_path / "appdata", instance_id="slot-1")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        assert not dialog.clear_spawned_pets_btn.isEnabled()
+        assert dialog.clear_spawned_pets_btn.toolTip()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()

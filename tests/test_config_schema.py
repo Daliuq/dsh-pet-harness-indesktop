@@ -59,6 +59,7 @@ RELOAD_WHITELIST_SNAPSHOT = frozenset({
     "self_talk_image_dir", "self_talk_image_scale", "self_talk_max_interval", "self_talk_min_interval",
     "self_talk_texts", "shift_drag", "show_dock_icon", "slingshot_enabled",
     "spawn_inherit_dynamic_island", "spawn_inherit_size", "spawn_scale",
+    "user_customized",
     "stream_capture_mode", "system_notifications_enabled", "throw_strength",
     "experimental_single_process_spawn", "experimental_shared_decode",
     "todo_reminder_enabled", "todo_reminder_lead_minutes",

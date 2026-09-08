@@ -407,7 +407,7 @@ class ModernSettingsDialog(QDialog):
             SettingRow("spawn_inherit_dynamic_island", "生小肥鱼继承灵动岛",
                        "默认关闭：新生成的小肥鱼不打开自己的灵动岛。开启后小肥鱼继承主肥鱼的灵动岛设置。",
                        self.spawn_inherit_dynamic_island_check),
-            SettingRow("clear_spawned_pets", "一键清除子肥鱼",
+            SettingRow("clear_spawned_pets", "一键退出子肥鱼",
                        "关闭所有已生成的小肥鱼，并删除它们的配置、会话与待办数据。",
                        self.clear_spawned_pets_btn),
         ], behavior_content))
@@ -1104,24 +1104,26 @@ class ModernSettingsDialog(QDialog):
         )
 
     def _on_clear_spawned_pets(self) -> None:
-        """一键关闭并清除所有小肥鱼（slot-N）的配置/会话/待办数据。"""
-        answer = QMessageBox.question(
-            self,
-            "清除子肥鱼",
-            "将关闭所有已生成的小肥鱼，并删除它们的配置、会话与待办数据。\n\n此操作不可撤销，确定继续吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        """一键静默退出所有小肥鱼（slot-N）；它们的设置与数据保留。
+
+        优先走 PetWindow 上已接线的 ``on_clear_spawned_pets``（= AppShell 路径，
+        含进程内子窗前置于关闭，单进程模式才清得掉）；拿不到回调时回退为
+        直接文件级退出。批 I：无确认框无结果框（操作不删数据可重新生成，
+        子肥鱼消失即反馈）。
+        """
+        callback = getattr(self.parentWidget(), "on_clear_spawned_pets", None)
+        if callable(callback):
+            callback()
+            return
+        if self.config.instance_id:
+            # 双保险：子肥鱼不开放该操作（按钮已禁用；即便被旧接线调到也不执行，
+            # 否则子鱼进程会把主鱼当子鱼杀掉）。
             return
         from .child_pet_cleanup import clear_spawned_pets
         result = clear_spawned_pets(self.config.dir)
-        QMessageBox.information(
-            self,
-            "清除子肥鱼",
-            f"已关闭 {len(result['killed_pids'])} 个小肥鱼进程，"
-            f"并清除 {len(result['deleted'])} 个 slot 数据项。",
-        )
+        logging.info(
+            "退出子肥鱼：已退出 %d 只，未能退出 %d 只",
+            len(result.get("killed_pids", [])), len(result.get("failed_pids", [])))
 
     def _apply_agent_sound_enabled_now(self, checked: bool) -> None:
         """音效总开关即时生效，不等对话框关闭（合并写回，不动其他 agent_link 键）。"""
@@ -1698,6 +1700,10 @@ class ModernSettingsDialog(QDialog):
             self.config.set("proactive_screen", pro_data)
         self.config.set("autostart_wanted", self.autostart_check.isChecked())
         self.config.set("harness_autostart", self.harness_autostart_check.isChecked())
+        # 批 C：落种占位语义——仅当用户在该子肥鱼自己的设置界面保存过才置真；
+        # 位置自动保存等一切后台写盘不得置位。主配置（slot 0/主肥鱼）保存不置位。
+        if self.config.instance_id:
+            self.config.set("user_customized", True)
         ok = self.config.save()
         if not ok:
             QMessageBox.warning(

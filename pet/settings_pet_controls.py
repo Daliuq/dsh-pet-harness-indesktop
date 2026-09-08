@@ -79,8 +79,12 @@ def build_pet_controls(host) -> None:
     host.spawn_inherit_dynamic_island_check.setChecked(
         bool(host.config.get("spawn_inherit_dynamic_island", False))
     )
-    host.clear_spawned_pets_btn = QPushButton("一键清除…", host)
+    host.clear_spawned_pets_btn = QPushButton("一键退出…", host)
     host.clear_spawned_pets_btn.clicked.connect(host._on_clear_spawned_pets)
+    if host.config.instance_id:
+        # 子肥鱼不能关闭主肥鱼进程，只允许主肥鱼执行退出操作。
+        host.clear_spawned_pets_btn.setEnabled(False)
+        host.clear_spawned_pets_btn.setToolTip("请在主肥鱼的设置里操作")
 
     host.on_top_check = ToggleSwitch(host)
     host.on_top_check.setChecked(bool(host.config.get("on_top", True)))

@@ -43,7 +43,13 @@ PET_DIR = Path(__file__).resolve().parents[1] / "pet"
 # 取消激活中的边缘探头会话，防止宠物斜着出现在右下角；实测 4350）。
 # 2026-09-08 上调到 4352：合入识屏自我识别 pet_name 传递（+4）与死键清理（-2），
 # 实测 4352。window.py 分块拆分仍是待办，拆分前预算只随实测校准。
-WINDOW_PY_LINE_BUDGET = 4352
+# 2026-09-08 上调到 4358：批 D 彩蛋（边缘探头被击飞时飞行中整帧旋转跟随速度方向）——
+# window.py 仅保留薄钩子（_tick_throw_physics 调 throw_egg.update、_stop_physics 调
+# throw_egg.end），控制器实现在 throw_egg.py；实测 4358。
+# 2026-09-08 上调到 4369：批 G——change_scale 子肥鱼置位 user_customized（+4）、
+# showEvent 启动即登记 runtime 标记（+7，含 try 兜底，修「退出子肥鱼」漏清未
+# 拖动过的小肥鱼），实测 4369。
+WINDOW_PY_LINE_BUDGET = 4369
 
 # modern_settings_dialog.py 行数预算：按结构线拆分后实测 1857 行（拆分前 4811 行）。
 # 主对话框 ModernSettingsDialog + 对话框装配/配置写回 + 为 pet/ 与 tests/ 保留的
@@ -54,8 +60,15 @@ WINDOW_PY_LINE_BUDGET = 4352
 # 2026-09-06 上调到 1992：合入上游 main（PR73）带来动画预热开关等 +85 行
 # （实测 1942），预算随实测校准。
 # 2026-09-08 上调到 1996：新增「随桌宠启动 dsh 服务」开关行（+4，实测 1996）。
+# 2026-09-08 上调到 2000：批 C 落种占位语义在保存路径加 user_customized 置位（+4，实测 2000）。
+# 2026-09-08 上调到 2009：批 E 清除子肥鱼走 shell 已接线回调（+9，实测 2009）——
+# _on_clear_spawned_pets 优先调 win.on_clear_spawned_pets（自带确认框与进程内
+# 子窗前置于关闭），拿不到回调时回退原有确认+直接清理；按文件约定校准预算，
+# 不为达标压缩行宽/合并语句。
+# 2026-09-08 上调到 2018：批 G——「退出子肥鱼」按钮对子肥鱼禁用（+5）+
+# _on_clear_spawned_pets 加 instance_id 双保险（+5，含注释折行），实测 2018。
 # 本文件拆分仍是待办，拆分前预算只随实测校准。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 1996
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 2018
 
 
 

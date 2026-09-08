@@ -1513,6 +1513,17 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._dock_reactivate_armed = False
         self.show()
 
+
+    def _restore_dock_icon_preference(self) -> None:
+        """macOS：桌宠恢复显示后按用户偏好还原 Dock 图标策略。"""
+        if sys.platform != 'darwin' or not getattr(self, "_dock_icon_forced", False):
+            return
+        self._dock_icon_forced = False
+        try:
+            from .app import _mac_set_dock_icon_visible
+            _mac_set_dock_icon_visible(bool(self.cfg.get('show_dock_icon', True)))
+        except Exception:
+            pass
     def set_no_move(self, on: bool) -> None:
         """切换「不移动」：禁用自动移动；勾选瞬间若正在移动则立即停下回待机。"""
         self.no_move = bool(on)

@@ -291,9 +291,9 @@ class PetInstance:
     # ------------------------------------------------------------ 窗口构建
     def _create_library(self, character_id: str) -> MovieLibrary:
         # 预热策略：默认 balanced（瞬时交互核 pinned 预热首帧，随机动作池
-        # 按需解码）。省电模式（闲置降帧）与预热解耦——批10 预测式预热 +
-        # 批10-A3 的 8MB 预算接管后，「省电强制 minimal」的耦合已过时
-        # （残留清理：省电模式只保留降帧）。media_prewarm 键保留给高级用户。
+        # 按需解码）。预热开关已并入省电模式：省电开启 = 闲置降帧 + 关闭
+        # 后台预热（此处经 prewarm_enabled 传入，设置保存后由
+        # _sync_animation_prewarm 同步）。media_prewarm 键保留给高级用户。
         prewarm = str(self.config.get("media_prewarm", "balanced") or "balanced")
         # 首帧缓存全局预算（高级用户可在 config.json 调小，省电/低配机用）；
         # 进程级设置，幂等，切角色重复调用无害。
@@ -1003,6 +1003,28 @@ class AppShell:
         self._apply_balance_timer()
         self._sync_todo_service()
         QTimer.singleShot(3500, self.instance._check_autostart_wanted)
+        QTimer.singleShot(4000, self._maybe_autostart_harness)
+
+    def _maybe_autostart_harness(self) -> None:
+        """「随桌宠启动 dsh 服务」：主窗就绪后拉起 dsh web（只起服务，全程静默）。
+
+        机器级语义：仅主窗就绪时调度一次（进程内新窗不重复触发）；本机已有
+        实例（含官方默认 3080）则跳过。静默 = CREATE_NO_WINDOW 隐藏控制台 +
+        launch_harness(open_browser=False) 不开浏览器，无任何弹窗。
+        """
+        if not self.enable_chat or not bool(self.config.get("harness_autostart", False)):
+            return
+
+        def _run() -> None:
+            try:
+                from . import harness_launcher as harness_mod
+                if any(harness_mod.is_running(p) for p in harness_mod._candidate_ports()):
+                    return
+                harness_mod.launch_harness(open_browser=False)
+            except Exception:
+                logging.exception("随桌宠自动拉起 dsh 服务失败")
+
+        threading.Thread(target=_run, daemon=True, name="pet-harness-autostart").start()
 
     # ------------------------------------------------------------ 退出收口
     def _on_about_to_quit(self) -> None:
@@ -1859,10 +1881,6 @@ def main(argv: list[str] | None = None, enable_chat: bool = True) -> int:
     _configure_linux_fcitx_input_method()
     argv = list(argv if argv is not None else sys.argv)
     preferred_slot = None
-
-    if "--instance" in argv:
-        logging.error("参数 --instance 已弃用并移除，多开实例请改用 --slot <0-127>")
-        return 1
 
     if "--slot" in argv:
         index = argv.index("--slot")

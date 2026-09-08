@@ -41,7 +41,9 @@ PET_DIR = Path(__file__).resolve().parents[1] / "pet"
 # 预算上调到 4340（+7 余量，理由见本注释）。
 # 2026-09-07 上调到 4350（探头/回旋第四批微调：go_default_corner 在回到右下角前
 # 取消激活中的边缘探头会话，防止宠物斜着出现在右下角；实测 4350）。
-WINDOW_PY_LINE_BUDGET = 4350
+# 2026-09-08 上调到 4352：合入识屏自我识别 pet_name 传递（+4）与死键清理（-2），
+# 实测 4352。window.py 分块拆分仍是待办，拆分前预算只随实测校准。
+WINDOW_PY_LINE_BUDGET = 4352
 
 # modern_settings_dialog.py 行数预算：按结构线拆分后实测 1857 行（拆分前 4811 行）。
 # 主对话框 ModernSettingsDialog + 对话框装配/配置写回 + 为 pet/ 与 tests/ 保留的
@@ -51,7 +53,9 @@ WINDOW_PY_LINE_BUDGET = 4350
 # 2026-09-05 建立（perf/memory-footprint 拆分批）。
 # 2026-09-06 上调到 1992：合入上游 main（PR73）带来动画预热开关等 +85 行
 # （实测 1942），预算随实测校准。
-MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 1992
+# 2026-09-08 上调到 1996：新增「随桌宠启动 dsh 服务」开关行（+4，实测 1996）。
+# 本文件拆分仍是待办，拆分前预算只随实测校准。
+MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET = 1996
 
 
 def _read(name: str) -> str:
@@ -86,12 +90,24 @@ def test_window_private_surface_frozen():
     assert not offenders, "window 私有面回潮：\n" + "\n".join(offenders)
 
 
+# —— 行数预算的意图与使用约定（给所有贡献者，含 AI 驱动）——
+# 为什么有预算：window.py / modern_settings_dialog.py 这类文件膨胀到几千行后，
+# 人和 AI 都难读难改、定位问题成本高、合并冲突频发。预算只是倒逼拆分的
+# 「绊线」，本身不是目的，更不是红线。触发时的正确动作按优先级：
+#   1. 首选：把新内容拆到独立模块/控制器（window.py 见 docs/WINDOW_PY_SPLIT_GUIDE.md）；
+#   2. 实在拆不动或强拆更伤可读性时：把预算常量校准到新实测值，注明日期+理由，
+#      并在 PR 里说明（超一点没关系，说清楚就行）。
+# 禁止的反向优化：靠压缩行宽/合并语句/删注释把行数硬塞回预算内——
+# 那比超预算本身更伤维护性。宁可校准预算，不要压行。
+
 def test_window_py_line_budget():
     lines = len(_read("window.py").splitlines())
     assert lines <= WINDOW_PY_LINE_BUDGET, (
         f"window.py 涨到 {lines} 行（预算 {WINDOW_PY_LINE_BUDGET}）。"
-        "新功能请先拆对应控制器（docs/WINDOW_PY_SPLIT_GUIDE.md），"
-        "确需上调预算时在 PR 说明理由。"
+        "预算是防膨胀的绊线（文件太大则难读难改、合并冲突多、问题定位难），"
+        "不是红线：新功能优先拆对应控制器（docs/WINDOW_PY_SPLIT_GUIDE.md）；"
+        "拆不动可把预算校准到新实测值（带日期注释）并在 PR 说明理由。"
+        "请勿为达标压缩行宽/合并语句——那是反向优化。"
     )
 
 
@@ -99,7 +115,10 @@ def test_modern_settings_dialog_py_line_budget():
     lines = len(_read("modern_settings_dialog.py").splitlines())
     assert lines <= MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET, (
         f"modern_settings_dialog.py 涨到 {lines} 行（预算 {MODERN_SETTINGS_DIALOG_PY_LINE_BUDGET}）。"
-        "控件库/菜单布局编辑器/AI 设置页/主题 QSS 已拆出；确需上调预算时在 PR 说明理由。"
+        "预算是防膨胀的绊线（文件太大则难读难改、合并冲突多、问题定位难），"
+        "不是红线：新页面/新控件组优先拆出（控件库/布局编辑器/AI 设置页/"
+        "主题 QSS 已是先例）；拆不动可校准预算到新实测值（带日期注释）并说明理由。"
+        "请勿为达标压缩行宽/合并语句。"
     )
 
 

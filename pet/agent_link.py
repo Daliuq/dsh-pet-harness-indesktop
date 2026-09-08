@@ -363,18 +363,12 @@ class DirGlobTailer:
         self._tailers.clear()
 
     def _scan(self, now: float) -> None:
-        # Directory metadata changes on create/delete/rename.  Existing files
-        # remain cheap to tail on every poll; their ByteOffsetTailer owns the
-        # current byte offset, so appends do not need a directory rescan.
-        try:
-            directory_mtime = self.directory.stat().st_mtime_ns if self.directory.is_dir() else None
-        except OSError:
-            directory_mtime = None
-        directory_changed = directory_mtime != self._last_directory_mtime_ns
-        if not directory_changed and now - self._last_scan < self.scan_interval:
-            return
+        # 始终 glob 目录以可靠发现新文件。st_mtime_ns 在部分文件系统（尤其 CI）
+        # 上分辨率粗或有缓存，不能作为「文件增删」的唯一检测信号——用它做早退会
+        # 导致 create 后立即 read 漏掉新文件（test_discovers_new_files_during_scan
+        # _throttle_and_keeps_offsets 的稳定失败）。glob 便宜（dsh*.jsonl，
+        # max_files 封顶），无需节流。
         self._last_scan = now
-        self._last_directory_mtime_ns = directory_mtime
         try:
             if not self.directory.is_dir():
                 return

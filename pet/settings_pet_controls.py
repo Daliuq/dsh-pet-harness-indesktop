@@ -293,22 +293,8 @@ def build_pet_controls(host) -> None:
     host.click_talk_bindings_btn.setObjectName("clickTalkBindingsButton")
     host.click_talk_bindings_btn.clicked.connect(host._open_click_talk_bindings)
 
-    # Agent 联动：每个 Agent 的自定义 thinking 气泡文案
+    # Agent 联动：agent_link 配置（思考文案编辑已移除；后续音效/专属层共用此引用）
     agent_link_cfg = host.config.get("agent_link", {})
-    thinking_texts = agent_link_cfg.get("thinking_texts") or {}
-    # 兼容旧的全局 thinking_text 字段
-    legacy_text = str(agent_link_cfg.get("thinking_text", "") or "")
-    host.thinking_text_edits: dict[str, QLineEdit] = {}
-    for agent_key, agent_name in AgentLinkManager.AGENT_NAMES.items():
-        edit = QLineEdit(host)
-        default = AgentLinkManager._THINKING_DEFAULTS.get(agent_key, f"{agent_name} 正在深度烧烤……")
-        edit.setPlaceholderText(default)
-        text = str(thinking_texts.get(agent_key, "") or "")
-        if not text and legacy_text:
-            text = legacy_text
-        edit.setText(text)
-        edit.setClearButtonEnabled(True)
-        host.thinking_text_edits[agent_key] = edit
 
     host.dialogue_mode_select = ModernSelect(host, width=190)
     for label, value in (("默认模式", "legacy"), ("鲸鱼娘女仆模式", "whale_maid"), ("自定义台词", "custom")):
@@ -506,46 +492,48 @@ def build_pet_controls(host) -> None:
         str(image_dir.resolve()), directory=True, image_preview=True, parent=host,
     )
 
-    # 灵动岛
-    island_cfg = host.config.get("dynamic_island", {})
-    if not isinstance(island_cfg, dict):
-        island_cfg = {}
-    host.island_enabled_check = ToggleSwitch(host)
-    host.island_enabled_check.setChecked(bool(island_cfg.get("enabled", False)))
-    host.island_icon_check = ToggleSwitch(host)
-    host.island_icon_check.setChecked(bool(island_cfg.get("show_icon", True)))
-    host.island_name_check = ToggleSwitch(host)
-    host.island_name_check.setChecked(bool(island_cfg.get("show_name", True)))
-    host.island_info_check = ToggleSwitch(host)
-    host.island_info_check.setChecked(bool(island_cfg.get("show_info", True)))
-    host.island_status_check = ToggleSwitch(host)
-    host.island_status_check.setChecked(bool(island_cfg.get("show_status", True)))
-    host.island_info_mode_select = ModernSelect(host, width=160)
-    for label, value in (
-        ("当前时间", "time"),
-        ("余额峰谷", "balance_tier"),
-        ("余额数值", "balance"),
-        ("自定义短文本", "custom"),
-    ):
-        host.island_info_mode_select.addItem(label, value)
-    host.island_info_mode_select.setCurrentData(str(island_cfg.get("info_mode") or "time"))
-    host.island_style_select = ModernSelect(host, width=160)
-    for label, value in (
-        ("黑色", "dark"),
-        ("白色", "light"),
-        ("玻璃质感", "glass"),
-    ):
-        host.island_style_select.addItem(label, value)
-    host.island_style_select.setCurrentData(str(island_cfg.get("style") or "dark"))
-    host.island_icon_select = ModernSelect(host, width=160)
-    for emoji in ("🐳", "🐟", "🐙", "🦭", "🐧", "🐱", "🐶", "🌟", "⚡", "❤️"):
-        host.island_icon_select.addItem(emoji, emoji)
-    host.island_icon_select.setCurrentData(str(island_cfg.get("icon") or "🐳"))
-    host.island_custom_text_edit = _line_edit(str(island_cfg.get("custom_text") or ""), width=220)
-
 # ------------------------------------------------------------ 主动识屏
     if sys.platform == "win32" and host.include_ai:
         host._build_proactive_controls()
+
+
+# ------------------------------------------------------------ 灵动岛联动控制器
+
+
+def _update_island_controls(host, enabled: bool) -> None:
+    host._set_setting_rows_visible((
+        "dynamic_island_icon", "dynamic_island_name", "dynamic_island_info",
+        "dynamic_island_status", "dynamic_island_info_mode",
+        "dynamic_island_style", "dynamic_island_icon_value",
+        "dynamic_island_custom_text",
+    ), enabled, dependency="island_enabled")
+    _update_island_icon_controls(host, host.island_icon_check.isChecked())
+    _update_island_info_controls(host, host.island_info_check.isChecked())
+
+
+def _update_island_icon_controls(host, enabled: bool) -> None:
+    host._set_setting_rows_visible(
+        ("dynamic_island_icon_value",),
+        enabled,
+        dependency="island_show_icon",
+    )
+
+
+def _update_island_info_controls(host, enabled: bool) -> None:
+    host._set_setting_rows_visible(
+        ("dynamic_island_info_mode", "dynamic_island_custom_text"),
+        enabled,
+        dependency="island_show_info",
+    )
+    _update_island_custom_text(host)
+
+
+def _update_island_custom_text(host, _index: int | None = None) -> None:
+    host._set_setting_rows_visible(
+        ("dynamic_island_custom_text",),
+        host.island_info_mode_select.currentData() == "custom",
+        dependency="island_info_mode",
+    )
 
 
 # ------------------------------------------------------------ 台词模板控制器

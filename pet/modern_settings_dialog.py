@@ -60,7 +60,6 @@ from PySide6.QtWidgets import (
 
 from . import autostart as autostart_mod
 from . import catalog
-from .agent_link import AgentLinkManager
 from .click_sound import warm_click_sound_effects
 from .config import (
     DEFAULT_CONTEXT_MENU_APPEARANCE,
@@ -269,6 +268,44 @@ class ModernSettingsDialog(QDialog):
         if self.config.instance_id:
             self.harness_autostart_check.setEnabled(False)
             self.harness_autostart_check.setToolTip("仅主桌宠可设置")
+
+        # 灵动岛控件构建保留在对话框本体，便于上游直接修改后上传。
+        island_cfg = self.config.get("dynamic_island", {})
+        if not isinstance(island_cfg, dict):
+            island_cfg = {}
+        self.island_enabled_check = ToggleSwitch(self)
+        self.island_enabled_check.setChecked(bool(island_cfg.get("enabled", False)))
+        self.island_icon_check = ToggleSwitch(self)
+        self.island_icon_check.setChecked(bool(island_cfg.get("show_icon", True)))
+        self.island_name_check = ToggleSwitch(self)
+        self.island_name_check.setChecked(bool(island_cfg.get("show_name", True)))
+        self.island_info_check = ToggleSwitch(self)
+        self.island_info_check.setChecked(bool(island_cfg.get("show_info", True)))
+        self.island_status_check = ToggleSwitch(self)
+        self.island_status_check.setChecked(bool(island_cfg.get("show_status", True)))
+        self.island_info_mode_select = ModernSelect(self, width=160)
+        for label, value in (
+            ("当前时间", "time"),
+            ("余额峰谷", "balance_tier"),
+            ("余额数值", "balance"),
+            ("自定义短文本", "custom"),
+        ):
+            self.island_info_mode_select.addItem(label, value)
+        self.island_info_mode_select.setCurrentData(str(island_cfg.get("info_mode") or "time"))
+        self.island_style_select = ModernSelect(self, width=160)
+        for label, value in (
+            ("黑色", "dark"),
+            ("白色", "light"),
+            ("玻璃质感", "glass"),
+        ):
+            self.island_style_select.addItem(label, value)
+        self.island_style_select.setCurrentData(str(island_cfg.get("style") or "dark"))
+        self.island_icon_select = ModernSelect(self, width=160)
+        for emoji in ("🐳", "🐟", "🐙", "🦭", "🐧", "🐱", "🐶", "🌟", "⚡", "❤️"):
+            self.island_icon_select.addItem(emoji, emoji)
+        self.island_icon_select.setCurrentData(str(island_cfg.get("icon") or "🐳"))
+        self.island_custom_text_edit = _line_edit(str(island_cfg.get("custom_text") or ""), width=220)
+
         if include_ai:
             # 延迟 import：no-chat 打包变体 excludes=['pet.chat']，顶层导入会在
             # 产物运行时抛 ModuleNotFoundError，导致设置界面整体打不开。
@@ -417,18 +454,6 @@ class ModernSettingsDialog(QDialog):
             SettingRow("self_talk_image_scale", "配图大小", "气泡里配图的显示尺寸（100% 为默认）。", self.self_talk_image_scale_spin),
             SettingRow("click_talk_bindings", "点击动画台词绑定", "为每个点击动画设置专属自言自语台词。", self.click_talk_bindings_btn),
         ], behavior_content))
-        # Agent 联动：每个 Agent 一行自定义思考文案
-        agent_thinking_rows = []
-        for agent_key, edit in self.thinking_text_edits.items():
-            agent_name = AgentLinkManager.AGENT_NAMES.get(agent_key, agent_key)
-            default = AgentLinkManager._THINKING_DEFAULTS.get(agent_key, f"{agent_name} 正在深度烧烤……")
-            agent_thinking_rows.append(
-                SettingRow(f"agent_thinking_{agent_key}", f"{agent_name} 思考文案",
-                           f"默认：{default}；支持 {{name}} 占位符；留空用默认。",
-                           edit, stacked=True)
-            )
-        behavior_layout.addWidget(SettingsSection("Agent 联动 · 思考气泡文案", agent_thinking_rows, behavior_content))
-
         # Agent 联动：音效设置
         agent_sound_rows = [
             SettingRow("agent_sound_enabled", "Agent 音效联动", "当 Agent 开始工作、任务完成或发生错误时播放提示音。", self.agent_sound_check),
@@ -857,36 +882,16 @@ class ModernSettingsDialog(QDialog):
         self._set_setting_rows_visible(keys, enabled)
 
     def _update_island_controls(self, enabled: bool) -> None:
-        self._set_setting_rows_visible((
-            "dynamic_island_icon", "dynamic_island_name", "dynamic_island_info",
-            "dynamic_island_status", "dynamic_island_info_mode",
-            "dynamic_island_style", "dynamic_island_icon_value",
-            "dynamic_island_custom_text",
-        ), enabled, dependency="island_enabled")
-        self._update_island_icon_controls(self.island_icon_check.isChecked())
-        self._update_island_info_controls(self.island_info_check.isChecked())
+        settings_pet_controls._update_island_controls(self, enabled)
 
     def _update_island_icon_controls(self, enabled: bool) -> None:
-        self._set_setting_rows_visible(
-            ("dynamic_island_icon_value",),
-            enabled,
-            dependency="island_show_icon",
-        )
+        settings_pet_controls._update_island_icon_controls(self, enabled)
 
     def _update_island_info_controls(self, enabled: bool) -> None:
-        self._set_setting_rows_visible(
-            ("dynamic_island_info_mode", "dynamic_island_custom_text"),
-            enabled,
-            dependency="island_show_info",
-        )
-        self._update_island_custom_text()
+        settings_pet_controls._update_island_info_controls(self, enabled)
 
     def _update_island_custom_text(self, _index: int | None = None) -> None:
-        self._set_setting_rows_visible(
-            ("dynamic_island_custom_text",),
-            self.island_info_mode_select.currentData() == "custom",
-            dependency="island_info_mode",
-        )
+        settings_pet_controls._update_island_custom_text(self, _index)
 
     def _update_egg_controls(self, enabled: bool) -> None:
         self._set_setting_rows_visible(
@@ -1328,7 +1333,6 @@ class ModernSettingsDialog(QDialog):
         claimed.update(watchdog_rows)
         automation = page_content([
             ("Agent 联动文案风格", claim_prefix("dialogue_")),
-            ("Agent 文案", claim_prefix("agent_thinking_")),
             ("Agent 提示音", claim_prefix("agent_sound_")),
             ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
             ("主动感知", proactive_rows),
@@ -1614,14 +1618,7 @@ class ModernSettingsDialog(QDialog):
             self.config.set("dialogue_phrases", {"global": new_global, "agents": agents_delta})
         else:
             self.config.set("dialogue_phrases", new_global)
-        # Agent 联动：自定义 thinking 文案（合并写回，不覆盖 agent_link 其他开关）
         agent_cfg = dict(self.config.get("agent_link", {}))
-        agent_cfg["thinking_texts"] = {
-            key: edit.text().strip()
-            for key, edit in self.thinking_text_edits.items()
-            if edit.text().strip()
-        }
-        agent_cfg.pop("thinking_text", None)  # 旧的全局字段已迁移到 thinking_texts
         # 循环检测设置页（合并写回，不覆盖 agent_link 其他字段）
         if self.watchdog_page is not None:
             agent_cfg = self.watchdog_page.apply_to_config(agent_cfg)

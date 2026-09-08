@@ -155,5 +155,9 @@ exact breakpoint there; see `docs/agents/handoff.md`.
   context-menu structure, styling, interaction, or platform behavior.
 - Read `docs/SETTINGS-CHANGE-GATES.md` before adding, moving, removing, or
   changing a persistent setting or its settings-page interaction.
+- Read `docs/PERSONA-PHRASES-PRESET-STORAGE-2026-09-08.md` before changing
+  dialogue preset files (`pet/persona_presets/*.json`), phrase loading
+  (`persona_phrases.py`), or expression-style semantics
+  (`dialogue_mode`/`dialogue_phrases`).
 - Treat `assets/characters/<id>/videos/` plus its manifest as one character
   package; preserve relative paths and case because packaged platforms differ.

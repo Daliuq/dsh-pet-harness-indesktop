@@ -622,10 +622,23 @@ class PetSpeechBubble(QFrame):
                 )
                 self._button_layout.addWidget(hint)
                 continue
-            btn = QPushButton(str(label), self._button_row)
+            button_text = str(label)
+            btn = QPushButton(button_text, self._button_row)
             btn.setObjectName("pet-speech-button")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            # 选择/审批选项来自 Agent，单个选项可能远长于气泡的文本列。
+            # QPushButton 不会像 QLabel 一样自动换行，若直接使用 sizeHint，
+            # FlowLayout 会把整颗气泡撑宽，最终文字仍可能绘制到气泡外。
+            # 限制按钮宽度并在按钮内做省略，完整选项保留在 tooltip 中。
+            button_width = 220
+            btn.setMaximumWidth(button_width)
+            metrics = QFontMetrics(btn.font())
+            available_width = button_width - 24 - 2
+            btn.setText(metrics.elidedText(
+                button_text, Qt.TextElideMode.ElideRight, available_width
+            ))
+            btn.setToolTip(button_text)
+            btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
             btn.setStyleSheet(
                 "QPushButton {"
                 " background:#ffffff; border:1px solid #c9d4e0; border-radius:11px;"

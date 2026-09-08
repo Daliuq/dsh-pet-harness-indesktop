@@ -242,3 +242,25 @@ def test_flow_layout_has_height_for_width():
     assert layout.hasHeightForWidth() is True
     assert layout.heightForWidth(120) >= 0
 
+
+def test_interactive_long_option_stays_inside_bubble():
+    """选择/审批里的超长选项不能把按钮文字绘制到气泡外。"""
+    _get_app()
+    bubble = PetSpeechBubble()
+    bubble.show_text(
+        "请选择：",
+        QRect(0, 0, 120, 120),
+        3200,
+        sticky=True,
+        buttons=[("这是一个非常非常长的选择项文本，不能超出气泡边界", lambda: None)],
+    )
+    button = bubble._interactive_buttons[0]
+    # 交互气泡的内容列最大宽度为 248，按钮还需留出两侧内边距。
+    assert button.width() <= 220
+    row = bubble._button_row
+    # button 的坐标相对于按钮行；按钮行本身由气泡内容边距约束。
+    assert row.geometry().left() >= 13
+    assert row.geometry().right() <= bubble.width() - 13
+    assert button.geometry().left() >= 0
+    assert button.geometry().right() <= row.width()
+

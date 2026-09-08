@@ -16,7 +16,7 @@ import sys
 from dataclasses import asdict
 from typing import Any, cast
 
-from PySide6.QtCore import QCoreApplication, QEvent, QMetaObject, QObject, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QMetaObject, QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtNetwork import QAbstractSocket, QLocalServer, QLocalSocket
 
 from . import collision
@@ -1087,14 +1087,6 @@ class _CollisionWorker(QObject):
         self._timers.clear()
         slot_manager.release_file_lock(self._coordinator_lock)
         self._coordinator_lock = None
-        # 关闭顺序最后一步：先排空本线程 DeferredDelete，再 quit 线程。
-        # 否则上面的 QLocalServer/QLocalSocket/QTimer deleteLater 事件会随线程
-        # 退出被丢弃，成为孤儿原生对象（Linux 段错误崩溃点漂移的根因之一）。
-        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        # worker 在本线程同步销毁：deleteLater 后由事件循环在 quit timer 之前
-        # 处理（posted 事件优先于 timer），避免 finished 后跨线程 deleteLater
-        # 投递到已退出的线程永不执行。
-        self.deleteLater()
         QTimer.singleShot(0, self.thread().quit)
 
 
@@ -1140,9 +1132,7 @@ class CollisionIpcSession(QObject):
                                         getattr(config, "instance_id", ""), policy,
                                         lock_path=config.dir / "collision-coordinator.lock")
         self._worker.moveToThread(self._thread)
-        # worker 的销毁不再挂在 finished→deleteLater：该 deleteLater 会投递到
-        # 已退出的线程、永不执行，形成孤儿原生对象。改由 _CollisionWorker.stop()
-        # 末尾在本线程内 deleteLater 并排空 DeferredDelete 完成同步销毁。
+        self._thread.finished.connect(self._worker.deleteLater)
         self._thread.started.connect(self._worker.start)
         self._worker.impulse_ready.connect(self.impulse_ready, Qt.ConnectionType.QueuedConnection)
         self._worker.snapshot_ready.connect(self.snapshot_ready, Qt.ConnectionType.QueuedConnection)

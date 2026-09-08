@@ -6,11 +6,14 @@ existing callers and test patches keep working unchanged.
 
 from __future__ import annotations
 
+import json
 import sys
 
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -32,7 +35,8 @@ from .config import (
 )
 from .context_menus.icons import vector_widget_icon
 from .fun_image_popup import oijingjing_image_path, resolve_fun_asset
-from .persona_phrases import phrase_keys
+from .persona_phrases import default_phrases, phrase_keys
+from .persona_template import build_persona_template
 from .settings_widgets import (
     AUDIO_NAME_FILTER,
     BrowserDoubleSpinBox,
@@ -152,12 +156,6 @@ def build_pet_controls(host) -> None:
     if host.config.instance_id:
         host.autostart_check.setEnabled(False)
         host.autostart_check.setToolTip("仅主桌宠可设置")
-    host.harness_autostart_check = ToggleSwitch(host)
-    host._harness_autostart_initial = bool(host.config.get("harness_autostart", False))
-    host.harness_autostart_check.setChecked(host._harness_autostart_initial)
-    if host.config.instance_id:
-        host.harness_autostart_check.setEnabled(False)
-        host.harness_autostart_check.setToolTip("仅主桌宠可设置")
     host.dock_icon_check = None
     if sys.platform == "darwin":
         host.dock_icon_check = ToggleSwitch(host)
@@ -548,3 +546,150 @@ def build_pet_controls(host) -> None:
 # ------------------------------------------------------------ 主动识屏
     if sys.platform == "win32" and host.include_ai:
         host._build_proactive_controls()
+
+
+# ------------------------------------------------------------ 台词模板控制器
+# 从 ModernSettingsDialog 外迁（host-based）：逻辑以 host 为参数驻留本模块，
+# 对话框保留同名薄委托方法，兼容既有调用与测试 patch（tests 直接调
+# dialog._import_dialogue_template_json / _current_dialogue_template 等）。
+
+
+def _dialogue_flush_scope(host, scope: str | None = None) -> None:
+    """把当前编辑区的文本快照写回 scope buffer（切换/保存前调用）。
+
+    scope 缺省取内部追踪的当前层（host._dialogue_scope），而不是
+    select.currentData()——切换信号触发时下拉已是新值，用它 flush 会把
+    编辑内容误写进目标层。
+    """
+    if not hasattr(host, "dialogue_scope_select") or not hasattr(host, "dialogue_phrase_edits"):
+        return
+    scope = host._dialogue_scope if scope is None else scope
+    host._dialogue_scope_buffer[str(scope)] = {
+        key: edit.toPlainText() for key, edit in host.dialogue_phrase_edits.items()
+    }
+
+
+def _on_dialogue_scope_changed(host, index: int) -> None:
+    """切换 global/某 Agent 专属文案编辑层：flush 当前层后载入目标层内容。"""
+    if not hasattr(host, "dialogue_scope_select"):
+        return
+    _dialogue_flush_scope(host)
+    target = str(host.dialogue_scope_select.currentData() or "")
+    host._dialogue_scope = target
+    buf = host._dialogue_scope_buffer.get(target) or {}
+    for key, edit in host.dialogue_phrase_edits.items():
+        edit.setPlainText(str(buf.get(key, "") or ""))
+
+
+def _dialogue_scope_values(host, scope: str) -> dict[str, list[str]]:
+    """scope buffer 某层的非空事件 → list[str]（供保存/导出）。"""
+    buf = host._dialogue_scope_buffer.get(scope) or {}
+    return {
+        key: [line.strip() for line in str(text).splitlines() if line.strip()]
+        for key, text in buf.items()
+        if str(text or "").strip()
+    }
+
+
+def _dialogue_phrase_values(host) -> dict[str, list[str]]:
+    return _dialogue_scope_values(host, "")
+
+
+def _current_dialogue_template(host) -> dict:
+    # 导出 = 纯字段参考模板：phrases 一律留空（不携带当前已配置的台词），
+    # 供 AI 依角色卡从零撰写；当前台词如需备份请直接复制编辑框内容。
+    return build_persona_template({
+        "dialogue_mode": host.dialogue_mode_select.currentData() or "legacy",
+        "dialogue_phrases": {},
+    })
+
+
+def _export_dialogue_template(host) -> None:
+    """Export the complete current template to the clipboard (no file dialog)."""
+    try:
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            raise RuntimeError("系统剪贴板不可用")
+        clipboard.setText(json.dumps(_current_dialogue_template(host), ensure_ascii=False, indent=2) + "\n")
+    except Exception as exc:
+        QMessageBox.warning(host, "导出失败", f"无法写入系统剪贴板：{exc}")
+        return
+    QMessageBox.information(
+        host, "导出成功",
+        "模板已复制到剪贴板：可直接粘贴给 AI 依角色卡改写，"
+        "或粘贴回「导入模板」输入框一键导回。",
+    )
+
+
+def _import_dialogue_template(host) -> None:
+    """导入默认台词模板：将所有预设台词填充到自定义编辑框。"""
+    defaults = default_phrases()
+    for key, edit in host.dialogue_phrase_edits.items():
+        if key in defaults:
+            edit.setPlainText(defaults[key])
+    QMessageBox.information(host, "导入成功", "已导入全部默认台词模板。")
+
+
+def _import_dialogue_template_json(host) -> None:
+    """Import a complete persona template from the inline JSON editor."""
+    raw = host.dialogue_template_import_edit.toPlainText().strip()
+    if not raw:
+        QMessageBox.warning(host, "导入失败", "请先粘贴 JSON 模板。")
+        return
+    try:
+        document = json.loads(raw)
+        if not isinstance(document, dict):
+            raise ValueError("模板根节点必须是 JSON 对象")
+        template_name = str(document.get("template", "") or "")
+        if template_name and not template_name.startswith("persona-phrases/"):
+            raise ValueError("不是兼容的 persona-phrases 模板")
+        phrases = document.get("phrases")
+        if not isinstance(phrases, dict):
+            phrases = document.get("dialogue_phrases")
+        if not isinstance(phrases, dict):
+            raise ValueError("模板缺少 phrases 对象")
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        QMessageBox.warning(host, "导入失败", f"JSON 模板无效：{exc}")
+        return
+    for key, edit in host.dialogue_phrase_edits.items():
+        value = phrases.get(key, "")
+        if isinstance(value, list):
+            edit.setPlainText("\n".join(str(item) for item in value if isinstance(item, str)))
+        elif value is not None:
+            edit.setPlainText(str(value))
+    # entries[].phrases 兜底：顶层 phrases 缺失/为空的 key 用 entries 补齐
+    #（顶层有内容时以顶层为准，不被 entries 覆盖）。
+    entries = document.get("entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            edit = host.dialogue_phrase_edits.get(str(entry.get("key") or "").strip())
+            if edit is None:
+                continue
+            current = phrases.get(entry["key"])
+            has_top = (
+                (isinstance(current, list) and any(isinstance(i, str) and i.strip() for i in current))
+                or (isinstance(current, str) and current.strip())
+            )
+            if has_top or edit.toPlainText().strip():
+                continue
+            value = entry.get("phrases")
+            if isinstance(value, list):
+                text = "\n".join(str(item) for item in value if isinstance(item, str) and item.strip())
+                if text:
+                    edit.setPlainText(text)
+    host.dialogue_mode_select.setCurrentData("custom")
+    # agents delta（整体导入）：写入 scope buffer，供切换专属层编辑
+    _dialogue_flush_scope(host)
+    raw_agents = document.get("agents")
+    if isinstance(raw_agents, dict):
+        for agent_key, agent_events in raw_agents.items():
+            if not isinstance(agent_events, dict):
+                continue
+            host._dialogue_scope_buffer[str(agent_key)] = {
+                str(k): ("\n".join(str(i) for i in v) if isinstance(v, list) else str(v or ""))
+                for k, v in agent_events.items()
+            }
+    host.dialogue_template_import_edit.clear()
+    QMessageBox.information(host, "导入成功", "已导入全部弹窗内容模板；点击“保存并退出”后生效。")

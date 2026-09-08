@@ -11,28 +11,28 @@
   ],
   "activity.read": [
     "主人，{name}正在读取{label}，人家也帮您瞄两眼～",
-    "哼，{tool}翻资料还挺认真嘛，人家才没有偷偷夸它。",
-    "{name}正在{projectName}里查看内容，主人先歇会儿，人家替您盯着～"
+    "哼，{tool}正在处理{argsKey}，第{step}步还挺认真嘛。",
+    "{name}正在{projectName}里的{sessionName}继续读取，调用号是{callId}，人家替您盯着～"
   ],
   "activity.search": [
     "主人，{name}正在搜索{label}，人家也下去帮忙捞线索啦～",
-    "哼，{tool}还在信息海里翻呢，希望它别游太远。",
-    "{name}正在{projectName}里继续搜索，主人稍等一下哦～"
+    "哼，{tool}正在查{argsKey}，希望别在信息海里游太远。",
+    "{name}正在{projectName}里的{sessionName}继续搜索，第{step}步啦～"
   ],
   "activity.edit": [
     "主人，{name}正在编辑{label}，人家帮您看着别让它乱改～",
-    "哼，{tool}还在修改呢，最好一次改对，人家可不喜欢返工。",
-    "{name}已经做到第{step}步啦，主人稍等一下哦～"
+    "哼，{tool}正在处理{argsKey}，已经做到第{step}步啦。",
+    "{name}正在{projectName}里的{sessionName}继续修改，调用号{callId}人家也记着呢～"
   ],
   "activity.run": [
     "主人，{name}正在运行{label}，结果很快就会出来～",
-    "哼，{tool}已经跑起来了，最好一次通过哦。",
-    "{name}正在{projectName}里执行任务，人家替主人等结果～"
+    "哼，{tool}已经跑起来了，第{step}步最好一次通过哦。",
+    "{name}正在{projectName}里的{sessionName}执行任务，调用号是{callId}～"
   ],
   "activity.default": [
     "主人，{name}正在处理{label}，人家替您守着～",
-    "嗯…{tool}还在继续干活啦，尾鳍有点酸，但人家可没有偷懒。",
-    "{name}正在{projectName}里忙活，主人不用一直盯着，有人家呢～"
+    "嗯…{tool}正在处理{argsKey}，尾鳍有点酸，但人家可没有偷懒。",
+    "{name}正在{projectName}里的{sessionName}继续忙活，第{step}步啦～"
   ],
   "agent.attention": [
     "主人～{name}停下来等您啦，这一步要您亲自决定哦。",
@@ -55,14 +55,14 @@
     "{name}的通道正在连接，很快就可以用了～"
   ],
   "bridge.install.success": [
-    "桥接好啦～{name}现在已经在我的感知范围里啦。",
+    "桥接好啦～{name}现在已经在人家的感知范围里啦。",
     "哼，总算接通了，{name}以后可要乖乖替主人干活哦。",
     "{name}连接成功～人家这次做得很漂亮吧？不许说我胖！"
   ],
   "bridge.install.failed": [
     "呜～{name}的桥没装好：{detail}，主人帮忙看看嘛。",
     "安装出问题啦：{detail}。哼，这种小麻烦居然还敢拦主人。",
-    "{name}暂时还没连上，问题是：{detail}。"
+    "{name}暂时还没连上，问题是：{detail}，人家先替您守着～"
   ],
   "bridge.uninstall.failed": [
     "{name}的桥没卸干净呢，主人您手动检查一下嘛。",
@@ -72,37 +72,37 @@
   "dsh.writeback.failed": [
     "呜呜，消息没送回DSH，主人去界面处理一下吧～",
     "回传信号掉进海里啦……哼，这次真的不是人家偷懒。",
-    "DSH那边没有成功收到消息，主人去看看嘛～"
+    "DSH那边没有成功收到消息，主人去看看嘛，人家先守在这里～"
   ],
   "approval.command": [
     "主人～{name}想执行命令：{command}，得您点头才行哦。",
-    "{name}正在等您的批准：{command}，主人说可以才能继续。",
-    "命令已经准备好啦：{command}。人家听主人的，您来决定～"
+    "{name}正在{projectName}里的{sessionName}等您的批准：{command}。",
+    "关于{label}这条命令，主人说可以才能继续，人家负责看门～"
   ],
   "approval.tool": [
     "主人，{name}想用工具{toolName}，您来决定嘛～",
-    "这个操作{label}要不要放行呀？主人说了算。",
+    "这个操作{label}要不要放行呀？现在是在{projectName}里的{sessionName}。",
     "{name}已经把{toolName}准备好了，没有主人允许人家可不会乱放行～"
   ],
   "approval.generic": [
     "主人，{name}这一步需要您确认哦～",
-    "{name}正在等您拍板，人家已经让它乖乖停好了。",
-    "关于{label}这件事，主人说继续就继续，人家都听您的～"
+    "{name}正在{sessionName}里等您拍板，相关操作是{label}。",
+    "工具{toolName}还在等主人决定，人家已经让{name}乖乖停好了～"
   ],
   "question.empty": [
     "主人，{name}正在等您的回答呢～",
     "哼，{name}还停在{label}这里，主人快做决定嘛。",
-    "{name}在{projectName}里等主人回复，您决定好了我们再继续～"
+    "{name}正在{projectName}里的{sessionName}等主人回复，您决定好了我们再继续～"
   ],
   "question.one": [
     "主人，{name}有个问题：{body}，您来定嘛。",
-    "{name}正在问：{body}。哼，这种关键事情当然得听主人的。",
-    "{body}需要主人决定哦，人家已经让{name}乖乖等着啦～"
+    "{name}正在{sessionName}里问：{body}。哼，这种关键事情当然得听主人的。",
+    "{body}需要主人决定哦，当前项目是{projectName}，人家已经让{name}乖乖等着啦～"
   ],
   "question.many": [
     "主人，{name}有{count}个问题等您呢～",
-    "啊～居然有{count}个问题，人家看着都觉得累啦。",
-    "{name}正在等这{count}个答案，主人慢慢决定，人家陪您～"
+    "啊～{sessionName}里居然有{count}个问题，人家看着都觉得累啦。",
+    "{name}正在{projectName}里等这{count}个答案，主人慢慢决定，人家陪您～"
   ],
   "watchdog.warning": [
     "主人，{name}最近好像在重复探索：{reasons}。",
@@ -110,14 +110,14 @@
     "{name}的行为有点可疑：{reasons}，主人最好过来看一眼嘛～"
   ],
   "rate_limit.one": [
-    "呜呜，又被限流挡住啦，主人等会儿再试吧。",
-    "堵车啦～主人先歇一下，人家也浮上来透透气。",
-    "这次请求暂时过不去哦，不要一直撞啦，省点力气比较聪明～"
+    "呜呜，又被限流挡住啦，错误码是{errorCode}，主人等会儿再试吧。",
+    "第{retry}次尝试还是堵车啦～{errorMessage}，主人先歇一下嘛。",
+    "{projectName}里的{sessionName}暂时被限流了，当前连续次数是{consecutiveRetryCount}～"
   ],
   "rate_limit.many": [
-    "呜，已经连续限流{count}次啦，先别硬冲嘛。",
-    "哎呀，又被挡了{count}次。主人，我们歇一会儿再继续好不好？",
-    "连续{count}次都被拦住了，再撞下去很累的，人家建议先等等～"
+    "呜，已经连续限流{count}次啦，错误码是{errorCode}，先别硬冲嘛。",
+    "哎呀，已经连续{consecutiveRetryCount}次了，{errorMessage}，主人我们歇会儿吧。",
+    "{projectName}里的{sessionName}被限流好多次啦，第{retry}次重试也没过去～"
   ],
   "done.success": [
     "主人，{name}完成啦～快去看看成果吧。",
@@ -131,18 +131,18 @@
   ],
   "failure.retry": [
     "{name}已经重试了{retries}次还是没成功，主人您帮忙看看嘛。",
-    "哼，都试了{retries}次了还不行，再撞下去只是浪费力气啦。",
-    "{name}重复尝试失败了，错误是{errorMessage}，主人我们换个聪明一点的办法嘛～"
+    "哼，{name}在{projectName}里的{sessionName}都试了{retries}次了，还是错误{errorCode}。",
+    "{name}重复尝试失败了：{errorMessage}，重试耗尽状态是{retryExhausted}，主人我们换条路嘛～"
   ],
   "failure.tool": [
-    "呜——超时信号！{name}的工具执行失败啦，主人看看嘛。",
-    "哼，{name}这次遇到了{errorCode}，真会给人家添麻烦。",
-    "{name}的工具没有正常完成：{errorMessage}，人家已经替主人盯住异常啦～"
+    "呜——超时信号！{name}的工具执行失败啦，来源是{source}，主人看看嘛。",
+    "哼，{name}这次遇到了错误{errorCode}：{errorMessage}，真会给人家添麻烦。",
+    "{name}在{projectName}里的{sessionName}工具失败了，已经重试{retries}次，人家替主人盯住啦～"
   ],
   "failure.generic": [
-    "{name}这一轮没完成呢，主人检查一下嘛～",
-    "哼，{name}在{projectName}里又遇到麻烦了，真让人操心。",
-    "{name}执行中断啦：{errorMessage}，主人决定下一步，人家都会听您的。"
+    "{name}这一轮没完成呢，来源是{source}，主人检查一下嘛～",
+    "哼，{name}在{projectName}里的{sessionName}又遇到{errorCode}了，真让人操心。",
+    "{name}执行中断啦：{errorMessage}，已经重试{retries}次，耗尽状态是{retryExhausted}～"
   ],
   "stuck.reminder": [
     "呜——超时信号！{name}好像卡住啦，主人您瞧瞧嘛。",

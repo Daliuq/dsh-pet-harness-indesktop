@@ -11,28 +11,28 @@
   ],
   "activity.read": [
     "{name} 正在读取 {label}。",
-    "{name} 正在通过 {tool} 查看相关内容。",
-    "{name} 正在 {projectName} 中读取所需信息。"
+    "{name} 正在通过 {tool} 查看 {argsKey}。",
+    "{name} 正在 {projectName} 的 {sessionName} 中读取内容，当前为第 {step} 步。"
   ],
   "activity.search": [
     "{name} 正在搜索 {label}。",
-    "{name} 正在使用 {tool} 查找相关信息。",
-    "{name} 正在 {projectName} 中继续搜索。"
+    "{name} 正在使用 {tool} 查找 {argsKey}。",
+    "{name} 正在 {projectName} 的 {sessionName} 中继续搜索，当前为第 {step} 步。"
   ],
   "activity.edit": [
     "{name} 正在编辑 {label}。",
-    "{name} 正在通过 {tool} 修改内容。",
-    "{name} 当前执行到第 {step} 步，正在继续修改。"
+    "{name} 正在通过 {tool} 修改 {argsKey}。",
+    "{name} 正在 {projectName} 的 {sessionName} 中执行第 {step} 步修改。"
   ],
   "activity.run": [
     "{name} 正在运行 {label}。",
-    "{name} 已通过 {tool} 开始执行。",
-    "{name} 正在 {projectName} 中运行当前任务。"
+    "{name} 已通过 {tool} 开始执行，当前为第 {step} 步。",
+    "{name} 正在 {projectName} 的 {sessionName} 中运行任务，调用 ID：{callId}。"
   ],
   "activity.default": [
     "{name} 正在处理 {label}。",
-    "{name} 当前正在使用 {tool} 执行任务。",
-    "{name} 正在 {projectName} 中继续处理。"
+    "{name} 当前正在使用 {tool} 处理 {argsKey}。",
+    "{name} 正在 {projectName} 的 {sessionName} 中继续执行，当前为第 {step} 步。"
   ],
   "agent.attention": [
     "{name} 需要你确认一下。",
@@ -76,33 +76,33 @@
   ],
   "approval.command": [
     "{name} 请求执行命令：{command}",
-    "请确认是否允许 {name} 执行：{command}",
-    "{name} 正在等待你批准命令：{command}"
+    "{name} 正在 {projectName} 的 {sessionName} 中等待命令批准：{command}",
+    "请确认是否允许 {name} 执行 {label}：{command}"
   ],
   "approval.tool": [
     "{name} 请求使用工具 {toolName}。",
-    "请确认是否允许 {name} 执行 {label}。",
-    "{name} 正在等待工具 {toolName} 的使用批准。"
+    "请确认是否允许 {name} 在 {projectName} 中执行 {label}。",
+    "{name} 正在 {sessionName} 中等待工具 {toolName} 的使用批准。"
   ],
   "approval.generic": [
     "{name} 有一项操作等待你的批准。",
-    "{name} 正在等待你确认 {label}。",
-    "请确认是否允许 {name} 继续执行。"
+    "{name} 正在 {sessionName} 中等待你确认 {label}。",
+    "请确认是否允许 {name} 使用 {toolName} 继续执行。"
   ],
   "question.empty": [
     "{name} 正在等待你的回答。",
     "{name} 有一项 {label} 需要你确认。",
-    "{name} 正在 {projectName} 中等待你的选择。"
+    "{name} 正在 {projectName} 的 {sessionName} 中等待你的选择。"
   ],
   "question.one": [
     "{name} 正在询问：{body}",
-    "{name} 有一个问题需要你决定：{body}",
-    "请回答 {name} 的问题：{body}"
+    "{name} 在 {sessionName} 中有一个问题需要你决定：{body}",
+    "请处理 {projectName} 中 {name} 的问题：{body}"
   ],
   "question.many": [
     "{name} 有 {count} 个问题等待回答。",
-    "当前有 {count} 个问题需要你确认。",
-    "{name} 正在等待你处理这 {count} 个问题。"
+    "{name} 在 {sessionName} 中有 {count} 个问题需要你确认。",
+    "{name} 正在 {projectName} 中等待你处理这 {count} 个问题。"
   ],
   "watchdog.warning": [
     "{name} 最近可能存在重复探索行为：{reasons}",
@@ -111,13 +111,13 @@
   ],
   "rate_limit.one": [
     "当前请求受到限流，请稍后再试。",
-    "本次请求暂时无法继续，错误码：{errorCode}。",
-    "当前处于限流状态，第 {retry} 次重试暂未成功。"
+    "本次请求暂时无法继续，错误码：{errorCode}，信息：{errorMessage}",
+    "{projectName} 的 {sessionName} 当前处于限流状态，第 {retry} 次重试暂未成功。"
   ],
   "rate_limit.many": [
     "已连续触发限流 {count} 次，请稍后再试。",
-    "当前连续限流次数为 {consecutiveRetryCount}，建议等待一段时间。",
-    "多次请求受到限流，错误码：{errorCode}，当前累计 {count} 次。"
+    "当前连续限流次数为 {consecutiveRetryCount}，错误码：{errorCode}。",
+    "{projectName} 的 {sessionName} 多次受到限流，第 {retry} 次重试仍未恢复：{errorMessage}"
   ],
   "done.success": [
     "{name} 已完成本轮任务。",
@@ -131,18 +131,18 @@
   ],
   "failure.retry": [
     "{name} 多次重试后仍未成功。",
-    "{name} 已重试 {retries} 次，问题仍未解决。",
-    "{name} 重试后仍然失败：{errorMessage}"
+    "{name} 已重试 {retries} 次，错误码：{errorCode}。",
+    "{name} 在 {projectName} 的 {sessionName} 中重试后仍失败：{errorMessage}"
   ],
   "failure.tool": [
     "{name} 的工具执行失败。",
     "{name} 调用工具时出现错误：{errorMessage}",
-    "{name} 本轮工具执行异常，错误码：{errorCode}"
+    "{name} 在 {projectName} 的 {sessionName} 中工具执行异常，来源：{source}，错误码：{errorCode}。"
   ],
   "failure.generic": [
     "{name} 本轮执行失败，请检查后重试。",
-    "{name} 在 {projectName} 中的任务未能完成。",
-    "{name} 执行过程中出现问题：{errorMessage}"
+    "{name} 在 {projectName} 的 {sessionName} 中任务未能完成，来源：{source}。",
+    "{name} 执行过程中出现问题：{errorMessage}，已重试 {retries} 次。"
   ],
   "stuck.reminder": [
     "{name} 已经有一段时间没有新动作了。",

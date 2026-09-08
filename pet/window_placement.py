@@ -254,7 +254,7 @@ def save_position(host) -> None:
         return
     if not getattr(host, '_awaiting_saved_screen', None):
         cx = host.x() + host._w / 2
-        cy = host.y() + host._h / 2
+        cy = host.y() + (host._h + getattr(host, "_capture_headroom", 0)) / 2
         host.cfg.set('rx', (cx - avail.left()) / avail.width())
         host.cfg.set('ry', (cy - avail.top()) / avail.height())
         host.cfg.set('screen_name', scr.name())

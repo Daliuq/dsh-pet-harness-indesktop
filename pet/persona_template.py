@@ -77,7 +77,7 @@ DISPLAY_HINTS = {
     "bridge.install.pending": "正在给 {name} 接上通信桥…",
     "bridge.install.success": "{name} 的联动插件安装完成。",
     "bridge.uninstall.failed": "{name} 的通信桥没有完全卸载，需要手动检查。",
-    "dsh.writeback.failed": "回写 DSH 失败，请到 DSH 界面处理。",
+    "dsh.writeback.failed": "agent 写回失败，请到 DSH 界面处理。",
     "done.attention": "{name} 停下来了，结果请主人确认。",
     "done.success": "{name} 这一轮完成啦。",
     "failure.generic": "{name} 本轮运行失败，请检查后再运行。",

@@ -14,6 +14,16 @@ def test_dialogue_modes_and_custom_phrases_persist(tmp_path):
     assert loaded.get("dialogue_phrases")["thinking"] == ["想想"]
 
 
+def test_dialogue_last_scope_roundtrip(tmp_path):
+    """设置页「记住上次编辑层」：dialogue_last_scope 走默认值/白名单持久化。"""
+    cfg = Config(base=tmp_path)
+    assert cfg.get("dialogue_last_scope") == ""
+    cfg.set("dialogue_last_scope", "dsh")
+    cfg.save()
+    loaded = Config(base=tmp_path)
+    assert loaded.get("dialogue_last_scope") == "dsh"
+
+
 def test_bad_mode_and_phrase_types_are_repaired(tmp_path):
     cfg = Config(base=tmp_path)
     cfg.set("dialogue_mode", "bad")

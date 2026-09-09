@@ -35,7 +35,7 @@ from .config import (
 )
 from .context_menus.icons import vector_widget_icon
 from .fun_image_popup import oijingjing_image_path, resolve_fun_asset
-from .persona_phrases import default_phrases, phrase_keys
+from .persona_phrases import PUBLIC_DIALOGUE_EVENTS, default_phrases, phrase_keys
 from .persona_template import build_persona_template
 from .settings_widgets import (
     AUDIO_NAME_FILTER,
@@ -46,6 +46,7 @@ from .settings_widgets import (
     ModernSelect,
     ResourcePathPicker,
     ResponsiveToggleActionRow,
+    SettingRow,
     ToggleSwitch,
     _line_edit,
 )
@@ -327,8 +328,12 @@ def build_pet_controls(host) -> None:
         if isinstance(item, dict) and str(item.get("key") or "").strip():
             host.dialogue_scope_select.addItem(
                 f"{str(item.get('name') or item.get('key'))} 专属文案", str(item["key"]).strip())
-    host.dialogue_scope_select.setCurrentData("")
-    host._dialogue_scope = ""  # 当前编辑层（""=global）
+    # 记住并恢复上次编辑层（设置页保存时写 dialogue_last_scope；未知值回落全局）
+    initial_scope = str(host.config.get("dialogue_last_scope", "") or "")
+    if host.dialogue_scope_select.findData(initial_scope) < 0:
+        initial_scope = ""
+    host.dialogue_scope_select.setCurrentData(initial_scope)
+    host._dialogue_scope = initial_scope  # 当前编辑层（""=global）
 
     host.dialogue_phrase_edits: dict[str, QPlainTextEdit] = {}
     for key in phrase_keys():
@@ -360,6 +365,9 @@ def build_pet_controls(host) -> None:
             key: ("\n".join(str(i) for i in value) if isinstance(value, list) else str(value or ""))
             for key, value in agent_events.items()
         }
+    if host._dialogue_scope:
+        # 恢复上次编辑层：把该层缓冲载入编辑框（行可见性等对话框建完行后再收敛）
+        _load_dialogue_scope_into_editors(host, host._dialogue_scope)
     host.dialogue_scope_select.currentIndexChanged.connect(host._on_dialogue_scope_changed)
 
     host.dialogue_template_import_edit = QPlainTextEdit(host)
@@ -561,6 +569,33 @@ def _dialogue_flush_scope(host, scope: str | None = None) -> None:
     }
 
 
+def _load_dialogue_scope_into_editors(host, scope: str) -> None:
+    """把某层缓冲载入全部编辑框（未配置的事件留空 = 沿用 global/内置）。"""
+    buf = host._dialogue_scope_buffer.get(scope) or {}
+    for key, edit in host.dialogue_phrase_edits.items():
+        edit.setPlainText(str(buf.get(key, "") or ""))
+
+
+def _apply_dialogue_scope_rows(host) -> None:
+    """Agent 专属层只显示该层可定制（Agent 路由）事件，公共事件行隐藏。
+
+    global 层（""）显示全部事件。行尚未构建（对话框 __init__ 中途）时静默跳过。
+    """
+    scope = str(getattr(host, "_dialogue_scope", "") or "")
+    if not hasattr(host, "dialogue_phrase_edits"):
+        return
+    show_all = scope == ""
+    for key in host.dialogue_phrase_edits:
+        row = host.findChild(SettingRow, f"settingRow_dialogue_{key}")
+        if row is None:
+            continue
+        if show_all:
+            row.setVisible(True)
+            continue
+        if key in PUBLIC_DIALOGUE_EVENTS:
+            row.setVisible(False)
+
+
 def _on_dialogue_scope_changed(host, index: int) -> None:
     """切换 global/某 Agent 专属文案编辑层：flush 当前层后载入目标层内容。"""
     if not hasattr(host, "dialogue_scope_select"):
@@ -568,9 +603,8 @@ def _on_dialogue_scope_changed(host, index: int) -> None:
     _dialogue_flush_scope(host)
     target = str(host.dialogue_scope_select.currentData() or "")
     host._dialogue_scope = target
-    buf = host._dialogue_scope_buffer.get(target) or {}
-    for key, edit in host.dialogue_phrase_edits.items():
-        edit.setPlainText(str(buf.get(key, "") or ""))
+    _load_dialogue_scope_into_editors(host, target)
+    _apply_dialogue_scope_rows(host)
 
 
 def _dialogue_scope_values(host, scope: str) -> dict[str, list[str]]:

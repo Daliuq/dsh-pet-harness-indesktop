@@ -2801,7 +2801,7 @@ class AgentLinkManager(QObject):
             worker.start()
         except Exception:
             log.exception("DSH 回写线程启动失败")
-            self._show_link_bubble(self._dialogue("dsh.writeback.failed", "回写 DSH 失败，请到 DSH 界面处理"), important=True)
+            self._show_link_bubble(self._dialogue("dsh.writeback.failed", "agent 写回失败，请到 DSH 界面处理"), important=True)
 
     def _post_respond_worker(self, agent_key: str, msg: dict) -> None:
         """后台线程：找在线 DSH 端口并 POST /api/respond，结果经信号回主线程。"""
@@ -2839,7 +2839,7 @@ class AgentLinkManager(QObject):
         log.warning("DSH 回写失败: %s", detail)
         try:
             if hasattr(self.win, "show_bubble") and self.win.isVisible():
-                self.win.show_bubble(self._dialogue("dsh.writeback.failed", "回写 DSH 失败，请到 DSH 界面处理"), duration_ms=4000)
+                self.win.show_bubble(self._dialogue("dsh.writeback.failed", "agent 写回失败，请到 DSH 界面处理"), duration_ms=4000)
         except Exception:
             pass
 

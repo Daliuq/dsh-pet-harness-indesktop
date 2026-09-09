@@ -585,6 +585,7 @@ class Config:
             # Existing event wording: legacy is deliberately the default.
             "dialogue_mode": "legacy",
             "dialogue_phrases": dict(DEFAULT_DIALOGUE_PHRASES),
+            "dialogue_last_scope": "",  # 台词编辑上次打开的层（""=全局；设置页专属文案入口记忆）
             "mouse_through": False,
             "cursor_hidden_passthrough": True,
             "drag_physics": False,
@@ -784,6 +785,7 @@ class Config:
             "mouse_through", "cursor_hidden_passthrough", "drag_physics", "context_menu_template",
             "dialogue_mode",
             "dialogue_phrases",
+            "dialogue_last_scope",
             "context_menu_layout",
             "lock_position", "shift_drag", "pet_opacity",
             "context_menu_appearance", "quick_launch_apps",

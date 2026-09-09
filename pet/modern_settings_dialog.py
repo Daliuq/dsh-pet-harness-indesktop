@@ -147,7 +147,7 @@ DIALOGUE_LABELS = {
     "agent.attention": "需要用户处理", "agent.error": "Agent 出错",
     "agent.missing": "未找到 Agent", "bridge.install.pending": "安装桥接中",
     "bridge.install.success": "桥接安装成功", "bridge.install.failed": "桥接安装失败",
-    "bridge.uninstall.failed": "桥接卸载失败", "dsh.writeback.failed": "回写 DSH 失败",
+    "bridge.uninstall.failed": "桥接卸载失败", "dsh.writeback.failed": "agent 写回失败",
     "approval.command": "审批命令", "approval.tool": "审批工具",
     "approval.generic": "审批提示", "question.empty": "等待选择",
     "question.one": "单个用户问题", "question.many": "多个用户问题",
@@ -649,6 +649,8 @@ class ModernSettingsDialog(QDialog):
 
         self.menu_theme_select.currentIndexChanged.connect(self._apply_selected_theme)
         self._apply_selected_theme()
+        # 行全部就位后收敛台词编辑可见性：初始层若为某 Agent 专属则隐藏公共事件行
+        settings_pet_controls._apply_dialogue_scope_rows(self)
 
     def _sync_menu_action_states(self, *_args) -> None:
         enabled = set(self.menu_available_actions)
@@ -1625,6 +1627,8 @@ class ModernSettingsDialog(QDialog):
             self.config.set("dialogue_phrases", {"global": new_global, "agents": agents_delta})
         else:
             self.config.set("dialogue_phrases", new_global)
+        # 记住上次编辑层：下次打开设置直接回到该 Agent 专属层（未知值回落全局）
+        self.config.set("dialogue_last_scope", str(getattr(self, "_dialogue_scope", "") or ""))
         agent_cfg = dict(self.config.get("agent_link", {}))
         # 循环检测设置页（合并写回，不覆盖 agent_link 其他字段）
         if self.watchdog_page is not None:

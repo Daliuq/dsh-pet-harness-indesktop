@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """待办管理面板：右键菜单「待办提醒」打开的非模态对话框。
 
 视觉上沿用 Shared UX Contract 令牌（references/visual-system.md）：卡片

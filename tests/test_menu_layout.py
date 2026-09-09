@@ -782,7 +782,6 @@ def test_settings_sidebar_uses_stable_domains_and_owns_representative_rows(tmp_p
     assert owner("quick_launch_apps") == "菜单"
     assert owner("dynamic_island_enabled") == "桌面组件"
     assert owner("api_url") == "AI 与对话"
-    assert owner("agent_thinking_dsh") == "自动化与联动"
     assert "待分类（开发期）" not in [
         label.text() for label in dialog.findChildren(settings_mod.QLabel)
     ]

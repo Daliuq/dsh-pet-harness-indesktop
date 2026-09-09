@@ -1090,6 +1090,23 @@ class _CollisionWorker(QObject):
         QTimer.singleShot(0, self.thread().quit)
 
 
+# 存活会话登记（测试隔离用）：构造时登记、stop 时注销，供 conftest 每测
+# teardown 统一 stop 泄漏的 session（强引用防止「QThread destroyed while
+# running」的过早 GC，崩溃点漂移防线）。
+_live_sessions: set = set()
+
+
+def _stop_live_sessions_for_tests() -> None:
+    """测试隔离：stop 所有仍存活的 CollisionIpcSession（finally 语义）。"""
+    sessions = list(_live_sessions)
+    for session in sessions:
+        try:
+            session.stop()
+        except Exception:
+            pass
+    _live_sessions.clear()
+
+
 class CollisionIpcSession(QObject):
     """GUI 线程持有的 IPC facade；不暴露任何 socket 或成员表。"""
     state_submitted = Signal(object)
@@ -1103,6 +1120,7 @@ class CollisionIpcSession(QObject):
     def __init__(self, config, parent=None, server_name: str | None = None):
         # AppShell 是普通控制器而非 QObject；生命周期由其属性持有。
         super().__init__(parent if isinstance(parent, QObject) else None)
+        _live_sessions.add(self)
         self.runtime_id = make_runtime_id(getattr(config, "instance_id", ""))
         self._thread = QThread(self)
         policy = {"collision_enabled": bool(config.get("collision_enabled", True)),
@@ -1139,6 +1157,7 @@ class CollisionIpcSession(QObject):
         self.leave_submitted.emit()
 
     def stop(self) -> None:
+        _live_sessions.discard(self)
         if self._thread.isRunning():
             self.state_submitted.disconnect(self._worker.submit_state)
             QMetaObject.invokeMethod(self._worker, "stop", Qt.ConnectionType.QueuedConnection)

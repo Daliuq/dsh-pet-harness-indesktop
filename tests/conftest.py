@@ -82,6 +82,76 @@ def _close_session_writers():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _clear_click_sound_pool():
+    """每测后清空点击音效池（测试债防线）。
+
+    conftest 只静音了 play()，但设置保存等路径的 warm_click_sound_effects
+    会真实创建 QSoundEffect/QMediaPlayer/QAudioOutput。这些 QtMultimedia
+    原生对象跨测试累积后，在共享 QApplication 下随机 access violation /
+    Fatal abort（全量套件崩溃点会漂移：click_sound 预热循环、气泡图片
+    processEvents 均观测到）。每测后 clear() 复位原生对象缓存。
+    """
+    yield
+    try:
+        from pet import click_sound
+        click_sound._pool.clear()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _close_qt_top_level_widgets():
+    """在测试后收口仍存活的应用级后台资源与 collision IPC 会话。"""
+    yield
+    # collision IPC：stop 仍存活的 CollisionIpcSession（finally 语义）。
+    # 会话若在测试里未 stop，其 QThread 被 GC 时仍在跑 → 后续无关测试的
+    # processEvents 处 native abort（QThread: Destroyed while thread is still
+    # running，崩溃点漂移、Linux exit 139 根因）。
+    try:
+        from pet.collision_ipc import _stop_live_sessions_for_tests
+        _stop_live_sessions_for_tests()
+    except Exception:
+        pass
+    try:
+        from pet.agent_link import AgentLinkManager, BaseAgentMonitor
+        AgentLinkManager._shutdown_live_for_tests()
+        BaseAgentMonitor._shutdown_live_for_tests()
+    except Exception:
+        pass
+    try:
+        from pet.library import MovieLibrary
+        MovieLibrary._shutdown_live_for_tests()
+    except Exception:
+        pass
+    # dsh_state：QTimer 只停了不算完——在途在线探测线程（daemon + 阻塞 socket）
+    # 回来后仍会跨线程 emit；先 stop() 换代作废其结果，再销毁顶层窗口，
+    # 否则 deleteLater + processEvents 收尾时 worker 向已销毁 QObject emit
+    # （macOS 全量套件 segfault：conftest._close_qt_top_level_widgets + socket 线程）。
+    try:
+        from pet import dsh_state
+        dsh_state._shutdown_live_for_tests()
+    except Exception:
+        pass
+    # 销毁残留顶层窗口（QDialog/QWidget）：只用 deleteLater，绝不用 close()。
+    # close() 会触发 closeEvent → _write_config → warm_click_sound_effects 的
+    # 副作用（t4 曾因此崩溃）；deleteLater 走 DeferredDelete，Qt 安全销毁且不
+    # 触发 closeEvent。清理掉泄漏的 C++ 对话框，避免其悬空事件在后续测试的
+    # processEvents 引爆（崩溃点漂移、access violation）。
+    try:
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is not None:
+            for widget in list(app.topLevelWidgets()):
+                try:
+                    widget.deleteLater()
+                except RuntimeError:
+                    pass  # C++ 侧已销毁的半死窗口：跳过
+            app.processEvents()
+    except Exception:
+        pass
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _close_webm_readers_at_session_end():
     """session 结束强收口所有 webm reader（测试债 #2 防线）。

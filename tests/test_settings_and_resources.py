@@ -106,6 +106,53 @@ def test_modern_settings_dialog_round_trip(qapp, tmp_path: Path):
     assert abs(agent_cfg["sound_cooldown_seconds"] - 3.5) < 1e-4
 
 
+def test_import_dialogue_template_reads_entries_and_top_level_phrases(tmp_path, monkeypatch):
+    """导入模板必须同时读取顶层 phrases 与 entries[].phrases（既有 bug 回归）。"""
+    import json
+
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Ok)
+    cfg = Config(tmp_path / "appdata")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        # 1) 只改了 entries[].phrases（顶层缺失/为空）的模板也要生效
+        entries_only = {
+            "template": "persona-phrases/v1",
+            "mode": "custom",
+            "phrases": {},
+            "entries": [
+                {"key": "start", "description": "start", "sources": [], "parameters": [],
+                 "displayHint": "", "phrases": ["entries 里的台词 {name}"]},
+                {"key": "done.success", "description": "done", "sources": [], "parameters": [],
+                 "displayHint": "", "phrases": []},
+            ],
+        }
+        dialog.dialogue_template_import_edit.setPlainText(json.dumps(entries_only, ensure_ascii=False))
+        dialog._import_dialogue_template_json()
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "entries 里的台词 {name}"
+        assert dialog.dialogue_mode_select.currentData() == "custom"
+
+        # 2) 顶层 phrases 有内容时以顶层为准，不被 entries 覆盖
+        both = {
+            "template": "persona-phrases/v1",
+            "mode": "custom",
+            "phrases": {"start": ["顶层台词 {name}"]},
+            "entries": [
+                {"key": "start", "description": "start", "sources": [], "parameters": [],
+                 "displayHint": "", "phrases": ["entries 不应覆盖"]},
+            ],
+        }
+        dialog.dialogue_template_import_edit.setPlainText(json.dumps(both, ensure_ascii=False))
+        dialog._import_dialogue_template_json()
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "顶层台词 {name}"
+
+
+    finally:
+        dialog.deleteLater()
+
+
 def test_spawn_size_controls_visibility(qapp, tmp_path: Path):
     """生小肥鱼继承大小开启时隐藏自定义大小；关闭后显示。"""
     cfg_root = tmp_path / "appdata"
@@ -152,6 +199,239 @@ def test_agent_sound_controls_visibility_and_subcontrols(qapp, tmp_path: Path):
         dialog.agent_sound_start_check.setChecked(True)
         assert dialog.agent_sound_start_picker.isHidden() is False
         assert dialog.agent_sound_start_preview.isHidden() is False
+    finally:
+        dialog.deleteLater()
+
+def test_dialogue_key_params_match_runtime_call_sites():
+    """设置页每 key 的“可用参数”提示直接派生自 PARAMETERS（单一真相源）。
+
+    上游重构曾让设置页提示与运行时注入漂移；现在 DIALOGUE_KEY_PARAMS 由
+    persona_template.PARAMETERS 派生，这里验证派生关系与代表性条目。"""
+    from pet.modern_settings_dialog import DIALOGUE_KEY_PARAMS, DIALOGUE_PARAMS
+    from pet.persona_template import PARAMETERS
+
+    assert DIALOGUE_KEY_PARAMS == dict(PARAMETERS)
+    # 展示名必须覆盖全部宣称的参数（对话框 hint 渲染用 DIALOGUE_PARAMS[item]）
+    advertised = {f for fields in PARAMETERS.values() for f in fields}
+    assert advertised <= set(DIALOGUE_PARAMS), sorted(advertised - set(DIALOGUE_PARAMS))
+    # activity 组字段以桥接 tool/call 真实记录为准：target/ok 不在 tool/call 里，
+    # 不得宣称（活动气泡渲染时拿不到，写了就是永不替换的占位符）
+    assert "callId" in DIALOGUE_KEY_PARAMS["activity.read"]
+    assert "target" not in DIALOGUE_KEY_PARAMS["activity.read"]
+    assert "ok" not in DIALOGUE_KEY_PARAMS["activity.read"]
+    assert {"errorCode", "errorMessage", "consecutiveRetryCount", "retry"} <= set(
+        DIALOGUE_KEY_PARAMS["rate_limit.one"])
+    assert DIALOGUE_KEY_PARAMS["dsh.writeback.failed"] == ()
+
+
+def test_dialogue_template_export_is_blank_without_current_phrases(qapp, tmp_path):
+    """导出 = 纯字段参考模板：不携带当前已配置的台词（phrases 一律留空）。"""
+    cfg = Config(tmp_path / "appdata")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        dialog.dialogue_phrase_edits["start"].setPlainText("当前已配置的台词不应出现在导出里")
+        data = dialog._current_dialogue_template()
+        assert all(not v for v in data["phrases"].values())
+        assert all(not e["phrases"] for e in data["entries"])
+        assert data["mode"] == dialog.dialogue_mode_select.currentData()
+    finally:
+        dialog.deleteLater()
+
+
+def _nav_item_indexes(dialog) -> dict[str, int]:
+    """返回 sidebar 标签 → pages 栈索引 的映射。"""
+    return {
+        dialog.sidebar.item(i).text(): i
+        for i in range(dialog.sidebar.count())
+    }
+
+
+def test_express_style_rows_move_to_agent_domain(qapp, tmp_path):
+    """表达风格（dialogue_* rows）应从「互动」域迁入「自动化与联动」域的文案风格组。
+
+    ticket 01：现代设置重排后 dialogue 模式/模板卡片/逐事件编辑所属页面。
+    """
+    cfg = Config(tmp_path / "appdata")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        nav = _nav_item_indexes(dialog)
+        assert "自动化与联动" in nav, f"缺少自动化与联动导航页，现有: {sorted(nav)}"
+        agent_page = dialog.pages.widget(nav["自动化与联动"])
+        interaction_idx = nav.get("互动")
+        dialogue_row_names = {
+            row.objectName()
+            for row in dialog.findChildren(SettingRow)
+            if row.objectName().startswith("settingRow_dialogue_")
+        }
+        assert dialogue_row_names, "未找到任何 dialogue_* 设置行"
+        # 全部 dialogue 行都应出现在 automation 域页内
+        agent_rows = {
+            row.objectName()
+            for row in agent_page.findChildren(SettingRow)
+            if row.objectName().startswith("settingRow_dialogue_")
+        }
+        assert dialogue_row_names <= agent_rows, sorted(dialogue_row_names - agent_rows)
+        # 专属文案对象（scope）行同属该域
+        assert "settingRow_dialogue_scope" in agent_rows
+        # 互动域（若存在）不得残留 dialogue 行
+        if interaction_idx is not None:
+            interaction_rows = {
+                row.objectName()
+                for row in dialog.pages.widget(interaction_idx).findChildren(SettingRow)
+                if row.objectName().startswith("settingRow_dialogue_")
+            }
+            assert not interaction_rows, sorted(interaction_rows)
+    finally:
+        dialog.deleteLater()
+
+
+def test_automation_domain_name_stays_stable(qapp, tmp_path):
+    """automation 域顶层导航保持「自动化与联动」；域内非 Agent 组保留。
+
+    ticket 03（撤销改名）：旧设置回归测试锁定侧边栏文案，域名不改为
+    「Agent 联动」——迁移只作用于域内组名（Agent 联动文案风格）。
+    """
+    from pet.settings_widgets import SETTINGS_DOMAIN_NAV
+
+    labels = [label for label, _ in SETTINGS_DOMAIN_NAV]
+    assert "自动化与联动" in labels
+    assert "Agent 联动" not in labels
+
+    cfg = Config(tmp_path / "appdata")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        nav = _nav_item_indexes(dialog)
+        assert "自动化与联动" in nav
+        agent_page = dialog.pages.widget(nav["自动化与联动"])
+        # 非 Agent 组（待办提醒/主动感知/循环检测）仍保留：抽查关键 setting 行存在
+        for row_id in ("todo_reminder_enabled",):
+            assert agent_page.findChild(SettingRow, f"settingRow_{row_id}") is not None
+    finally:
+        dialog.deleteLater()
+
+
+def test_dialogue_global_edits_read_and_preserve_unified_preset(qapp, tmp_path):
+    """global 逐事件编辑读取/写回统一预设：编辑 global.start 只改 global，agents delta 保留。
+
+    ticket 04 数据层：config.dialogue_phrases 为 {global, agents} 双层时，编辑区
+    读 global 层；_write_config 保存后 agents 不被破坏。
+    """
+    cfg = Config(tmp_path / "appdata")
+    cfg.set("dialogue_mode", "custom")
+    cfg.set("dialogue_phrases", {
+        "global": {"start": ["全局默认 start"], "thinking": ["全局默认 thinking"]},
+        "agents": {"dsh": {"thinking": ["DSH thinking"]}},
+    })
+    cfg.save()
+
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        # 编辑区初始展示 global 层内容
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "全局默认 start"
+        assert dialog.dialogue_phrase_edits["thinking"].toPlainText() == "全局默认 thinking"
+
+        # 修改 global.start；保存后 agents delta 不受影响
+        dialog.dialogue_phrase_edits["start"].setPlainText("新的全局 start")
+        ok = dialog._write_config()
+        assert ok is True
+    finally:
+        dialog.deleteLater()
+
+    reloaded = Config(tmp_path / "appdata")
+    phrases = reloaded.get("dialogue_phrases")
+    assert phrases["global"]["start"] == ["新的全局 start"]
+    assert phrases["global"]["thinking"] == ["全局默认 thinking"]
+    assert phrases["agents"]["dsh"]["thinking"] == ["DSH thinking"]
+
+
+def test_dialogue_scope_switch_edits_agent_delta(qapp, tmp_path):
+    """编辑区切换 scope：选中某 Agent 后编辑其事件，保存落 agents[agent_key]，
+    且只写有差异的事件（空事件不覆盖 global）。
+
+    ticket 04 UI：global 编辑面是默认层，agent scope 是 delta 覆盖层。
+    """
+    cfg = Config(tmp_path / "appdata")
+    cfg.set("dialogue_mode", "custom")
+    cfg.set("dialogue_phrases", {
+        "global": {"start": ["全局 start"], "thinking": ["全局 thinking"]},
+    })
+    cfg.save()
+
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        assert dialog.dialogue_scope_select.currentData() == ""
+        # 切到 DSH 专属层
+        dialog.dialogue_scope_select.setCurrentData("dsh")
+        # flush+load 后编辑区为空（dsh 尚无覆盖）→ 填 start 差异
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == ""
+        dialog.dialogue_phrase_edits["start"].setPlainText("DSH 专属 start")
+        # 切回 global：dsh 层已缓存，global 内容不变
+        dialog.dialogue_scope_select.setCurrentData("")
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "全局 start"
+
+        ok = dialog._write_config()
+        assert ok is True
+    finally:
+        dialog.deleteLater()
+
+    reloaded = Config(tmp_path / "appdata")
+    phrases = reloaded.get("dialogue_phrases")
+    assert phrases["global"]["start"] == ["全局 start"]
+    assert phrases["agents"]["dsh"]["start"] == ["DSH 专属 start"]
+    # 未覆盖的 thinking 不进 dsh delta
+    assert "thinking" not in phrases["agents"]["dsh"]
+
+
+def test_import_dialogue_template_with_agents_populates_scopes(qapp, tmp_path, monkeypatch):
+    """整体导入模板含 agents 层时，agents delta 写入 scope buffer 并可在编辑区看到。
+
+    ticket 04：persona-phrases 模板除顶层 phrases（=global）外新增 agents 层；
+    导入后切到该 agent scope 应看到其专属文案，保存后进入 dialogue_phrases.agents。
+    """
+    import json
+
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Ok)
+
+    cfg = Config(tmp_path / "appdata")
+    cfg.set("dialogue_mode", "custom")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        template = {
+            "template": "persona-phrases/v1",
+            "mode": "custom",
+            "phrases": {"start": ["全局 start"]},
+            "agents": {
+                "dsh": {"start": ["导入的 DSH start"], "thinking": ["导入的 DSH thinking"]},
+            },
+        }
+        dialog.dialogue_template_import_edit.setPlainText(json.dumps(template, ensure_ascii=False))
+        dialog._import_dialogue_template_json()
+
+        # 编辑区当前在 global scope → 显示顶层 phrases
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "全局 start"
+        # 切到 dsh scope → 显示导入的 agents delta
+        dialog.dialogue_scope_select.setCurrentData("dsh")
+        assert dialog.dialogue_phrase_edits["start"].toPlainText() == "导入的 DSH start"
+        assert dialog.dialogue_phrase_edits["thinking"].toPlainText() == "导入的 DSH thinking"
+    finally:
+        dialog.deleteLater()
+
+
+def test_export_dialogue_template_mentions_agents_separator(qapp, tmp_path):
+    """导出模板结构：顶层 phrases 为 global 参考，新增 agents 占位说明不影响导出。"""
+    import json as json_mod
+
+    cfg = Config(tmp_path / "appdata")
+    dialog = ModernSettingsDialog(cfg, include_ai=False)
+    try:
+        data = dialog._current_dialogue_template()
+        # 导出仍是纯字段参考模板：phrases 留空；不强制含 agents（既有导出契约）
+        assert all(not v for v in data["phrases"].values())
+        text = json_mod.dumps(data, ensure_ascii=False)
+        assert "persona-phrases/v1" in text
     finally:
         dialog.deleteLater()
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import shiboken6
+
 from PySide6.QtCore import QEvent, QFileInfo, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFontDatabase, QImageReader, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -446,6 +448,8 @@ class ImagePreviewDrawer(QFrame):
         root.addWidget(self.scroll, 1)
         root.addWidget(self.empty_label, 1)
         parent.installEventFilter(self)
+        # 抽屉销毁时移除事件过滤器，杜绝宿主持悬空 QObject*（崩溃点漂移根因之一）。
+        self.destroyed.connect(self._release_host_filter)
         self.hide()
 
     def _sync_geometry(self) -> None:
@@ -454,6 +458,27 @@ class ImagePreviewDrawer(QFrame):
             return
         width = min(480, max(360, round(parent.width() * 0.46)))
         self.setGeometry(parent.width() - width, 0, width, parent.height())
+
+    def _sync_flow_height(self) -> None:
+        """0ms 定时回调：flow 高度同步（isValid 守卫，避免延迟回调撞上已销毁对象）。"""
+        flow = self.flow
+        if shiboken6.isValid(flow):
+            flow._sync_height()
+
+    def _release_host_filter(self, _obj=None) -> None:
+        """抽屉销毁时从宿主移除事件过滤器，杜绝宿主持悬空 QObject*。
+
+        用 parentWidget() 而非实例属性取值：teardown 期间 Shiboken 可能重包装
+        C++ 对象（Python 侧实例属性丢失），parentWidget() 是 C++ 方法、始终可用。
+        """
+        host = self.parentWidget()
+        if host is None:
+            return
+        try:
+            if shiboken6.isValid(host):
+                host.removeEventFilter(self)
+        except RuntimeError:
+            pass  # 宿主已随 Qt C++ 侧销毁：无需再移除
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         if watched is self.parentWidget() and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
@@ -481,7 +506,8 @@ class ImagePreviewDrawer(QFrame):
         self._sync_geometry()
         self.show()
         self.raise_()
-        QTimer.singleShot(0, self.flow._sync_height)
+        # 以 self 为 context 的 singleShot：抽屉销毁时 Qt 自动取消，不再在已删对象上回调。
+        QTimer.singleShot(0, self, self._sync_flow_height)
 
 class ResourcePathPicker(QWidget):
     """Absolute-path field with a native file or directory chooser."""

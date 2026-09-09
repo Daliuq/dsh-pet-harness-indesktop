@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QCursor, QFontMetrics, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QMenu, QMessageBox, QWidget, QWidgetAction
 
@@ -166,8 +166,12 @@ class OjingjingMenuEntry(QWidget):
     def showEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().showEvent(event)
         # 菜单弹出时鼠标可能已在项上方（如顶行彩蛋项），此时没有 enter 事件，
-        # 按光标位置合成初始 hover 状态
-        self._hovered = self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+        # 按光标位置合成初始 hover 状态。布局尚未激活导致 rect 为空时用
+        # sizeHint 兜底，避免合成高亮静默丢失。
+        rect = self.rect()
+        if rect.isEmpty():
+            rect = QRect(0, 0, self.sizeHint().width(), self.sizeHint().height())
+        self._hovered = rect.contains(self.mapFromGlobal(QCursor.pos()))
         self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API

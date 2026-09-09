@@ -2,6 +2,7 @@
 """
 桌宠主窗口 —— 透明无边框置顶窗口 + 动画链状态机 + 移动驱动 + 交互。
 
+
 状态机（对应原插件 dsh-pet lib/client.js 的链式模型，行为 1:1 移植）：
   - 每个动画一次性播放，播完按概率选下一个：30% 待机 / 10% 转向 / 40% 动作 / 20% 移动；
   - 转向（东张西望）播完翻转朝向；facing=right 时水平镜像；
@@ -14,6 +15,8 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
+from collections import deque
 import json
 import logging
 import os
@@ -21,9 +24,15 @@ import math
 import random
 import sys
 import threading
-import time
+import time as _stdlib_time
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+# 测试 seam：`pet.window.time.monotonic` 是可被 monkeypatch 的时钟命名空间；
+# 搬迁出去的 helper 模块经委托注入本命名空间的 monotonic（见 *_delegation）。
+time = SimpleNamespace(monotonic=_stdlib_time.monotonic)
 
 import shiboken6
 
@@ -38,8 +47,29 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QBitmap, QColor, QCursor, QImage, QPainter, QPen, QPixmap, QRegion
-from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QToolTip, QWidget
+
+from PySide6.QtGui import (
+    QBitmap,
+    QColor,
+    QCursor,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QRegion,
+)
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QInputDialog,
+    QLineEdit,
+    QMenu,
+    QToolTip,
+    QWidget,
+)
 
 from . import autostart as autostart_mod
 from . import catalog
@@ -56,6 +86,9 @@ from .config import (
 from .library import MovieLibrary
 from .predictive_prewarm import PredictivePrewarm, pick_from_pool, roll_next
 from . import slot_manager as slot_manager_mod
+from . import window_placement
+from . import window_screen
+from . import window_alerts
 from .animation_thumbnail import decode_representative_frame
 from .speech_bubble import PetSpeechBubble, list_self_talk_images
 from .fun_image_popup import oijingjing_image_path, resolve_fun_asset
@@ -462,6 +495,17 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._bubble_busy_until = 0.0
         # 设置窗口打开期间暂停气泡，避免置顶气泡盖住设置界面
         self._bubble_suppressed = False
+        # 审批等「一直挂到主动关闭」的气泡：激活期间自言自语/普通气泡让路，
+        # 临时气泡盖掉它后在其隐藏时自动恢复；审批结束调用 hide_bubble 收尾。
+        self._sticky_bubble_active = False
+        self._sticky_text = ""
+        self._sticky_subtitle = ""
+        self._sticky_buttons: list[tuple[str, object]] | None = None
+        # 提醒消息队列：所有需要用户注意的提醒（审批/问题/硬失败/卡住介入）
+        # 统一入队，一次只展示一个，当前展示时普通气泡全部让路不覆盖。
+        self._alert_queue: deque = deque()
+        self._alert_current: dict | None = None  # 当前展示的提醒
+        self._speech_bubble.hidden_signal.connect(self._on_speech_bubble_hidden)
 
         # Agent 联动动作衔接：正在播一次性动作时联动动作不打断，存为待播（最新覆盖旧的），
         # 等当前动作播完由 _on_anim_ended 自然接上；联动动作播完仍有 Agent 在忙则接下一个。
@@ -487,6 +531,11 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._fs_stop = threading.Event()
         self._fs_thread: threading.Thread | None = None
         self._fs_last = False
+        # Qt 可能在测试/退出路径中先销毁 C++ 窗口，再来不及进入
+        # closeEvent；destroyed 信号先置位纯 Python 闸门，让 watcher 在
+        # 下一次 wait 返回时退出，避免后台线程继续触碰已销毁的 QObject。
+        _fs_stop = self._fs_stop
+        self.destroyed.connect(lambda *_args, stop=_fs_stop: stop.set())
         self.fullscreen_changed.connect(self._on_fullscreen_changed)
         self.cursor_visibility_changed.connect(self._on_cursor_visibility_changed)
 
@@ -578,6 +627,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._lock_press_active = False   # 锁定位置下左键按住（不拖拽但仍是交互）
         self._click_hold = False          # 点击动画播放中持有让路闸门
         self._closing = False             # closeEvent 后丢弃迟到的动画事件
+        self._close_event_done = False     # closeEvent 幂等闸门
         self._slingshot_anchor_pos: QPoint | None = None
         self._slingshot_anchor_mouse: QPoint | None = None
         self._slingshot_mouse: QPoint | None = None
@@ -834,56 +884,29 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         if callable(report):
             report(movie, divisor)
 
-    def _arm_screen_restore_retry(self) -> None:
-        """目标副屏暂未就绪：启动 5s 轮询 + screenAdded 监听，等它上线。"""
-        from PySide6.QtGui import QGuiApplication
-        app = QGuiApplication.instance()
-        if app is None:
-            return
-        self._screen_retry_deadline = time.monotonic() + 120.0
-        if not self._screen_restore_armed:
-            app.screenAdded.connect(self._screen_retry_tick)
-            self._screen_restore_armed = True
-            logging.debug('已监听屏幕变化，等待 %s 上线', self._awaiting_saved_screen)
-        self._screen_retry_timer.start()  # start() 即重启，超时窗口随之刷新
+    def _arm_screen_restore_retry(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.arm_screen_restore_retry)."""
+        return window_placement.arm_screen_restore_retry(self, *args, **kwargs)
 
-    def _disarm_screen_restore_retry(self) -> None:
-        self._awaiting_saved_screen = None
-        if hasattr(self, '_screen_retry_timer'):
-            self._screen_retry_timer.stop()
-        if not self._screen_restore_armed:
-            return
-        self._screen_restore_armed = False
-        from PySide6.QtGui import QGuiApplication
-        app = QGuiApplication.instance()
-        if app is not None:
-            try:
-                app.screenAdded.disconnect(self._screen_retry_tick)
-            except (RuntimeError, TypeError):
-                pass
+    def _disarm_screen_restore_retry(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.disarm_screen_restore_retry)."""
+        return window_placement.disarm_screen_restore_retry(self, *args, **kwargs)
 
-    def _screen_retry_tick(self, *_args) -> None:
-        """轮询/screenAdded 共用入口：目标屏一旦进入枚举立即恢复位置。"""
-        target = self._awaiting_saved_screen
-        if not target:
-            self._disarm_screen_restore_retry()
-            return
-        if time.monotonic() > self._screen_retry_deadline:
-            logging.info('等待屏幕 %s 超时（120s），放弃自动恢复', target)
-            self._disarm_screen_restore_retry()
-            return
-        # _screen_available 找不到目标屏时回退当前屏（名字不匹配），找到才算上线
-        scr = self._screen_available(target)
-        if scr is not None and scr.name() == target:
-            self._disarm_screen_restore_retry()
-            self._restore_position()
-            logging.info('目标屏幕 %s 上线，已恢复到保存位置', target)
+    def _screen_retry_tick(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.screen_retry_tick)."""
+        return window_placement.screen_retry_tick(self, *args, **kwargs)
 
-    def _on_screen_added_restore(self, screen) -> None:
-        """兼容入口：新屏幕上线 → 立即触发一次检查。"""
-        self._screen_retry_tick()
+    def _force_show_on_primary(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.force_show_on_primary)."""
+        return window_placement.force_show_on_primary(self, *args, **kwargs)
 
-    # ================================================================ 尺寸
+    def _ensure_visible_after_restore(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.ensure_visible_after_restore)."""
+        return window_placement.ensure_visible_after_restore(self, *args, **kwargs)
+
+    def _on_screen_added_restore(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.on_screen_added_restore)."""
+        return window_placement.on_screen_added_restore(self, *args, **kwargs)
     def _apply_scale(self) -> None:
         """按缩放计算窗口尺寸：宽度 220×scale，高度 (124+落地偏移)×scale。"""
         self._w = max(1, int(round(catalog.CANVAS_W * self.scale)))
@@ -927,17 +950,9 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._save_position()
 
     # ================================================================ 位置
-    def _screen_available(self, screen_name: str | None = None):
-        """返回指定或窗口所在屏幕；macOS 上 self.screen() 失效时兜底主屏。"""
-        from PySide6.QtGui import QGuiApplication
-        if screen_name:
-            for screen in QGuiApplication.screens():
-                if screen.name() == screen_name:
-                    return screen
-        scr = self.screen()
-        if scr is None:
-            scr = QGuiApplication.primaryScreen()
-        return scr
+    def _screen_available(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.screen_available)."""
+        return window_placement.screen_available(self, *args, **kwargs)
 
     def screen_available(self, screen_name: str | None = None):
         """公开转发：返回指定或窗口所在屏幕（等价 _screen_available）。"""
@@ -953,145 +968,43 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         except ValueError:
             pass
 
-    def visible_content_rect(self) -> QRect:
-        """Return the current visible character bounds in global coordinates.
+    def visible_content_rect(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.visible_content_rect)."""
+        return window_placement.visible_content_rect(self, *args, **kwargs)
 
-        The pet window includes a transparent canvas and landing padding. The
-        alpha mask is the source of truth for the actual visible character, so
-        other windows can be placed beside the character instead of beside the
-        transparent canvas.
-        """
-        frame_rect = self.frameGeometry()
-        local_rect = self.character_local_region()
-        if not local_rect.isEmpty():
-            return QRect(frame_rect.topLeft() + local_rect.topLeft(), local_rect.size())
-        mask = self.mask()
-        if not mask.isEmpty():
-            local_rect = mask.boundingRect()
-            if not local_rect.isEmpty():
-                return QRect(frame_rect.topLeft() + local_rect.topLeft(), local_rect.size())
-        return frame_rect
-
-    def _restore_position(self) -> None:
-        """恢复上次位置（按屏幕比例），无记录则落右下角。
-        保存位置时所在的屏幕此刻不在线（如开机自启时副屏未就绪）→
-        落当前屏并记下目标屏，由 screenAdded 监听在它上线后重新恢复。"""
-        saved_screen = self.cfg.get('screen_name')
-        scr = self._screen_available(saved_screen)
-        if saved_screen and scr.name() != saved_screen:
-            self._awaiting_saved_screen = saved_screen
-            logging.info('目标屏幕 %s 暂不在线，先落在 %s，等它上线后自动恢复',
-                         saved_screen, scr.name())
-        else:
-            self._awaiting_saved_screen = None
-        avail = scr.availableGeometry()
-        rx, ry = self.cfg.get('rx'), self.cfg.get('ry')
-        if rx is None or ry is None:
-            x = avail.right() - self._w - catalog.CORNER_MARGIN
-            y = avail.bottom() - self._h
-        else:
-            x = int(round(avail.left() + rx * avail.width())) - self._w // 2
-            y = int(round(avail.top() + ry * avail.height())) - self._h // 2
-            x = min(max(x, avail.left()), avail.right() - self._w)
-            y = min(max(y, avail.top()), avail.bottom() - self._h)
-        # 多开避让：与其他存活实例重叠时逐级向左错开（含双击重复启动
-        # 同一实例的场景——它和有名字的 --instance 一样会撞位置）
-        _rects_fn = getattr(self, '_live_instance_rects', None)
-        others = _rects_fn() if callable(_rects_fn) else []
-        if others:
-            step = self._w + 48
-            for _ in range(12):
-                if not any(self._rects_overlap(x, y, self._w, self._h, o) for o in others):
-                    break
-                nx = max(avail.left(), x - step)
-                if nx == x:
-                    break  # 已经顶到屏幕左缘，无法再让
-                x = nx
-        logging.info('恢复位置 screen=%s avail=(%d,%d,%d,%d) dpr=%s -> (%d,%d)',
-                     scr.name(), avail.left(), avail.top(), avail.right(),
-                     avail.bottom(), scr.devicePixelRatio(), x, y)
-        self.move(x, y)
-        _marker_fn = getattr(self, '_write_runtime_marker', None)
-        if callable(_marker_fn):
-            _marker_fn()
+    def _restore_position(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.restore_position)."""
+        return window_placement.restore_position(self, *args, **kwargs)
 
     @staticmethod
     def _rects_overlap(x: int, y: int, w: int, h: int, other) -> bool:
-        ox, oy, ow, oh = other
-        return x < ox + ow and ox < x + w and y < oy + oh and oy < y + h
+        """Compatibility wrapper for the window-placement helper."""
+        return window_placement.rects_overlap(x, y, w, h, other)
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
-        """跨平台探活：Windows 用 OpenProcess，其余用 kill(pid, 0)。
-
-        实现已下沉到 slot_manager.pid_alive（多开位置避让），
-        本方法保留作薄封装，外部对 PetWindow._pid_alive 的补丁仍生效。
-        """
-        return slot_manager_mod.pid_alive(pid)
+        """Compatibility wrapper; external patches remain effective."""
+        return window_placement.pid_alive(pid)
 
     def _runtime_marker_versioned(self) -> bool:
-        """批5.2 R4：本窗 runtime 标记是否用版本化新名。
-
-        P1-2/N-1：读取构造参数注入的进程级 flag 快照（_single_process_spawn，
-        __init__ 早期就位，先于 _restore_position 的标记读写），不读每窗
-        config——第二窗 config-slot-N 里 `experimental_single_process_spawn`
-        无意义（进程级事实）。
-        """
-        return bool(getattr(self, '_single_process_spawn', False))
+        """Compatibility wrapper for the runtime-marker naming policy."""
+        return window_placement.runtime_marker_versioned(self)
 
     def _live_instance_rects(self) -> list[tuple[int, int, int, int]]:
-        """其他存活实例的窗口矩形（runtime-<pid>.json / pet-runtime-v2-* 标记）。
-
-        死进程/损坏文件的标记由 slot_manager.read_live_instances 顺手清理，
-        避免越积越多。批5.2 多窗同 pid 下排除「本窗自己的标记」而不按 pid
-        过滤（否则会把同进程其它窗一并排除）。
-        """
-        own_marker = slot_manager_mod.runtime_marker_path(
-            self.cfg.dir, self.cfg.instance_id,
-            versioned=self._runtime_marker_versioned(),
-        )
-        rects: list[tuple[int, int, int, int]] = []
-        for _pid, x, y, w, h in slot_manager_mod.read_live_instances(
-                self.cfg.dir, exclude_markers=[own_marker], pid_alive_fn=self._pid_alive):
-            if w > 0 and h > 0:
-                rects.append((x, y, w, h))
-        return rects
+        """Compatibility wrapper for live multi-instance rectangles."""
+        return window_placement.live_instance_rects(self, pid_alive_fn=self._pid_alive)
 
     def _write_runtime_marker(self) -> None:
-        """登记本实例的当前位置，供后启动的实例避让。"""
-        slot_manager_mod.write_runtime_marker(
-            self.cfg.dir, self.cfg.instance_id,
-            self.x(), self.y(), self._w, self._h,
-            versioned=self._runtime_marker_versioned(),
-        )
+        """Compatibility wrapper registering this window's runtime marker."""
+        window_placement.write_runtime_marker(self)
 
     def remove_runtime_marker(self) -> None:
-        """删除本窗 runtime 标记（「退出这只」显式清，防活 pid 陈旧标记虚增计数）。"""
-        slot_manager_mod.delete_runtime_marker(
-            self.cfg.dir, self.cfg.instance_id,
-            versioned=self._runtime_marker_versioned(),
-        )
+        """Compatibility wrapper removing this window's runtime marker."""
+        window_placement.remove_runtime_marker(self)
 
-    def _save_position(self) -> None:
-        """以"窗口中心相对屏幕可用区的比例"持久化位置（分辨率变化后仍正确）。
-        等待目标副屏上线期间（_awaiting_saved_screen 非空）不写位置/屏名：
-        当前只是临时落脚主屏，写回会把保存的副屏坐标永久覆盖。"""
-        scr = self._screen_available()
-        avail = scr.availableGeometry()
-        if avail.width() <= 0 or avail.height() <= 0:
-            return
-        if not getattr(self, '_awaiting_saved_screen', None):
-            cx = self.x() + self._w / 2
-            cy = self.y() + (self._h + getattr(self, "_capture_headroom", 0)) / 2
-            self.cfg.set('rx', (cx - avail.left()) / avail.width())
-            self.cfg.set('ry', (cy - avail.top()) / avail.height())
-            self.cfg.set('screen_name', scr.name())
-        self.cfg.set('facing', self.facing)
-        self.cfg.set('scale', self.scale)
-        self.cfg.save()
-        _marker_fn = getattr(self, '_write_runtime_marker', None)
-        if callable(_marker_fn):
-            _marker_fn()
+    def _save_position(self, *args, **kwargs):
+        """Compatibility delegation (window_placement.save_position)."""
+        return window_placement.save_position(self, *args, **kwargs)
 
     def save_position(self) -> None:
         """公开转发：以窗口中心相对屏幕可用区的比例持久化位置（等价 _save_position）。"""
@@ -1195,6 +1108,7 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         music_timer = getattr(self, "_music_sing_timer", None)
         if getattr(self, "_music_sing_enabled", False) and music_timer is not None and music_timer.isActive():
             QTimer.singleShot(0, self, self._check_music_sing)
+        self._restore_dock_icon_preference()
         self._effects_on_shown()
 
     def hide(self, *, notify: bool = True) -> None:
@@ -1217,6 +1131,29 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self.on_hidden()
         self._arm_dock_reactivate_restore()
 
+    def _stop_all_timers(self) -> None:
+        """停止全部活动定时器并清空关联状态（隐藏/关闭共用的收口）。
+
+        closeEvent 与 _pause_activity 此前各自收口、已出现分叉：closeEvent
+        漏停 _move_timer/_squash_timer/_physics_timer/_music_sing_timer。这些
+        QTimer(self) 子对象虽随窗口 C++ 销毁而销毁，但 win.close() 只隐藏不
+        销毁窗口，Python 包装存活期内残留的单次 timeout 仍可对已停播/半销毁
+        窗口触发（全量套件崩溃点漂移、Linux exit 139 的来源之一）。统一在此
+        收口，避免两类路径再次分叉。
+        """
+        self._cancel_pending_switch_retry()
+        self._cancel_animation_gap()
+        self._clear_drag_move()
+        self._cancel_move()
+        self._self_talk_timer.stop()
+        self._music_sing_timer.stop()
+        self._squash_timer.stop()
+        self._squash_active = False
+        self._physics_timer.stop()
+        jank = getattr(self, "_jank_timer", None)  # 仅 perfstats 观测模式存在
+        if jank is not None:
+            jank.stop()
+
     def _pause_activity(self) -> None:
         """暂停动画解码与所有活动定时器（窗口不可见时没有任何可见效果）。"""
         if not hasattr(self, 'movie'):
@@ -1226,22 +1163,13 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             # 共享解码：窗口停播（隐藏/暂停）→ shareable idle 会话中止
             # （订阅者回绕合成 end，消费端本地回退）；broker 关 = no-op。
             self._broker_unregister(self.anim, self.movie, natural=False)
-        # 隐藏期间不重试被拒动画：停掉待重试并清空状态（恢复显示时重新切换）
-        self._cancel_pending_switch_retry()
-        self._move_timer.stop()
-        self._physics_timer.stop()
-        self._drag_move_timer.stop()
-        self._drag_move_pending = None
+        # 停掉全部活动定时器并清空关联状态（含待重试被拒动画）。
+        self._stop_all_timers()
         # 全屏 watcher 不能在"全屏自动隐藏"期间停：它是退出全屏后
         # 重新 show() 的唯一检测路径，停了桌宠就再也回不来。
         # 只有手动隐藏（托盘/右键，_auto_hidden 为 False）才停它。
         if not self._auto_hidden:
             self._stop_fs_watch()
-        self._self_talk_timer.stop()
-        self._music_sing_timer.stop()
-        self._animation_gap_timer.stop()
-        self._squash_timer.stop()
-        self._squash_active = False
         if hasattr(self, 'proactive_watcher') and self.proactive_watcher is not None:
             self.proactive_watcher.pause()
         if hasattr(self, 'agent_link_manager') and self.agent_link_manager is not None:
@@ -1253,8 +1181,6 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         # 按住状态一并复位（含闸门释放），恢复显示后由 _switch →
         # _update_interaction_hold 重新同步。
         self._reset_press_hold_state()
-        self._cancel_move()
-        self._cancel_animation_gap()
         pp = getattr(self, 'predictive_prewarm', None)
         if pp is not None:
             pp.clear()
@@ -1279,6 +1205,12 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self.agent_link_manager.resume()
         if hasattr(self, 'lib') and self.lib is not None and hasattr(self.lib, 'resume_warm'):
             self.lib.resume_warm()
+        # 窗口隐藏期间审批气泡被 _pause_activity 关掉；恢复显示时若审批仍挂着则重新挂上
+        if self._sticky_bubble_active and self._sticky_text:
+            self._speech_bubble.show_text(
+                self._sticky_text, self.visible_content_rect(), 0,
+                pet_scale=self.scale, subtitle=self._sticky_subtitle, sticky=True,
+            )
 
     def attach_collision_session(self, session) -> None:
         """绑定 AppShell 持有的 IPC facade，GUI 不接触 socket。"""
@@ -1515,183 +1447,58 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         """
         return platform_win._fg_fullscreen_probe()
 
-    def _start_fs_watch(self) -> None:
-        """启动全屏监视线程（幂等）。"""
-        if self._single_process_spawn:  # 批5.2a：flag 开由共享 watcher 接管
-            return
-        if self._fs_thread is not None and self._fs_thread.is_alive():
-            return
-        self._fs_stop.clear()
-        self._fs_thread = threading.Thread(
-            target=self._fs_watch_loop, daemon=True, name="pet-fs-watch")
-        self._fs_thread.start()
-        logging.info("全屏监视线程已启动")
+    def _start_fs_watch(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.start_fs_watch)."""
+        return window_screen.start_fs_watch(self, *args, **kwargs)
 
-    def _stop_fs_watch(self) -> None:
-        """停止全屏监视线程（不 join，线程 1s 内自行退出，绝不卡 UI）。"""
-        self._fs_stop.set()
+    def _stop_fs_watch(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.stop_fs_watch)."""
+        return window_screen.stop_fs_watch(self, *args, **kwargs)
 
-    def _fs_watch_loop(self) -> None:
-        """后台轮询光标与前台窗口，分别使用 20Hz 与 1Hz 节拍。"""
-        # Phase 1：避免纯桌宠启动即加载 PIL；该线程真正需要检测光标时才导入。
-        from . import vision as vision_mod
-        polls = 0
-        consecutive_errors = 0
-        next_fullscreen = time.monotonic() + 1.0
-        while not self._fs_stop.wait(0.05):
-            if shiboken6.isValid(self) is False:
-                return
-            if self._cursor_hidden_passthrough_enabled():
-                try:
-                    visibility = vision_mod.get_cursor_visibility()
-                    if shiboken6.isValid(self) is False:
-                        return
-                    self.cursor_visibility_changed.emit(visibility)
-                    consecutive_errors = 0
-                except (RuntimeError, AttributeError) as exc:
-                    if shiboken6.isValid(self) is False:
-                        return
-                    consecutive_errors += 1
-                    backoff = 1.0 if consecutive_errors == 1 else (2.0 if consecutive_errors == 2 else 5.0)
-                    logging.debug("光标状态检测瞬时异常 (%s), 退避 %ss 后重试", exc, backoff)
-                    if self._fs_stop.wait(backoff):
-                        return
-                except Exception:
-                    try:
-                        if shiboken6.isValid(self) is False:
-                            return
-                        self.cursor_visibility_changed.emit('UNKNOWN')
-                    except (RuntimeError, AttributeError) as exc:
-                        if shiboken6.isValid(self) is False:
-                            return
-                        consecutive_errors += 1
-                        backoff = 1.0 if consecutive_errors == 1 else (2.0 if consecutive_errors == 2 else 5.0)
-                        logging.debug("光标状态降级发射瞬时异常 (%s), 退避 %ss 后重试", exc, backoff)
-                        if self._fs_stop.wait(backoff):
-                            return
-            now = time.monotonic()
-            if not self.auto_hide_fullscreen or now < next_fullscreen:
-                continue
-            next_fullscreen = now + 1.0
-            try:
-                hit, detail = self._fg_fullscreen_probe()
-            except Exception:
-                logging.exception("全屏检测异常")
-                continue
-            polls += 1
-            if hit != self._fs_last:
-                self._fs_last = hit
-                logging.info("全屏检测变化 hit=%s (%s)", hit, detail)
-                if shiboken6.isValid(self) is False:
-                    return
-                self.fullscreen_changed.emit(hit)
-            elif polls % 15 == 0:
-                logging.info("全屏检测心跳 hit=%s %s", hit, detail)
 
-    def _cursor_hidden_passthrough_enabled(self) -> bool:
-        return self._cursor_hidden_passthrough
+    def _fs_watch_loop(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.fs_watch_loop); injects the
+        patchable pet.window.time.monotonic clock seam."""
+        kwargs.setdefault("monotonic", time.monotonic)
+        return window_screen.fs_watch_loop(self, *args, **kwargs)
 
-    def _watch_required(self) -> bool:
-        return os.name == 'nt' and (self.auto_hide_fullscreen or self._cursor_hidden_passthrough_enabled())
+    def _cursor_hidden_passthrough_enabled(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.cursor_hidden_passthrough_enabled)."""
+        return window_screen.cursor_hidden_passthrough_enabled(self, *args, **kwargs)
 
-    def _cursor_transition_blocked(self) -> bool:
-        return (self._press_global is not None or self._dragging or
-                self._interaction_state in ('DRAGGING', 'SLINGSHOT_AIMING', 'PRESS_CANDIDATE'))
+    def _watch_required(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.watch_required)."""
+        return window_screen.watch_required(self, *args, **kwargs)
 
-    def _on_cursor_visibility_changed(self, visibility: str) -> None:
-        if not self._cursor_hidden_passthrough_enabled():
-            return
-        now = time.monotonic()
-        self._cursor_visibility = visibility
-        if visibility == 'HIDDEN':
-            if self._cursor_hidden_since is None:
-                self._cursor_hidden_since = now
-            if now - self._cursor_hidden_since >= 0.2 and not self._cursor_transition_blocked():
-                self._auto_cursor_hidden = True
-                self._apply_effective_mouse_through()
-        elif visibility == 'SHOWING':
-            self._cursor_hidden_since = None
-            if self._cursor_transition_blocked():
-                self._cursor_restore_pending = True
-            else:
-                self._cursor_restore_pending = False
-                self._auto_cursor_hidden = False
-                self._apply_effective_mouse_through()
-        elif visibility == 'SUPPRESSED':
-            self._cursor_hidden_since = None
-            logging.debug('系统光标被触摸/笔输入抑制，保持当前自动穿透状态')
+    def _cursor_transition_blocked(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.cursor_transition_blocked)."""
+        return window_screen.cursor_transition_blocked(self, *args, **kwargs)
 
-    def _on_fullscreen_changed(self, hit: bool) -> None:
-        """主线程：全屏出现 → 隐藏桌宠；全屏退出 → 恢复。"""
-        logging.info("全屏状态变化 hit=%s auto_hidden=%s visible=%s", hit, self._auto_hidden, self.isVisible())
-        if hit:
-            if not self._auto_hidden and self.isVisible():
-                self._auto_hidden = True
-                self._speech_bubble.hide()
-                self.hide(notify=False)  # 自动隐藏是内部语义，不弹"桌宠已隐藏"托盘通知
-        elif self._auto_hidden:
-            self._auto_hidden = False
-            self.show()
+    def _on_cursor_visibility_changed(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.on_cursor_visibility_changed);
+        injects the patchable pet.window.time.monotonic clock seam."""
+        kwargs.setdefault("monotonic", time.monotonic)
+        return window_screen.on_cursor_visibility_changed(self, *args, **kwargs)
 
-    def set_auto_hide_fullscreen(self, on: bool) -> None:
-        """全屏自动隐藏开关（供设置/菜单调用）。"""
-        self.auto_hide_fullscreen = bool(on)
-        self.cfg.set('auto_hide_fullscreen', self.auto_hide_fullscreen)
-        self.cfg.save()
-        if self._watch_required():
-            self._start_fs_watch()
-        else:
-            self._stop_fs_watch()
-        if not self.auto_hide_fullscreen and self._auto_hidden:
-            self._auto_hidden = False
-            self.show()
+    def _on_fullscreen_changed(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.on_fullscreen_changed)."""
+        return window_screen.on_fullscreen_changed(self, *args, **kwargs)
 
-    def set_cursor_hidden_passthrough(self, on: bool) -> None:
-        """切换光标自动穿透，不改变用户手动穿透意图。"""
-        on = bool(on)
-        self._cursor_hidden_passthrough = on
-        self.cfg.set('cursor_hidden_passthrough', on)
-        self.cfg.save()
-        self._cursor_hidden_since = None
-        self._cursor_restore_pending = False
-        if not on:
-            self._auto_cursor_hidden = False
-            self._apply_effective_mouse_through()
-        if self._watch_required():
-            self._start_fs_watch()
-        elif not self._auto_hidden:
-            self._stop_fs_watch()
+    def set_auto_hide_fullscreen(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.set_auto_hide_fullscreen)."""
+        return window_screen.set_auto_hide_fullscreen(self, *args, **kwargs)
 
+    def set_cursor_hidden_passthrough(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.set_cursor_hidden_passthrough)."""
+        return window_screen.set_cursor_hidden_passthrough(self, *args, **kwargs)
+
+    def set_stream_capture_mode(self, *args, **kwargs):
+        """Compatibility delegation (window_screen.set_stream_capture_mode)."""
+        return window_screen.set_stream_capture_mode(self, *args, **kwargs)
     def set_quick_chat_capture_widget(self, widget) -> None:
-        """注册/清空快速对话气泡的捕获子控件引用并同步当前捕获模式。"""
-        self._quick_chat_capture_widget = widget
-        if widget is not None and callable(getattr(widget, "set_capture_compat", None)):
-            widget.set_capture_compat(self._stream_capture_mode, host=self)
+        """Compatibility delegation (window_screen.set_quick_chat_capture_widget)."""
+        return window_screen.set_quick_chat_capture_widget(self, widget)
 
-    def set_stream_capture_mode(self, on: bool) -> None:
-        """直播捕获兼容模式：Tool → 普通顶层窗口 + 标题。
-
-        直播姬/OBS 的窗口捕获会过滤 Tool 窗口（WS_EX_TOOLWINDOW），
-        开启后改为普通窗口并设置可见标题，捕获列表即可看到桌宠；
-        代价是任务栏出现图标。setWindowFlags 会重建原生窗口，随后
-        showEvent 会自动重新应用置顶。
-        """
-        on = bool(on)
-        if on == self._stream_capture_mode:
-            return
-        self._stream_capture_mode = on
-        self.cfg.set('stream_capture_mode', on)
-        self.cfg.save()
-        was_visible = self.isVisible()  # setWindowFlags 重建原生窗口会先隐藏
-        self.setWindowFlags(build_window_flags(self.cfg, self.mouse_through, on))
-        self.setWindowTitle(STREAM_CAPTURE_TITLE if on else '')
-        if was_visible:
-            self.show()  # 只在原本可见时恢复：手动/自动隐藏的桌宠不被意外唤出
-        self._speech_bubble.set_capture_compat(on, host=self)
-        if getattr(self, "_quick_chat_capture_widget", None) is not None and shiboken6.isValid(self._quick_chat_capture_widget):
-            self._quick_chat_capture_widget.set_capture_compat(on, host=self)
-        if not on:
-            self.set_capture_headroom(0)
 
     def _arm_dock_reactivate_restore(self) -> None:
         """macOS：隐藏后点击 Dock 图标激活应用时自动恢复桌宠（一次性监听）。
@@ -1717,6 +1524,17 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._dock_reactivate_armed = False
         self.show()
 
+
+    def _restore_dock_icon_preference(self) -> None:
+        """macOS：桌宠恢复显示后按用户偏好还原 Dock 图标策略。"""
+        if sys.platform != 'darwin' or not getattr(self, "_dock_icon_forced", False):
+            return
+        self._dock_icon_forced = False
+        try:
+            from .app import _mac_set_dock_icon_visible
+            _mac_set_dock_icon_visible(bool(self.cfg.get('show_dock_icon', True)))
+        except Exception:
+            pass
     def set_no_move(self, on: bool) -> None:
         """切换「不移动」：禁用自动移动；勾选瞬间若正在移动则立即停下回待机。"""
         self.no_move = bool(on)
@@ -2667,9 +2485,12 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             if name in self.idles or name in self.turns:
                 self._play_animation_gap_step()
             else:
-                # 异常状态（gap 期间播了非待机/转向动画）：兜底推进动画链，
-                # 避免 return 后动画链停摆
-                self._pick_next()
+                # gap 期间只允许待机/转向自然续播；其他结束回调不能
+                # 绕过剩余计时直接推进动作链。
+                logger.warning(
+                    "animation ended during gap with non-gap clip: name=%r anim=%r",
+                    name, self.anim,
+                )
             return
         if self.animation_gap_seconds > 0 and (name in self.acts or name in self.moves):
             self._start_animation_gap()
@@ -2694,7 +2515,13 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self._switch(self._pick(pool, exclude=self.anim))
 
     def _on_animation_gap_timeout(self) -> None:
+        logger.info(
+            "animation gap timeout: anim=%r gap_active=%s timer_active=%s",
+            self.anim, self._animation_gap_active,
+            self._animation_gap_timer.isActive(),
+        )
         self._animation_gap_active = False
+        self._pick_next()
 
     def _pick_next(self) -> None:
         """动画链：30% 待机 / 10% 转向 / 40% 动作 / 20% 移动（空间不够回退动作）。
@@ -3362,6 +3189,13 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._just_dragged = False
 
     def _on_speech_bubble_clicked(self) -> None:
+        # 交互/告警气泡的主体点击必须是 no-op；只有普通无按钮气泡可打开对话栏。
+        # 以实际展示状态判断，不依赖气泡文案关键词。按钮自身仍由气泡控件处理。
+        bubble = getattr(self, "_speech_bubble", None)
+        if (getattr(self, "_sticky_bubble_active", False)
+                or getattr(bubble, "_interactive_active", False)
+                or getattr(self, "_alert_current", None) is not None):
+            return
         if callable(getattr(self, "on_open_quick_chat", None)):
             self.on_open_quick_chat()
 
@@ -3376,6 +3210,10 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         bubble_origin = bubble.mapToGlobal(QPoint(0, 0))
         bubble_global = QRect(bubble_origin, bubble.size())
         if not bubble_global.contains(global_pos):
+            return False
+        if (getattr(self, "_sticky_bubble_active", False)
+                or getattr(bubble, "_interactive_active", False)
+                or getattr(self, "_alert_current", None) is not None):
             return False
         callback()
         return True
@@ -3575,6 +3413,10 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             pp.clear()
         super().hideEvent(event)
 
+    def _exec_context_menu(self, menu: QMenu, position: QPoint) -> None:
+        """Execute a context menu through a patchable seam."""
+        menu.exec(position)
+
     def _show_context_menu(self, global_pos: QPoint) -> None:
         # 右键菜单弹出 = 用户交互：刷新闲置降帧的活跃锚点。
         # getattr 守卫：测试桩/最小替代对象可以不实现 mark_activity。
@@ -3632,7 +3474,11 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         if callable(update_hold):
             update_hold()
         try:
-            menu.exec(transition_start)
+            executor = getattr(self, "_exec_context_menu", None)
+            if callable(executor):
+                executor(menu, transition_start)
+            else:
+                menu.exec(transition_start)
         finally:
             self._context_menu_open = False
             if callable(update_hold):
@@ -3706,125 +3552,97 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         QTimer.singleShot(10, self, lambda: self._show_context_menu(global_pos))
 
     @staticmethod
-    def _read_self_talk_texts(value) -> list[str]:
-        if not isinstance(value, list):
-            return list(DEFAULT_SELF_TALK_TEXTS)
-        texts = []
-        for item in value:
-            text = str(item).strip()[:120]
-            if text and text not in texts:
-                texts.append(text)
-        return texts or list(DEFAULT_SELF_TALK_TEXTS)
+    def _read_self_talk_texts(*args, **kwargs):
+        """Compatibility delegation (window_alerts.read_self_talk_texts)."""
+        return window_alerts.read_self_talk_texts(*args, **kwargs)
 
-    def _schedule_self_talk(self, *, after_display: bool = False) -> None:
-        self._self_talk_timer.stop()
-        if not self._self_talk_enabled or not (
-            self._self_talk_texts or self._self_talk_images
-        ):
-            return
-        delay = random.uniform(self._self_talk_min_interval, self._self_talk_max_interval)
-        if after_display:
-            delay += self._self_talk_duration_seconds
-        self._self_talk_timer.start(max(1000, int(round(delay * 1000))))
+    def _schedule_self_talk(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.schedule_self_talk)."""
+        return window_alerts.schedule_self_talk(self, *args, **kwargs)
 
-    def _show_self_talk_text(self, text: str) -> bool:
-        if getattr(self, "_bubble_suppressed", False):
-            return False
-        duration_ms = int(round(self._self_talk_duration_seconds * 1000))
-        anchor = self.visible_content_rect()
-        _set_speech_bubble_interactive(self)
-        self._speech_bubble.show_text(
-            text, anchor, duration_ms, pet_scale=self.scale
-        )
-        return True
+    def _expression_style_text(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.expression_style_text)."""
+        return window_alerts.expression_style_text(self, *args, **kwargs)
 
-    def _show_random_self_talk(self) -> bool:
-        if getattr(self, "_bubble_suppressed", False):
-            return False
-        # 惰性剔除运行期间被删除的图片（列表是启动/设置时的快照）
-        live_images = [p for p in self._self_talk_images if p.is_file()]
-        if len(live_images) != len(self._self_talk_images):
-            self._self_talk_images = live_images
-        choices = [
-            ("text", text) for text in self._self_talk_texts
-        ] + [
-            ("image", path) for path in self._self_talk_images
-        ]
-        if not choices:
-            return False
-        kind, value = random.choice(choices)
-        duration_ms = int(round(self._self_talk_duration_seconds * 1000))
-        anchor = self.visible_content_rect()
-        _set_speech_bubble_interactive(self)
-        if kind == "image":
-            return self._speech_bubble.show_image(
-                value, anchor, duration_ms, pet_scale=self.scale,
-                image_scale=self._self_talk_image_scale,
-            )
-        return self._show_self_talk_text(value)
+    def _show_self_talk_text(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.show_self_talk_text)."""
+        return window_alerts.show_self_talk_text(self, *args, **kwargs)
 
-    def _show_click_self_talk(self, click_name: str) -> bool:
-        """优先播放当前点击动画绑定的台词；未绑定则回退全局随机自言自语。"""
-        character_id = str(self.cfg.get('character', catalog.DEFAULT_CHARACTER))
-        texts = self.cfg.click_talk_texts_for(character_id, click_name)
-        if texts:
-            return self._show_self_talk_text(random.choice(texts))
-        return self._show_random_self_talk()
+    def _show_random_self_talk(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.show_random_self_talk)."""
+        return window_alerts.show_random_self_talk(self, *args, **kwargs)
 
-    def _on_self_talk_timeout(self) -> None:
-        if time.monotonic() < self._bubble_busy_until:
-            # 重要气泡占用中：本次自言自语跳过，重新排队下一次
-            self._schedule_self_talk()
-            return
-        displayed = False
-        if self._self_talk_enabled and self.isVisible():
-            displayed = self._show_random_self_talk()
-        self._schedule_self_talk(after_display=displayed)
+    def _show_click_self_talk(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.show_click_self_talk)."""
+        return window_alerts.show_click_self_talk(self, *args, **kwargs)
+
+    def _on_self_talk_timeout(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.on_self_talk_timeout)."""
+        return window_alerts.on_self_talk_timeout(self, *args, **kwargs)
 
     def hold_bubble(self, seconds: float) -> None:
         """声明重要气泡占用时长（自言自语在此期间让路）。"""
         self._bubble_busy_until = max(self._bubble_busy_until, time.monotonic() + max(0.0, seconds))
 
-    def set_bubble_suppressed(self, suppressed: bool) -> None:
-        """设置窗口打开期间暂停气泡显示；True 时立即隐藏当前气泡。"""
-        self._bubble_suppressed = bool(suppressed)
-        if self._bubble_suppressed:
-            self._speech_bubble.hide()
+    @staticmethod
+    def _alert_survives_suppression(*args, **kwargs):
+        """Compatibility delegation (window_alerts.alert_survives_suppression)."""
+        return window_alerts.alert_survives_suppression(*args, **kwargs)
 
-    def _start_music_sing_polling(self) -> None:
-        """启动音乐检测并尽量立即检查一次，避免等一个轮询周期才唱歌。"""
-        if not self._music_sing_enabled:
-            return
-        self._music_sing_timer.start()
-        if self.isVisible():
-            QTimer.singleShot(0, self, self._check_music_sing)
+    def set_bubble_suppressed(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.set_bubble_suppressed)."""
+        return window_alerts.set_bubble_suppressed(self, *args, **kwargs)
 
-    def _check_music_sing(self) -> None:
-        """检测后台音乐并自动播放唱歌动画（可配置开关）。
+    def _start_music_sing_polling(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.start_music_sing_polling)."""
+        return window_alerts.start_music_sing_polling(self, *args, **kwargs)
 
-        音乐播放期间唱歌动画会持续循环；音乐停止或开关关闭后恢复普通动画链。
-        不打断正在播放的一次性动作/点击/拖拽。
-        """
-        if not self.isVisible():
-            return
-        if not self._music_sing_enabled:
-            self._music_sing_active = False
-            return
-        from . import music_detect
-        playing = music_detect.is_music_playing()
-        if self._music_sing_active:
-            if not playing:
-                self._music_sing_active = False
-            return
-        if self._dragging or self._is_one_shot_playing():
-            return
-        if playing:
-            self._music_sing_active = True
-            self._switch(SING_ANIM)
+    def _check_music_sing(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.check_music_sing)."""
+        return window_alerts.check_music_sing(self, *args, **kwargs)
 
-    def show_bubble(self, text: str, duration_ms: int = 3200, subtitle: str | None = None) -> None:
-        """向桌宠头顶冒泡提示（app 层反馈用，非侵入）。重要气泡会占用气泡位。"""
+    def show_alert(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.show_alert)."""
+        return window_alerts.show_alert(self, *args, **kwargs)
+
+    def resolve_alert(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.resolve_alert)."""
+        return window_alerts.resolve_alert(self, *args, **kwargs)
+
+    def _pump_alerts(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.pump_alerts)."""
+        return window_alerts.pump_alerts(self, *args, **kwargs)
+
+    def show_bubble(self, text: str, duration_ms: int = 3200, subtitle: str | None = None,
+                    *, sticky: bool = False, buttons: list[tuple[str, object]] | None = None) -> None:
+        """向桌宠头顶冒泡提示（app 层反馈用，非侵入）。重要气泡会占用气泡位。
+
+        ``sticky=True`` 显示「一直挂到主动关闭」的气泡（审批等）：不启动自动
+        隐藏，且激活期间自言自语/普通气泡让路；被其他气泡临时盖掉后会自动恢复，
+        直到调用 :meth:`hide_bubble` 收尾。
+
+        ``buttons=[(label, callback), ...]`` 进入「交互气泡」模式（审批同意/拒绝、
+        问题 A/B/C）：按钮内嵌在气泡里，点击即回调（上层据此回写 DSH），
+        且自动 sticky（点选前一直挂着）。
+
+        提醒消息队列激活期间（有审批/问题/硬失败/卡住提醒在展示），普通气泡
+        直接让路丢弃，不覆盖提醒弹窗。"""
         if not self.isVisible() or self._bubble_suppressed:
+            return
+        if not sticky and not buttons and getattr(self, "_alert_current", None) is not None:
+            # 有提醒在展示：普通气泡让路，绝不覆盖审批弹窗
+            return
+        if sticky or buttons:
+            self._sticky_bubble_active = True
+            self._sticky_text = str(text)
+            self._sticky_subtitle = str(subtitle or "")
+            self._sticky_buttons = list(buttons) if buttons else None
+            # sticky 不 hold 气泡位（否则会永久挡自言自语）；靠 _sticky_bubble_active 挡
+            self._speech_bubble.show_text(
+                self._sticky_text, self.visible_content_rect(), 0,
+                pet_scale=self.scale, subtitle=self._sticky_subtitle, sticky=True,
+                buttons=self._sticky_buttons,
+            )
             return
         _set_speech_bubble_interactive(self)
         self.hold_bubble(duration_ms / 1000.0 + 2.0)
@@ -3832,6 +3650,18 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             str(text), self.visible_content_rect(), duration_ms,
             pet_scale=self.scale, subtitle=str(subtitle or ""),
         )
+
+    def hide_bubble(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.hide_bubble)."""
+        return window_alerts.hide_bubble(self, *args, **kwargs)
+
+    def clear_alerts(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.clear_alerts)."""
+        return window_alerts.clear_alerts(self, *args, **kwargs)
+
+    def _on_speech_bubble_hidden(self, *args, **kwargs):
+        """Compatibility delegation (window_alerts.on_speech_bubble_hidden)."""
+        return window_alerts.on_speech_bubble_hidden(self, *args, **kwargs)
 
     def hide_speech_bubble(self) -> None:
         """公开转发：隐藏当前气泡（等价 _speech_bubble.hide()）。"""
@@ -3900,9 +3730,16 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self.set_pet_opacity(desired_opacity)
         else:
             self._apply_opacity()  # 首次/未变时也确保窗口已应用
+        previous_gap = self.animation_gap_seconds
         self.animation_gap_seconds = max(0.0, min(3600.0, float(self.cfg.get('animation_gap_seconds', 0.0))))
         if self.animation_gap_seconds <= 0:
             self._cancel_animation_gap()
+        elif self._animation_gap_active and (
+                abs(previous_gap - self.animation_gap_seconds) >= 0.001
+                or not self._animation_gap_timer.isActive()):
+            self._animation_gap_timer.start(
+                max(1, int(round(self.animation_gap_seconds * 1000)))
+            )
         self._music_sing_enabled = bool(self.cfg.get('music_sing_enabled', False))
         if self._music_sing_enabled:
             # 隐藏期间保持停止，恢复显示时由 _resume_activity 按开关状态启动
@@ -4021,11 +3858,102 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._toggle_agent_link(agent_key, on, action)
 
     def _set_agent_link_option(self, key: str, on: bool) -> None:
-        """联动气泡提醒子项开关（开始干活 / 任务完成），立即写入配置。"""
+        """联动气泡提醒子项开关（开始干活 / 任务完成 / 卡住检测），立即写入配置。"""
         ag_data = dict(self.cfg.get('agent_link', {}))
         ag_data[key] = bool(on)
         self.cfg.set('agent_link', ag_data)
         self.cfg.save()
+        # 卡住检测/行为模式检测开关是 AgentLinkManager.apply_config 在启动/切换时
+        # 同步的，需要立即触发，否则要等下次设置变更/重启才生效。
+        if key in ('stuck_detect', 'pattern_detect') and hasattr(self, 'agent_link_manager'):
+            self.agent_link_manager.apply_config()
+
+    def _set_dialogue_mode(self, mode: str) -> None:
+        """Switch wording for existing desktop-pet events; legacy remains default."""
+        mode = mode if mode in ("legacy", "whale_maid", "custom") else "legacy"
+        # 重设/切换内置风格时重新从磁盘加载内置 JSON 预设（文件改动即时生效）。
+        from .persona_phrases import reload_builtin_presets
+        reload_builtin_presets()
+        self.cfg.set("dialogue_mode", mode)
+        self.cfg.save()
+        label = {"legacy": "默认模式", "whale_maid": "鲸鱼娘女仆模式", "custom": "自定义台词"}[mode]
+        self.show_bubble(f"台词风格已切换为{label}", duration_ms=3000)
+
+    def _edit_dialogue_phrases(self) -> None:
+        """Edit templates for the existing event messages only."""
+        fields = (
+            ("start", "开始工作"), ("thinking", "思考"),
+            ("activity.read", "读取"), ("activity.search", "搜索"),
+            ("activity.edit", "编辑"), ("activity.run", "运行/测试"),
+            ("activity.default", "其他工具"),
+            ("approval.command", "审批命令"), ("approval.tool", "审批工具"),
+            ("approval.generic", "审批提示"),
+            ("question.empty", "无选项问题"), ("question.one", "用户问题"),
+            ("question.many", "多个问题"),
+            ("watchdog.warning", "循环警告"), ("rate_limit.one", "限流"),
+            ("rate_limit.many", "连续限流"),
+            ("done.success", "任务完成"), ("done.attention", "任务暂停"),
+            ("failure.retry", "重试失败"), ("failure.tool", "工具失败"),
+            ("failure.generic", "执行失败"),
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("自定义现有台词")
+        layout = QFormLayout(dialog)
+        current = self.cfg.get("dialogue_phrases", {})
+        edits = {}
+        for key, label in fields:
+            edit = QLineEdit(str(current.get(key, "") or ""))
+            edit.setPlaceholderText("留空则使用原有台词；可用 {name}、{command}、{reasons} 等变量")
+            layout.addRow(label, edit)
+            edits[key] = edit
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        phrases = {key: edit.text().strip() for key, edit in edits.items() if edit.text().strip()}
+        self.cfg.set("dialogue_phrases", phrases)
+        self.cfg.set("dialogue_mode", "custom")
+        self.cfg.save()
+        self.show_bubble("自定义台词已保存并启用", duration_ms=3000)
+
+    def edit_agent_link_int(self, key: str, label: str, unit: str,
+                            default: int, minimum: int, maximum: int) -> None:
+        """编辑卡住检测整数参数（阈值/窗口/冷却），立即保存并同步到检测器。"""
+        ag_data = dict(self.cfg.get('agent_link', {}))
+        try:
+            current = int(ag_data.get(key, default))
+        except (TypeError, ValueError):
+            current = default
+        value, ok = QInputDialog.getInt(
+            self, '卡住检测设置', f'{label}（{unit}）：',
+            value=current, minValue=minimum, maxValue=maximum,
+        )
+        if not ok:
+            return
+        ag_data[key] = value
+        self.cfg.set('agent_link', ag_data)
+        self.cfg.save()
+        if hasattr(self, 'agent_link_manager'):
+            self.agent_link_manager.apply_config()
+        self.show_bubble(f'{label}：{value} {unit}')
+
+    def edit_agent_link_text(self, key: str, label: str) -> None:
+        """编辑卡住检测自定义文案（留空恢复默认），立即保存并同步。"""
+        ag_data = dict(self.cfg.get('agent_link', {}))
+        current = str(ag_data.get(key, '') or '')
+        text, ok = QInputDialog.getText(
+            self, '卡住检测设置', f'{label}（留空恢复默认）：', text=current,
+        )
+        if not ok:
+            return
+        ag_data[key] = text.strip()
+        self.cfg.set('agent_link', ag_data)
+        self.cfg.save()
+        if hasattr(self, 'agent_link_manager'):
+            self.agent_link_manager.apply_config()
+        self.show_bubble('卡住检测文案已更新' if text.strip() else '卡住检测文案已恢复默认')
 
     def set_agent_link_option(self, key: str, on: bool) -> None:
         """公开转发：联动气泡提醒子项开关（等价 _set_agent_link_option）。"""
@@ -4304,15 +4232,18 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         QTimer.singleShot(0, self, self._sync_position_debounced)
 
     def _sync_position_debounced(self) -> None:
-        if not self._position_sync_pending:
-            return  # 拖拽开始/松手已立即同步，丢弃过期的去抖回调
+        if self._closing or not self._position_sync_pending:
+            return  # 已关闭或拖拽开始/松手已同步，丢弃过期的去抖回调
         self._position_sync_pending = False
         self._position_sync_now()
 
     def _position_sync_now(self) -> None:
         """立即同步气泡重定位与 position listeners（拖拽开始/松手关键帧）。"""
         self._position_sync_pending = False
-        self._speech_bubble.reposition(self.visible_content_rect())
+        bubble = getattr(self, "_speech_bubble", None)
+        if bubble is None:
+            return  # 窗口已关闭/气泡已销毁：丢弃迟到回调
+        bubble.reposition(self.visible_content_rect())
         for listener in tuple(self._position_listeners):
             try:
                 listener(self)
@@ -4320,7 +4251,39 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
                 logging.exception("\u684c\u5ba0\u4f4d\u7f6e\u76d1\u542c\u5668\u6267\u884c\u5931\u8d25")
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        if getattr(self, '_close_event_done', False):
+            event.accept()
+            return
+        self._close_event_done = True
         self._closing = True  # 关闭后丢弃迟到的动画事件（生命周期守卫）
+        bubble = getattr(self, '_speech_bubble', None)
+        if bubble is not None:
+            # 气泡是独立 Tool 窗口，不能依赖 PetWindow 的 QObject 父链自动销毁。
+            # 先断开回调，避免 dismiss()/hideEvent 在关闭期间重新泵出提醒，
+            # 再停掉内部 timer、关闭窗口并交给 Qt 安全释放。
+            if isinstance(bubble, PetSpeechBubble):
+                try:
+                    bubble.clicked.disconnect(self._on_speech_bubble_clicked)
+                except (RuntimeError, TypeError, AttributeError):
+                    pass
+                try:
+                    bubble.hidden_signal.disconnect(self._on_speech_bubble_hidden)
+                except (RuntimeError, TypeError, AttributeError):
+                    pass
+            try:
+                dismiss = getattr(bubble, "dismiss", None)
+                if callable(dismiss):
+                    dismiss()
+                close = getattr(bubble, "close", None)
+                if callable(close):
+                    close()
+                if isinstance(bubble, PetSpeechBubble):
+                    # 独立 Tool 窗口在 GUI 线程同步销毁，避免全局 DeferredDelete
+                    # 队列在后续测试中触发旧 QObject。
+                    shiboken6.delete(bubble)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
+            self._speech_bubble = None
         # 摘除 DPR 变化信号接线（与 showEvent 的 arm 对称）
         self._disarm_dpr_change_watch()
         # 停掉 Agent 监视器 worker 线程：worker 经引用链持有本窗口，
@@ -4336,15 +4299,17 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self._input_controller.stop()
             self._input_controller = None
         # 不在这里覆盖记忆位置：避免自动移动/抛掷后的随机终点被存下来。
-        self._self_talk_timer.stop()
-        self._cancel_animation_gap()
-        self._clear_drag_move()  # 生命周期兜底：停拖拽合帧 timer、丢 pending
+        # 关闭即停掉全部活动定时器（含待重试被拒动画、移动/挤压/物理/唱歌），
+        # 否则 win.close() 只隐藏不销毁窗口，残留单次 timeout 会在后续测试的
+        # processEvents 触发悬空指针（全量套件崩溃点漂移、exit 139 的来源之一）。
+        self._stop_all_timers()
         self._position_sync_pending = False  # 丢弃 moveEvent 同帧合并的在途去抖
-        self._speech_bubble.hide()
         # 关闭即销毁：暂停预热并对称释放交互让路闸门，避免库侧计数泄漏。
         lib = getattr(self, 'lib', None)
         if lib is not None and hasattr(lib, 'pause_warm'):
             lib.pause_warm()
+        if lib is not None and hasattr(lib, 'shutdown'):
+            lib.shutdown()
         # 显式停掉当前动画 reader（Fix D）：窗口关闭不再依赖 GC + destroyed
         # （已实证会失效的路径），关闭即 stop()——reader 收到停止信号、底层
         # ffmpeg 被 terminate、线程退役登记。_closing 已置位，迟到的动画事件

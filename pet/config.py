@@ -27,6 +27,8 @@ DEFAULT_SELF_TALK_TEXTS = [
     "\u518d\u966a\u4f60\u4e00\u4f1a\u513f\u3002",
 ]
 DEFAULT_SELF_TALK_BUBBLE_STYLE = "classic_top"
+DIALOGUE_MODES = {"legacy", "whale_maid", "custom"}
+DEFAULT_DIALOGUE_PHRASES = {}
 DEFAULT_COLLISION_SETTINGS = {
     "collision_enabled": True,
     "collision_restitution": 0.82,
@@ -200,6 +202,39 @@ def _default_agent_link_data() -> dict:
         "notify_done": True,
         # 过程汇报（可选，默认关）：Agent 干活中报「正在读文件/跑命令/改代码…」
         "notify_activity": False,
+        # 硬失败提醒（默认开）：DSH 已决定本轮不再继续（重试耗尽/工具最终失败）
+        # 时直接提醒，不经行为分析。与审批/问题（notify_approval）同级。
+        "notify_exec_failed": True,
+        # 卡住检测（建议介入，默认关）：DSH 联动开启时，根据工具成败/超时/错误
+        # 推断「Agent 钻牛角尖了」，档位 1 播焦急动画、档位 2 弹持续提醒气泡。
+        "stuck_detect": False,
+        "stuck_worried_threshold": 3,
+        "stuck_intervene_threshold": 5,
+        "stuck_window_seconds": 90,
+        "stuck_cooldown_seconds": 300,
+        "stuck_reminder_text": "",
+        "exploration_watchdog_enabled": True,
+        "exploration_watchdog_warning_threshold": 3,
+        "exploration_watchdog_control_threshold": 5,
+        "exploration_watchdog_cooldown_steps": 3,
+        "exploration_watchdog_early_grace_minutes": 5,
+        "exploration_watchdog_long_run_minutes": 10,
+        "exploration_watchdog_long_think_seconds": 120,
+        # 行为模式检测（默认关）：双窗口规则识别慢性循环 / 短时爆发 / 纯探索无产出。
+        # 细分类：W10 同类 >= 3 → warning；W10 >= 4 → control；W6 >= 3 → control。
+        # 大类：W6 EXPLORATION >= 5 且 ACTION == 0 → control；W10 EXPLORATION >= 7 且
+        # ACTION <= 1 → warning。触发后至少新增 pattern_min_steps_between 个 step
+        # 且间隔 pattern_cooldown_seconds 秒才允许再次触发（step 去重防止误杀并行调用）。
+        "pattern_detect": False,
+        "pattern_w6_control": 3,
+        "pattern_w10_warn": 3,
+        "pattern_w10_control": 4,
+        "pattern_macro_w6_explore": 5,
+        "pattern_macro_w6_action": 0,
+        "pattern_macro_w10_explore": 7,
+        "pattern_macro_w10_action": 1,
+        "pattern_min_steps_between": 3,
+        "pattern_cooldown_seconds": 60,
         # 音效配置
         "sound_enabled": False,
         "sound_start_path": "builtin:agent-start",
@@ -547,6 +582,9 @@ class Config:
             "self_talk_texts": list(DEFAULT_SELF_TALK_TEXTS),
             "self_talk_image_dir": "assets/big_blue_fat_fish",
             "self_talk_bubble_style": DEFAULT_SELF_TALK_BUBBLE_STYLE,
+            # Existing event wording: legacy is deliberately the default.
+            "dialogue_mode": "legacy",
+            "dialogue_phrases": dict(DEFAULT_DIALOGUE_PHRASES),
             "mouse_through": False,
             "cursor_hidden_passthrough": True,
             "drag_physics": False,
@@ -566,6 +604,7 @@ class Config:
             "throw_strength": "standard",  # gentle / standard / strong / crazy
             "idle_low_fps_enabled": False,  # 闲置降帧（灰度默认关）：长时间无交互时动画隔帧呈现
             "idle_low_fps_threshold": 30.0,  # 闲置阈值（秒）：超过该时长无交互且窗口可见才降帧
+            "animation_prewarm_enabled": True,  # 动画素材后台预热开关
             "click_show_balance": False,   # 点击显示 DeepSeek 余额
             "click_show_self_talk": False, # 点击随机显示自定义自言自语
             "balance_refresh_minutes": 0,  # DeepSeek 余额自动刷新间隔（分钟，0=关闭）
@@ -742,7 +781,9 @@ class Config:
             "self_talk_duration_seconds", "self_talk_image_dir",
             "self_talk_image_scale",
             "self_talk_bubble_style",
-             "mouse_through", "cursor_hidden_passthrough", "drag_physics", "context_menu_template",
+            "mouse_through", "cursor_hidden_passthrough", "drag_physics", "context_menu_template",
+            "dialogue_mode",
+            "dialogue_phrases",
             "context_menu_layout",
             "lock_position", "shift_drag", "pet_opacity",
             "context_menu_appearance", "quick_launch_apps",
@@ -773,6 +814,7 @@ class Config:
             "collision_mass_scale", "collision_impulse_cap",
             "collision_sound_enabled", "collision_sound_volume",
             "media_prewarm",
+            "animation_prewarm_enabled",
             "first_frame_cache_max_mb",
             "predict_prewarm_lead_ms",
             "ffmpeg_recycle_minutes",
@@ -806,7 +848,14 @@ class Config:
         providers = chat.get("providers") if isinstance(chat, dict) else None
         if not isinstance(providers, dict):
             return
-        from .chat.models import SecretStore  # 惰性导入，且只实例化一次
+        try:
+            from .chat.models import SecretStore  # 惰性导入，且只实例化一次
+        except ModuleNotFoundError as exc:
+            # 无聊天功能的独立打包会明确排除 pet.chat；配置仍可被
+            # 通用入口加载，因此不能让一次迁移检查阻止桌宠启动。
+            if exc.name == "pet.chat" or str(exc.name or "").startswith("pet.chat."):
+                return
+            raise
         store = SecretStore()
         for provider_id, provider in providers.items():
             if not isinstance(provider, dict):
@@ -856,7 +905,45 @@ class Config:
             raw.pop("decode_broker_enabled", None)
         self._decode_broker_migrated = True
 
+    @staticmethod
+    def _clean_phrase_events(events) -> dict:
+        """清洗单层 dialogue 事件映射 {event: list[str] | str}（值上限 8 条/240 字符）。"""
+        if not isinstance(events, dict):
+            return {}
+        cleaned = {}
+        for key, value in events.items():
+            if not str(key).strip():
+                continue
+            if isinstance(value, list):
+                items = [item.strip()[:240] for item in value if isinstance(item, str) and item.strip()]
+                if not items:
+                    continue
+                cleaned[str(key)] = items[:8]
+            elif isinstance(value, str) and value.strip():
+                cleaned[str(key)] = value.strip()[:240]
+        return cleaned
+
     def _normalize_pet_settings(self):
+        dialogue_mode = str(self.data.get("dialogue_mode") or "legacy").lower()
+        self.data["dialogue_mode"] = dialogue_mode if dialogue_mode in {"legacy", "whale_maid", "custom"} else "legacy"
+        raw_phrases = self.data.get("dialogue_phrases")
+        if isinstance(raw_phrases, dict) and ("global" in raw_phrases or "agents" in raw_phrases):
+            # 统一预设双层 {global: events, agents: {agent_key: events}}
+            preset = {}
+            global_events = raw_phrases.get("global")
+            preset["global"] = self._clean_phrase_events(global_events)
+            agents = {}
+            raw_agents = raw_phrases.get("agents")
+            if isinstance(raw_agents, dict):
+                for agent_key, events in raw_agents.items():
+                    agent_cleaned = self._clean_phrase_events(events)
+                    if str(agent_key).strip() and agent_cleaned:
+                        agents[str(agent_key)] = agent_cleaned
+            preset["agents"] = agents
+            self.data["dialogue_phrases"] = preset
+        else:
+            # 旧单层 {event: [...]}：视为 global
+            self.data["dialogue_phrases"] = self._clean_phrase_events(raw_phrases)
         from . import physics as physics_mod
 
         self.data["playback_speed"] = _float_or_default(self.data.get("playback_speed"), 1.0, 0.1, 8.0)

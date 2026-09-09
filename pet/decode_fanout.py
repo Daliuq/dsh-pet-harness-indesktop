@@ -80,10 +80,15 @@ class _RingBuffer:
         self._capacity = max(1, int(capacity))
         self._dq: deque = deque(maxlen=self._capacity)
         self._lock = threading.Lock()
+        # 高水位线：最近一次 push 的 src_idx（与 push 同锁更新）。
+        # 消费端 pop 返回 None 时可据此判断「真空」vs「暂空但生产端还在推」，
+        # 消除跨线程可见性竞态（produced["done"] 与 ring.push 无 happens-before）。
+        self._last_pushed_src = -1
 
     def push(self, data, src_idx) -> None:
         with self._lock:
             self._dq.append((data, src_idx))  # 满时 deque 自动 drop 最旧
+            self._last_pushed_src = int(src_idx)
 
     def pop(self):
         """取最早一帧；空返回 None。"""
@@ -95,6 +100,17 @@ class _RingBuffer:
     def clear(self) -> None:
         with self._lock:
             self._dq.clear()
+
+    @property
+    def last_pushed_src(self) -> int:
+        """最近一次 push 的 src_idx（-1 = 尚无帧推入）。
+
+        与 push/pop 在同一把锁下更新/读取，消费端可据此判断是否已追平
+        生产端——避免 ``poll()`` 返回 ``none`` 时因跨线程可见性竞态
+        误判为「生产完成」而提前退出。
+        """
+        with self._lock:
+            return self._last_pushed_src
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +173,34 @@ class _FanoutFeedSession:
         self._abort_reason = None
         self._lock = threading.Lock()
 
+    @property
+    def last_consumed_src(self) -> int:
+        """消费端最近一次 pop 到的 src_idx（-1 = 尚未消费任何帧）。
+
+        与 ``_RingBuffer.last_pushed_src`` 配合，供消费端判断是否已追平
+        生产端——消除 ``poll()`` 返回 ``none`` 时的跨线程可见性竞态。
+        """
+        with self._lock:
+            return self._last_src
+
+    @property
+    def last_pushed_src(self) -> int:
+        """代理 ring 的高水位线（最近一次 push 的 src_idx）。"""
+        return self._ring.last_pushed_src
+
+    @property
+    def caught_up(self) -> bool:
+        """消费端是否已追平生产端（无更多待消费帧的可靠判定）。
+
+        当 ``poll()`` 返回 ``none`` 时，消费端可用此属性区分：
+        - ``True``：ring 真空且消费端已 pop 到生产端最后 push 的 src → 生产完成；
+        - ``False``：ring 暂空但生产端可能还在推 → 不可提前退出。
+
+        这消除了 ``produced["done"]`` 标志与 ``ring.push`` 之间无
+        happens-before 保证的跨线程竞态。
+        """
+        return self._ring.last_pushed_src <= self.last_consumed_src
+
     def abort(self, reason: str) -> None:
         """主动 abort（F1）：让本会话下一次 poll 立即返回 ``('abort', ..., reason)``。
 
@@ -184,7 +228,23 @@ class _FanoutFeedSession:
                 return ("abort", None, None, 'watchdog')
         item = self._ring.pop()
         if item is None:
-            return ("none", None, None, None)
+            # 跨线程可见性防护：ring pop 返回 None 可能是暂空（生产端已 push
+            # 但 ring lock 调度延迟导致 pop 看不到），而非真空。检查 ring 的
+            # 高水位线（last_pushed_src，与 push 同锁更新）是否已超过消费端
+            # 最后消费的 src（last_consumed_src）。如果是，说明有帧被 push
+            # 但消费端尚未 pop 到——retry 一次。若 retry 仍空，说明帧已被
+            # drop-oldest 丢弃（最后一帧不会被 drop，所以如果 last_pushed
+            # 是末帧，retry 一定能 pop 到）。
+            with self._lock:
+                consumed = self._last_src
+            pushed = self._ring.last_pushed_src
+            if pushed > consumed:
+                # 有更新的帧被 push 但消费端尚未 pop 到——retry。
+                # 这消除了「pop 返回 None → 消费端看到 produced["done"] →
+                # 提前 break → 末帧遗留在 ring 中未被消费」的竞态。
+                item = self._ring.pop()
+            if item is None:
+                return ("none", None, None, None)
         data, src = item
         src = int(src)
         with self._lock:

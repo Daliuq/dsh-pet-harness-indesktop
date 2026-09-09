@@ -917,12 +917,21 @@ def test_two_sessions_elect_one_coordinator_and_stop(tmp_path):
     second.role_changed.connect(lambda is_coordinator, epoch: roles.append((2, is_coordinator, epoch)))
     first.start()
     second.start()
-    _pump(1.2)
-    assert sum(is_coordinator for _, is_coordinator, _ in roles) == 1
-    epochs = {epoch for _, _, epoch in roles if epoch}
-    assert len(epochs) == 1
-    first.stop()
-    second.stop()
+    try:
+        # 选举经真实文件锁 + 随机 50~250ms 决胜延迟，慢 runner 上 1.2s 固定
+        # 窗口不够（0 coordinator）；轮询等到恰好一个 coordinator，宽预算。
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline and sum(is_coordinator for _, is_coordinator, _ in roles) != 1:
+            _pump(0.05)
+        assert sum(is_coordinator for _, is_coordinator, _ in roles) == 1
+        epochs = {epoch for _, _, epoch in roles if epoch}
+        assert len(epochs) == 1
+    finally:
+        # 无论断言成败都必须停掉两个 QThread：否则 session 被 GC 时线程仍在跑，
+        # 会在后续无关测试的 processEvents 处 native abort（QThread: Destroyed
+        # while thread is still running，崩溃点漂移）。
+        first.stop()
+        second.stop()
     assert not first._thread.isRunning()
     assert not second._thread.isRunning()
 

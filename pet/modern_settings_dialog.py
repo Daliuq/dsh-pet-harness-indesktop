@@ -152,6 +152,8 @@ DIALOGUE_LABELS = {
     "approval.generic": "审批提示", "question.empty": "等待选择",
     "question.one": "单个用户问题", "question.many": "多个用户问题",
     "watchdog.warning": "循环检测警告", "rate_limit.one": "单次限流",
+    "watchdog.control": "循环检测控制告警",
+    "watchdog.control.result": "循环检测控制回执",
     "rate_limit.many": "连续限流", "llm_error.api": "AI 服务错误",
     "done.success": "任务完成",
     "done.attention": "任务暂停待确认", "failure.retry": "重试后失败",
@@ -1334,7 +1336,10 @@ class ModernSettingsDialog(QDialog):
         watchdog_rows = list(self.watchdog_page.findChildren(SettingRow))
         claimed.update(watchdog_rows)
         automation = page_content([
-            ("Agent 联动文案风格", claim_prefix("dialogue_")),
+            ("Agent 联动文案风格", claim("dialogue_mode")),
+            # 逐事件自定义编辑默认折叠：不用自定义台词时不占版面（用户反馈），
+            # 展开后仍是完整的 scope/模板导入/逐事件编辑。
+            ("自定义台词编辑（高级，选「自定义台词」后使用）", claim_prefix("dialogue_"), True),
             ("Agent 提示音", claim_prefix("agent_sound_")),
             ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
             ("主动感知", proactive_rows),

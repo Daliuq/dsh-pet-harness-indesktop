@@ -322,6 +322,11 @@ def build_categories(names, manifest: dict | None = None, folder_map: dict | Non
         ├── drag/     # 拖拽（可选）
         └── random/   # 随机动作
     """
+    names_ordered = list(names)  # 保留调用方顺序（manifest/目录扫描序）。
+    # set 的迭代序随 PYTHONHASHSEED 随机化：若用 set 迭代序做关键词兜底 / 安全
+    # idle / 剩余 acts，低优先级预热池顺序会跨进程不稳定——「首个要预热的段」
+    # 每台机器/每次运行不同，等待首个 clip 进 warm_meta 的用例在 CI 上偶发
+    # 30s 超时（macOS 实测稳定复现）。此处 set 只做成员判断，排序一律用传入顺序。
     names = set(names)
     if not names:
         return {
@@ -340,7 +345,7 @@ def build_categories(names, manifest: dict | None = None, folder_map: dict | Non
         by_folder: dict[str, list[str]] = {k: list(v) for k, v in folder_files.items()}
     elif folder_map:
         by_folder: dict[str, list[str]] = {}
-        for name in names:
+        for name in names_ordered:
             by_folder.setdefault(folder_map.get(name, ''), []).append(name)
     else:
         by_folder = {}
@@ -392,32 +397,32 @@ def build_categories(names, manifest: dict | None = None, folder_map: dict | Non
     # 关键词兜底
     if not idles:
         m = IDLE if IDLE in names else next(
-            (n for n in names if _keyword_match(n, ['待机', 'idle', '呼吸'])), None
+            (n for n in names_ordered if _keyword_match(n, ['待机', 'idle', '呼吸'])), None
         )
         if m:
             idles = [m]
     if not turns:
         m = TURN if TURN in names else next(
-            (n for n in names if _keyword_match(n, ['转向', '转身', '东张西望', 'turn', '回头', '转'])), None
+            (n for n in names_ordered if _keyword_match(n, ['转向', '转身', '东张西望', 'turn', '回头', '转'])), None
         )
         if m:
             turns = [m]
     if drag is None:
         drag = DRAG if DRAG in names else next(
-            (n for n in names if _keyword_match(n, ['拖拽', '拖', '悬空', 'drag', '抓'])), None
+            (n for n in names_ordered if _keyword_match(n, ['拖拽', '拖', '悬空', 'drag', '抓'])), None
         )
     if not moves:
         moves = [n for n in MOVES if n in names]
         if not moves:
-            moves = [n for n in names if _keyword_match(n, ['走', '跑', '移动', 'move', 'walk', 'run', '踏步', '奔跑'])]
+            moves = [n for n in names_ordered if _keyword_match(n, ['走', '跑', '移动', 'move', 'walk', 'run', '踏步', '奔跑'])]
     if not clicks:
         clicks = [n for n in CLICKS if n in names]
         if not clicks:
-            clicks = [n for n in names if _keyword_match(n, ['点击', '回应', 'click', 'response'])]
+            clicks = [n for n in names_ordered if _keyword_match(n, ['点击', '回应', 'click', 'response'])]
 
     # 如果没有明确 idle，安全回退到第一个动画，避免启动崩溃
     if not idles:
-        first = next(iter(names), None)
+        first = names_ordered[0] if names_ordered else None
         if first:
             idles = [first]
 
@@ -448,7 +453,7 @@ def build_categories(names, manifest: dict | None = None, folder_map: dict | Non
                 unique_acts.append(n)
         acts = unique_acts
     else:
-        acts = [n for n in names if n not in core]
+        acts = [n for n in names_ordered if n not in core]
     acts.extend(n for n in inplace_moves if n not in acts)  # 原地素材降级为随机动作
     return {
         'idle': idles[0] if idles else None,

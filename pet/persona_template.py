@@ -125,6 +125,49 @@ EVENT_SOURCES = {
     "balance.loading": ("Pet 内置余额查询",), "balance.result": ("Pet 内置余额查询",),
 }
 
+# 每个事件的一句话场景描述（写给 AI 看的语义说明，写入 entries[].description）。
+# 关键：显式区分「进行中提示（activity.*/start/thinking）」与「出错场景
+# （failure.*/llm_error.*/rate_limit.*/agent.error 等）」——failure.tool 是
+# 「工具调用出错」，不是“工具执行中”；approval.tool 是「待审批的工具调用」。
+# 另标注 Pet 公共事件（balance/bridge 等，不随 Agent 路由，应写 global）。
+EVENT_DESCRIPTIONS: dict[str, str] = {
+    "start": "Agent 开始工作（进行中状态提示，非出错）",
+    "thinking": "Agent 正在思考（进行中状态提示，非出错）",
+    "activity.read": "Agent 正在读取文件——工具调用的过程汇报，进行中，不是错误",
+    "activity.search": "Agent 正在搜索/查找——工具调用过程汇报，进行中",
+    "activity.edit": "Agent 正在编辑代码——工具调用过程汇报，进行中",
+    "activity.run": "Agent 正在运行/测试——工具调用过程汇报，进行中",
+    "activity.default": "Agent 在做其它工具操作——过程汇报，进行中",
+    "agent.attention": "Agent 需要用户处理/注意（状态提示）",
+    "agent.error": "Agent 出错或异常（错误场景）",
+    "agent.missing": "本机未检测到该 Agent 安装",
+    "bridge.install.pending": "正在安装联动通信桥（Pet 公共事件，应写 global）",
+    "bridge.install.success": "联动通信桥安装完成（Pet 公共事件，应写 global）",
+    "bridge.install.failed": "联动通信桥安装失败（Pet 公共事件，应写 global）",
+    "bridge.uninstall.failed": "联动通信桥卸载失败（Pet 公共事件，应写 global）",
+    "dsh.writeback.failed": "Agent 写回 DSH 失败（错误场景，按 Agent 路由可配专属层）",
+    "approval.command": "Agent 请求审批一条命令（等待用户决策）",
+    "approval.tool": "Agent 请求审批一次工具调用（等待用户决策；不是工具已执行）",
+    "approval.generic": "通用审批等待用户决定",
+    "question.empty": "Agent 提问：等待用户从选项选择",
+    "question.one": "Agent 提问：单个问题等待回答",
+    "question.many": "Agent 提问：多个问题等待回答",
+    "watchdog.warning": "循环检测（重复探索行为）风险预警，非阻断",
+    "pattern.warning": "行为重复检测警告（模式提醒，非阻断）",
+    "pattern.control": "行为重复检测达到干预级别（建议介入）",
+    "rate_limit.one": "单次限流（服务侧 429，错误场景）",
+    "rate_limit.many": "连续限流多次（服务侧 429，错误场景）",
+    "llm_error.api": "AI 服务出错（错误场景）",
+    "done.success": "本轮任务完成（收尾）",
+    "done.attention": "任务停下等待用户确认（收尾）",
+    "failure.retry": "本轮多次重试后仍失败（错误场景）",
+    "failure.tool": "工具执行失败——Agent 调用工具时出错（错误场景；不是「正在执行工具」的过程提示）",
+    "failure.generic": "本轮运行通用失败（错误场景）",
+    "stuck.reminder": "卡住检测提醒：Agent 疑似钻牛角尖，建议人工介入",
+    "balance.loading": "余额查询中提示（Pet 公共事件，应写 global）",
+    "balance.result": "余额查询结果（Pet 公共事件，应写 global；占位符 {text}）",
+}
+
 # 每个事件 key 由其对应的上游方法（调用点）显式注入的参数——这是该弹窗
 # 「能获取到的字段」的完整清单，entries[].parameters 与之逐 key 严格相等。
 # 分两类：无条件注入的（保证可用）+ 条件注入的（CONDITIONAL_PARAMETERS，
@@ -226,7 +269,14 @@ EXPORT_GUIDE: dict[str, Any] = {
         "4. 想精确改某一句：到 entries 按 key 找到同一项，参考 sources（什么事件触发）与 parameters（该项可用变量），"
         "再改顶层 phrases 中同名 key（两处应保持一致）。",
         "5. 改完把整个 JSON 原样粘贴回设置页「自定义台词」的输入框，点「导入模板」即生效。",
+        "6. 想按 Agent 分开说话：用顶层 agents 给每个 Agent 配专属文案层（见下方「Agent 专属配置」小节）。",
     ],
+    "Agent 专属配置（agents 层）": (
+        "custom 模式下运行时会按「正在活动的 Agent」选台词：agents[该Agent][事件] → global(顶层 phrases)[事件] → 内置默认，"
+        "逐级兜底、留空即继承上一层。顶层 agents 的每个键就是一个 Agent（dsh/claude/cursor/opencode/自定义 Agent 等），"
+        "值为 {事件key: [候选文案数组]}，键名与顶层 phrases 完全一致、可全部或只挑几个事件配置。"
+        "注意：余额查询、桥接安装/卸载等 Pet 公共事件不随 Agent 路由，请写在顶层 phrases（global），不要在 agents 里写。"
+    ),
     "顶层字段涵义": {
         "_说明": "本段注释，导入时忽略，可保留或删除。",
         "template": "模板格式版本标识 persona-phrases/v1，导入时校验用，请勿改动。",
@@ -241,7 +291,7 @@ EXPORT_GUIDE: dict[str, Any] = {
     },
     "entries 项内字段涵义": {
         "key": "事件标识（与顶层 phrases 的键一致）：如 start=开始工作、thinking=思考、activity.read=读取文件、approval.command=命令审批。",
-        "description": "该 key 的说明文字（当前为占位，内容与 key 相同），可自行补充更易读的说明。",
+        "description": "该 key 的一句话语义说明（写入本模板，供人/AI 阅读；已区分「进行中提示」与「出错场景」，Pet 公共事件会标注）。导入时忽略，可自由改写。",
         "sources": "触发该文案的上游事件来源名，帮助理解在什么时刻出现，一般不改。",
         "parameters": "该项对应上游方法显式注入的 {变量} 清单（保证可用，含义见顶层 variables）。上游事件记录附带字段不在此列，需要时参考顶层 upstream（仅事件同轮可读）。",
         "displayHint": "用占位符写出的一句话示例，展示该事件能表达的信息上限，方便你或 AI 判断写多少内容；不会直接展示给用户。",
@@ -270,14 +320,19 @@ EXPORT_GUIDE: dict[str, Any] = {
 }
 
 
-def build_persona_template(config: dict[str, Any] | None) -> dict[str, Any]:
-    """Build a complete portable document without leaking runtime settings."""
+def build_persona_template(config: dict[str, Any] | None, agent_keys=None) -> dict[str, Any]:
+    """Build a complete portable document without leaking runtime settings.
+
+    agent_keys：需要生成「专属配置脚手架」的 Agent 键列表（如内置四件套 +
+    自定义 Agent）。不传则导出纯 global 模板（不含 agents 层），保持向后兼容。
+    """
     config = config if isinstance(config, dict) else {}
     raw = config.get("dialogue_phrases", config)
     raw = raw if isinstance(raw, dict) else {}
     phrases = {}
     entries = []
-    for key in phrase_keys():
+    keys = phrase_keys()
+    for key in keys:
         value = raw.get(key, [])
         if isinstance(value, str):
             value = [value] if value.strip() else []
@@ -287,13 +342,22 @@ def build_persona_template(config: dict[str, Any] | None) -> dict[str, Any]:
             value = []
         phrases[key] = copy.deepcopy(value)
         parameters = list(PARAMETERS.get(key, ()))
-        entries.append({"key": key, "description": key, "sources": list(EVENT_SOURCES.get(key, ())), "parameters": parameters, "displayHint": DISPLAY_HINTS.get(key, ""), "phrases": copy.deepcopy(value)})
+        entries.append({"key": key, "description": EVENT_DESCRIPTIONS.get(key, key), "sources": list(EVENT_SOURCES.get(key, ())), "parameters": parameters, "displayHint": DISPLAY_HINTS.get(key, ""), "phrases": copy.deepcopy(value)})
     mode = str(config.get("dialogue_mode", "custom") or "custom")
+    agents = None
+    if agent_keys:
+        # 每个 Agent 一层：事件键与顶层 phrases 完全一致，值留空 = 沿用 global/内置。
+        agents = {str(key): {k: [] for k in keys} for key in agent_keys if str(key or "").strip()}
     document = {
         "template": TEMPLATE_VERSION,
         "mode": mode if mode in {"legacy", "whale_maid", "custom"} else "custom",
         "name": str(config.get("persona_template_name", "我的角色台词") or "我的角色台词"),
-        "description": "Pet 全部弹窗/气泡内容模板。每个 entries 项的 parameters 是该项上游方法显式注入的参数（保证可用）；上游事件记录附带字段见顶层 upstream（仅事件同轮可读）。",
+        "description": (
+            "Pet 全部弹窗/气泡内容模板，供 AI 依角色卡从零撰写台词（纯字段参考，当前配置不携带）。"
+            "三层覆盖链（custom 模式、按正在活动的 Agent 路由）：agents[Agent][事件] → global(顶层 phrases)[事件] → 内置默认；"
+            "留空即继承上一层。每个 entries 项的 parameters 是该项上游方法显式注入的参数（保证可用），"
+            "其余可读上游字段见顶层 upstream（仅事件同轮可读）；条件参数上游缺失时渲染端自动隐藏，无需写回退。"
+        ),
         "variables": copy.deepcopy(VARIABLES),
         "upstream": {
             "description": "模板渲染会自动合并最近一条上游事件记录的字段（审批/提问/限流/工具/失败类文案与记录同轮触发，字段可靠；状态机与本地检测触发的文案不保证有记录），并保留完整对象于 payload/data。显式别名（如 name、command）优先。",
@@ -304,6 +368,8 @@ def build_persona_template(config: dict[str, Any] | None) -> dict[str, Any]:
         "phrases": phrases,
         "entries": entries,
     }
+    if agents is not None:
+        document["agents"] = agents
     return {"_说明": EXPORT_GUIDE, **document}
 
 

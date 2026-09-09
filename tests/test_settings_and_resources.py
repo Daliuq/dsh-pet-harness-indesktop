@@ -462,10 +462,20 @@ def test_export_dialogue_template_mentions_agents_separator(qapp, tmp_path):
     dialog = ModernSettingsDialog(cfg, include_ai=False)
     try:
         data = dialog._current_dialogue_template()
-        # 导出仍是纯字段参考模板：phrases 留空；不强制含 agents（既有导出契约）
+        # 导出仍是纯字段参考模板：phrases 留空；含 agents 专属配置脚手架
         assert all(not v for v in data["phrases"].values())
         text = json_mod.dumps(data, ensure_ascii=False)
         assert "persona-phrases/v1" in text
+        agents = data.get("agents", {})
+        assert agents, "导出模板应含 agents 专属配置脚手架"
+        for agent_events in agents.values():
+            assert set(agent_events) == set(data["phrases"])
+            assert all(not v for v in agent_events.values())
+        # entries.description 给出一句话语义，不再是 key 占位（AI 可读）
+        assert any(
+            entry["description"] and entry["description"] != entry["key"]
+            for entry in data["entries"]
+        )
     finally:
         dialog.deleteLater()
 

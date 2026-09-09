@@ -149,3 +149,16 @@ def test_public_events_excluded_from_agent_scoped_editor():
     assert "dsh.writeback.failed" in scoped
     assert "balance.result" not in scoped
     assert "thinking" in scoped
+
+
+def test_event_descriptions_cover_all_keys():
+    """EVENT_DESCRIPTIONS 覆盖全部事件且给一句话语义（≠ key 占位）。
+
+    回归（ticket 08）：entries[].description 曾等于 key，AI 会把 failure.tool
+    （工具执行失败=出错）误读成“工具执行中”。描述需逐 key 存在、非空、非占位。
+    """
+    from pet.persona_template import EVENT_DESCRIPTIONS
+
+    assert set(EVENT_DESCRIPTIONS) == set(phrase_keys())
+    for key, text in EVENT_DESCRIPTIONS.items():
+        assert text and text != key, (key, text)

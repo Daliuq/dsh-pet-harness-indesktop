@@ -624,10 +624,17 @@ def _dialogue_phrase_values(host) -> dict[str, list[str]]:
 def _current_dialogue_template(host) -> dict:
     # 导出 = 纯字段参考模板：phrases 一律留空（不携带当前已配置的台词），
     # 供 AI 依角色卡从零撰写；当前台词如需备份请直接复制编辑框内容。
+    # agents：为「全部 Agent（含自定义）」各生成一层事件脚手架（值空 = 沿用
+    # global/内置），让 AI 能逐个 Agent 单独配台词。
+    agent_keys = [
+        str(host.dialogue_scope_select.itemData(index) or "")
+        for index in range(host.dialogue_scope_select.count())
+    ]
+    agent_keys = [key for key in agent_keys if key]
     return build_persona_template({
         "dialogue_mode": host.dialogue_mode_select.currentData() or "legacy",
         "dialogue_phrases": {},
-    })
+    }, agent_keys=agent_keys or None)
 
 
 def _export_dialogue_template(host) -> None:

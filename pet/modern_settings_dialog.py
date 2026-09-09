@@ -1333,12 +1333,17 @@ class ModernSettingsDialog(QDialog):
         claimed.update(proactive_rows)
         watchdog_rows = list(self.watchdog_page.findChildren(SettingRow))
         claimed.update(watchdog_rows)
+        # WatchdogSettingsPage 现同时承载「循环检测」（watchdog/long_think）与
+        # 「卡住检测」（stuck_*）两组行，按 objectName 前缀分组显示。
+        stuck_rows = [r for r in watchdog_rows if r.objectName().startswith("settingRow_stuck_")]
+        loop_rows = [r for r in watchdog_rows if not r.objectName().startswith("settingRow_stuck_")]
         automation = page_content([
             ("Agent 联动文案风格", claim_prefix("dialogue_")),
             ("Agent 提示音", claim_prefix("agent_sound_")),
             ("待办提醒", claim("todo_reminder_enabled", "todo_reminder_lead_minutes")),
             ("主动感知", proactive_rows),
-            ("循环检测", watchdog_rows),
+            ("循环检测", loop_rows),
+            ("卡住检测", stuck_rows),
         ])
 
         # Preserve any newly added row until it receives an explicit domain decision.

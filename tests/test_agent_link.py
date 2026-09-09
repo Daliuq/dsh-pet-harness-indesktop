@@ -1987,9 +1987,9 @@ class TestCustomAgentMenu:
             for label in ("DeepSeek Harness (DSH)", "Claude Code", "Cursor", "OpenCode"):
                 assert label in texts
             assert "Gemini CLI" in texts
-            # Agent 联动子菜单不再带「台词风格」入口，仅保留联动相关设置
+            # Agent 联动子菜单不再带「台词风格」「循环检测/卡住检测」入口——
+            # 检测类配置已收敛到设置页（自动化与联动），仅保留联动相关设置
             assert "台词风格" not in texts
-            assert "循环检测" in texts
 
             gemini_act = next(a for a in sub.actions() if a.text() == "Gemini CLI")
             gemini_act.setChecked(True)

@@ -138,16 +138,29 @@ def _close_qt_top_level_widgets():
     # 副作用（t4 曾因此崩溃）；deleteLater 走 DeferredDelete，Qt 安全销毁且不
     # 触发 closeEvent。清理掉泄漏的 C++ 对话框，避免其悬空事件在后续测试的
     # processEvents 引爆（崩溃点漂移、access violation）。
+    # 逐对象定向派发自己排的 DeferredDelete，绝不调用共享 QApplication 的全局
+    # processEvents()。全局冲刷会把其他测试遗留的排队事件（跨线程 queued 调用、
+    # 历史 timer、别处排的删除任务）一并派发到正在销毁/已销毁的原生对象上，
+    # 把历史 QObject 生命周期集中引爆在当前测试 —— 这正是全量套件偶发
+    # 0xC0000005 access violation、且崩溃点随当前测试漂移的机制
+    # （docs/QT-LIFECYCLE-FULL-SUITE-STABILIZATION-2026-09.md §2、§4：全局冲刷与
+    # 进程级 sendPostedEvents 都已被否决；本轮崩溃点就是这里的 app.processEvents()）。
     try:
+        import shiboken6
+        from PySide6.QtCore import QCoreApplication, QEvent
         from PySide6.QtWidgets import QApplication
         app = QApplication.instance()
         if app is not None:
             for widget in list(app.topLevelWidgets()):
                 try:
+                    if not shiboken6.isValid(widget):
+                        continue  # C++ 侧已销毁的半死窗口：跳过
                     widget.deleteLater()
+                    # 接收者定向：只处理这一个对象的 DeferredDelete，不触碰共享队列里
+                    # 其他对象的删除任务与排队事件。
+                    QCoreApplication.sendPostedEvents(widget, QEvent.Type.DeferredDelete)
                 except RuntimeError:
-                    pass  # C++ 侧已销毁的半死窗口：跳过
-            app.processEvents()
+                    pass
     except Exception:
         pass
 

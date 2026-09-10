@@ -1610,6 +1610,10 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         # 动画时可能以错误的节流状态开播最多一帧。
         self._sync_movie_throttle(self._idle_reduction_active())
         movie.stop()
+        # _switch 切动画必须从头播：stop() 若触发圈末软停驻留（_soft_parked），
+        # start() 会走续圈路径直接返回、不重置 queue/frame_index，导致动画从
+        # 圈边界继续而非帧 0。此处强制清除驻留态，保证 start() 走 fresh start。
+        movie._soft_parked = False
         movie.jumpToFrame(0)
         if hasattr(movie, 'set_playback_speed'):
             movie.set_playback_speed(self.playback_speed)
@@ -1714,6 +1718,8 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         # 批11：idle 回退同样按当前门控对齐解码节流（见 _switch 同名调用）。
         self._sync_movie_throttle(self._idle_reduction_active())
         movie.stop()
+        # 同 _switch：idle 回退也必须从头播，清除圈末软停驻留态。
+        movie._soft_parked = False
         movie.jumpToFrame(0)
         if hasattr(movie, 'set_playback_speed'):
             movie.set_playback_speed(self.playback_speed)

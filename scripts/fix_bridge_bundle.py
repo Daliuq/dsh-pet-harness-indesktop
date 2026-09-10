@@ -43,10 +43,14 @@ def main() -> int:
     dst_nm = os.path.join(dst_bridge, "node_modules")
 
     if not os.path.isdir(src_nm):
-        print(f"[bridge] source node_modules missing: {src_nm} - "
-              f"run `pnpm install --frozen-lockfile` in integrations/dsh-pet-bridge first",
-              file=sys.stderr)
-        return 1
+        # 构建环境没有本地 node_modules（CI 首次 checkout / tag 构建）：
+        # 此时没有任何 pnpm junction 需要展开，bundle 里也不会带上 node_modules，
+        # 与 build_onedir.ps1「无 node_modules 时只做声明+lockfile 校验，
+        # 由运行时 install_bridge 用 pnpm 落盘」的既有设计一致——构建继续，
+        # 不能因为「没有可修复的东西」而失败。
+        print("[bridge] source node_modules absent - skip bundle repair "
+              "(declaration check only; install_bridge resolves via pnpm at runtime)")
+        return 0
 
     # 删除 PyInstaller 复制出的（可能损坏的）node_modules：它可能是普通目录、
     # junction 或指向源路径的符号链接。

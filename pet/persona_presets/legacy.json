@@ -1,7 +1,7 @@
 {
   "activity.default": [
     "{name} 正在当前会话 {sessionName} 中处理 {label}。",
-    "当前会话 {sessionName} 中，{name} 正在使用 {tool} 执行操作。",
+    "当前会话 {sessionName} 中，{name} 正在使用 {tool} 执行当前操作。",
     "{name} 在当前会话 {sessionName} 中执行到第 {step} 步，请稍等。"
   ],
   "activity.edit": [
@@ -119,6 +119,16 @@
     "模型服务请求失败，请稍后再试。",
     "AI 服务当前无法正常响应，请检查网络或服务状态。"
   ],
+  "model_access.many": [
+    "当前会话 {sessionName} 的模型访问已连续失败 {count} 次，请稍后再试。",
+    "当前会话 {sessionName} 的连续模型访问失败次数为 {consecutiveRetryCount}，错误码：{errorCode}。",
+    "当前会话 {sessionName} 的第 {retry} 次模型访问仍未成功：{errorMessage}"
+  ],
+  "model_access.one": [
+    "当前会话 {sessionName} 的本次模型访问失败，请稍后再试。",
+    "当前会话 {sessionName} 的模型访问暂时未成功，错误码：{errorCode}。",
+    "当前会话 {sessionName} 的第 {retry} 次模型访问未成功：{errorMessage}"
+  ],
   "pattern.control": [
     "{name} 出现了明显的重复行为：{reasons}",
     "{name} 当前行为模式已经达到建议干预的程度：{reasons}",
@@ -143,16 +153,6 @@
     "当前会话 {sessionName} 中，{name} 正在询问：{body}",
     "{name} 在当前会话 {sessionName} 中有一个问题需要你决定：{body}",
     "请回答当前会话 {sessionName} 中 {name} 的问题：{body}"
-  ],
-  "model_access.many": [
-    "当前会话 {sessionName} 的模型访问已连续失败 {count} 次，请稍后再试。",
-    "当前会话 {sessionName} 的连续模型访问失败次数为 {consecutiveRetryCount}，错误码：{errorCode}。",
-    "当前会话 {sessionName} 的第 {retry} 次尝试仍未成功：{errorMessage}"
-  ],
-  "model_access.one": [
-    "当前会话 {sessionName} 的本次模型访问失败，请稍后再试。",
-    "当前会话 {sessionName} 的模型请求暂时未成功，错误码：{errorCode}。",
-    "当前会话 {sessionName} 的第 {retry} 次尝试未成功：{errorMessage}"
   ],
   "start": [
     "{name} 已开始执行任务。",

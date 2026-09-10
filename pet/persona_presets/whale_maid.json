@@ -7,7 +7,7 @@
   "activity.edit": [
     "主人～{name}正在当前会话 {sessionName} 里编辑{label}，现在只是正常修改过程哦～",
     "哼，会话 {sessionName} 里的{name}正通过{tool}修改内容，已经做到第{step}步啦。",
-    "{name}还在当前会话 {sessionName} 里继续编辑，调用编号{callId}人家也替主人记着呢～"
+    "{name}还在当前会话 {sessionName} 里继续编辑，主人稍等一下哦～"
   ],
   "activity.read": [
     "主人～{name}正在当前会话 {sessionName} 里读取{label}，人家也陪您瞄两眼～",
@@ -17,7 +17,7 @@
   "activity.run": [
     "主人～{name}正在当前会话 {sessionName} 里运行{label}，现在是正常执行过程哦～",
     "哼，会话 {sessionName} 里的{tool}已经跑起来啦，{name}做到第{step}步了。",
-    "{name}正在当前会话 {sessionName} 里继续执行，调用编号是{callId}，人家替主人等结果～"
+    "{name}正在当前会话 {sessionName} 里继续执行，人家替主人等结果～"
   ],
   "activity.search": [
     "主人～{name}正在当前会话 {sessionName} 里搜索{label}，人家也下去帮忙捞线索啦～",
@@ -119,6 +119,16 @@
     "模型服务暂时没有正常回应……哼，这次真的不是鲸鱼偷懒。",
     "AI API 请求失败啦，主人检查一下网络或模型服务状态哦～"
   ],
+  "model_access.many": [
+    "呜～当前会话 {sessionName} 的模型访问已经连续失败{count}次啦，主人先别继续硬冲嘛。",
+    "会话 {sessionName} 的连续模型访问失败次数已经到{consecutiveRetryCount}，错误码是{errorCode}：{errorMessage}",
+    "当前会话 {sessionName} 的第{retry}次模型访问还是没成功，主人先等等嘛，硬撞只会把鲸鱼累趴啦～"
+  ],
+  "model_access.one": [
+    "呜～当前会话 {sessionName} 这次模型访问失败啦，主人稍等一下再试嘛。",
+    "会话 {sessionName} 的模型访问暂时没成功，错误码是{errorCode}：{errorMessage}",
+    "当前会话 {sessionName} 的第{retry}次尝试还没成功，连续模型访问失败次数是{consecutiveRetryCount}，人家先替主人盯着～"
+  ],
   "pattern.control": [
     "主人～{name}的重复行为已经达到需要干预的程度啦：{reasons}",
     "哼，{name}又在明显绕圈子，原因是{reasons}，继续下去不划算啦。",
@@ -143,16 +153,6 @@
     "主人～当前会话 {sessionName} 里的{name}正在问您：{body}",
     "{name}在会话 {sessionName} 里有一个问题需要您决定：{body}",
     "当前会话 {sessionName} 里的{name}正在等这个问题的答案：{body}"
-  ],
-  "model_access.many": [
-    "呜～当前会话 {sessionName} 的模型访问已经连续失败{count}次啦，主人先别继续硬冲嘛。",
-    "会话 {sessionName} 的连续模型访问失败次数已经到{consecutiveRetryCount}，错误码是{errorCode}：{errorMessage}",
-    "当前会话 {sessionName} 的第{retry}次尝试还是没成功，主人先等等嘛，硬撞只会把鲸鱼累趴啦～"
-  ],
-  "model_access.one": [
-    "呜～当前会话 {sessionName} 这次模型访问失败啦，主人稍等一下再试嘛。",
-    "会话 {sessionName} 的模型请求暂时没成功，错误码是{errorCode}：{errorMessage}",
-    "当前会话 {sessionName} 的第{retry}次尝试还没成功，连续失败次数是{consecutiveRetryCount}，人家先替主人盯着～"
   ],
   "start": [
     "主人～{name}开始工作啦，人家会帮您盯着它的～",

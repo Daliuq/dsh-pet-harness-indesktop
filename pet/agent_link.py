@@ -44,6 +44,7 @@ from .agent_event_normalizer import normalize_event
 from .agent_event_runtime import AgentEventRuntime
 from .model_access_tracker import ModelAccessTracker
 from .node_runtime import augmented_path as _augmented_path
+from .node_runtime import global_node_modules_roots
 
 from .persona_phrases import PhrasePicker
 from .persona_template import CONDITIONAL_PARAMETERS
@@ -73,6 +74,9 @@ def _which(name: str) -> str | None:
 #   node <pnpm CLI> add|remove <pkg>   —— 数组传参，不经任何 cmd 中转；
 # 并自行维护 profile 的 dsh.profile.bundles 层（等价于 dsh plugin add 的
 # reconcile 产物）。安装产物与 dsh 版本无关，EAC 桌面端 / 原生 CLI 均可加载。
+#
+# pnpm 入口的定位见 _find_pnpm_cli：npm 全局安装、nvm / nvm-windows 版本目录、
+# pnpm ≤10 的 pnpm.cjs、包装脚本、独立 pnpm.exe 都要认（issue：桌宠找不到 pnpm）。
 
 DSH_PLUGIN_NAME = "@dsh-pet/bridge"
 DSH_PROFILE_HOME = Path(os.environ.get("DSH_HOME", str(Path.home() / ".dsh")))
@@ -98,40 +102,236 @@ def _real_profiles() -> list[Path]:
     )
 
 
+# pnpm / npm 的 JS 入口在包内的相对路径：不同版本/安装方式各不相同
+# （pnpm 10 及以前是 bin/pnpm.cjs，pnpm 11 起是 bin/pnpm.mjs）。
+_JS_CLI_NAMES: dict[str, tuple[str, ...]] = {
+    "pnpm": ("pnpm.mjs", "pnpm.cjs", "pnpm.js"),
+    "npm": ("npm-cli.js", "npm-cli.cjs", "npm-cli.mjs"),
+}
+_JS_CLI_SUFFIXES = {".js", ".cjs", ".mjs"}
+# 包管理器生成的包装脚本（Windows 的 .cmd/.ps1、POSIX 的无扩展名 shell 脚本）
+_SHIM_NAMES: dict[str, tuple[str, ...]] = {
+    "pnpm": ("pnpm.cmd", "pnpm.exe", "pnpm.bat", "pnpm.ps1", "pnpm"),
+    "npm": ("npm.cmd", "npm.exe", "npm.bat", "npm.ps1", "npm"),
+}
+_PNPM_MISSING_HINT = (
+    "需要 pnpm，自动安装失败。可手动运行 npm install -g pnpm，"
+    "或用环境变量 DSH_PNPM_BIN 指定 pnpm 的可执行文件 / JS 入口路径"
+)
+
+
+def _is_js_cli(path: Path) -> bool:
+    return path.suffix.lower() in _JS_CLI_SUFFIXES
+
+
+def _is_direct_cli(path: Path) -> bool:
+    """能脱离 node 直接执行的入口（独立 pnpm.exe、.cmd/.ps1、POSIX shell 脚本）。"""
+    suffix = path.suffix.lower()
+    return not suffix or suffix in {".exe", ".cmd", ".bat", ".ps1"}
+
+
+def _dedupe_paths(paths) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _js_cli_candidates(root: Path, package: str) -> list[Path]:
+    """某个根目录下 JS 入口的所有已知落点。
+
+    root 可能是 node 安装根（`.../v18.20.5`、`.../v18.20.5/bin`、nodejs 安装目录），
+    也可能是全局 `node_modules` 根——两种都要覆盖，POSIX（nvm/lib/node_modules）
+    与 Windows（nvm-windows/AppData）布局才都不会漏。
+    """
+    names = _JS_CLI_NAMES.get(package, ())
+    subdirs = (
+        ("node_modules", package, "bin"),
+        ("lib", "node_modules", package, "bin"),
+        ("node_modules", package, "dist"),
+        ("lib", "node_modules", package, "dist"),
+        (package, "bin"),
+        (package, "dist"),
+    )
+    return [root.joinpath(*sub, name) for sub in subdirs for name in names]
+
+
+def _shim_target(shim: Path, package: str) -> Path | None:
+    """从包装脚本正文里抠出真正的 JS 入口。
+
+    npm/pnpm 生成的 `.cmd`/`.ps1`/shell 包装都写着真实入口的相对路径
+    （`"%dp0%\\node_modules\\pnpm\\bin\\pnpm.mjs"`、`$basedir/../lib/...`），
+    按固定布局硬猜会漏（issue：nvm 用户只能改源码）。
+    """
+    try:
+        text = shim.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    pattern = re.compile(
+        r"""["']([^"'\r\n]*[/\\]%s(?:-cli)?\.(?:mjs|cjs|js))["']""" % re.escape(package)
+    )
+    for raw in pattern.findall(text):
+        token = raw.strip()
+        relative = False
+        for prefix in ("%~dp0", "%dp0%", "$basedir", "${basedir}"):
+            if token.lower().startswith(prefix.lower()):
+                token = token[len(prefix):].lstrip("\\/")
+                relative = True
+                break
+        if not token:
+            continue
+        candidate = Path(token)
+        if relative or not candidate.is_absolute():
+            candidate = shim.parent / candidate
+        try:
+            candidate = candidate.resolve()
+        except OSError:
+            pass
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_cli_hint(hint: Path, package: str) -> Path | None:
+    """把 DSH_PNPM_BIN 之类的提示解析成可用入口（文件 / 目录 / 包装脚本）。"""
+    if hint.is_dir():
+        for name in _SHIM_NAMES.get(package, ()):
+            candidate = hint / name
+            if candidate.is_file():
+                target = _shim_target(candidate, package)
+                if target:
+                    return target
+                if _is_js_cli(candidate) or _is_direct_cli(candidate):
+                    return candidate
+        for candidate in _js_cli_candidates(hint, package):
+            if candidate.is_file():
+                return candidate
+        for name in _JS_CLI_NAMES.get(package, ()):
+            candidate = hint / name
+            if candidate.is_file():
+                return candidate
+        return None
+    if not hint.is_file():
+        return None
+    if _is_js_cli(hint):
+        return hint
+    target = _shim_target(hint, package)
+    if target:
+        return target
+    return hint if _is_direct_cli(hint) else None
+
+
+def _package_roots() -> list[Path]:
+    """pnpm / npm / dsh 全局包可能落脚的根目录（版本管理器 + 包管理器）。"""
+    roots: list[Path] = []
+    for name in ("pnpm", "npm", "node"):
+        found = _which(name)
+        if not found:
+            continue
+        path = Path(found)
+        roots.extend([path, path.parent, path.parent.parent])
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        roots.extend([resolved, resolved.parent, resolved.parent.parent])
+    roots.extend(global_node_modules_roots())
+    for var in ("PNPM_HOME", "NVM_SYMLINK", "NVM_HOME", "NVM_DIR", "VOLTA_HOME"):
+        value = (os.environ.get(var) or "").strip()
+        if not value:
+            continue
+        root = Path(value)
+        roots.extend([root, root / "bin"])
+        if var in {"NVM_HOME", "NVM_DIR"}:
+            try:
+                roots.extend(sorted(p for p in root.glob("v*") if p.is_dir()))
+            except OSError:
+                pass
+    return _dedupe_paths(roots)
+
+
 def _find_pnpm_cli() -> str | None:
-    """定位 pnpm 的 JS CLI 入口，不触发安装。"""
-    env = os.environ.get("DSH_PNPM_BIN")
-    if env and Path(env).is_file():
-        return env
-    pnpm = _which("pnpm")
-    if pnpm:
-        resolved = Path(pnpm).resolve()
-        if resolved.is_file() and resolved.suffix.lower() in {".js", ".cjs", ".mjs"}:
+    """定位 pnpm 的 JS CLI 入口，不触发安装。
+
+    覆盖真实世界里互相打架的多种安装方式（issue：只会一种布局就全漏）：
+    1. `DSH_PNPM_BIN` 显式指定（文件 / 目录 / 包装脚本）；
+    2. PATH 上的 pnpm（包装脚本解析出真实 JS 入口；POSIX 软链解析到 .cjs）；
+    3. 各版本管理器 / 包管理器根目录下的 `node_modules|lib/node_modules/pnpm/bin/pnpm.{mjs,cjs,js}`；
+    4. 独立安装的 `pnpm.exe`（无需 node，直接执行）。
+    """
+    hint = (os.environ.get("DSH_PNPM_BIN") or "").strip()
+    if hint:
+        found = _resolve_cli_hint(Path(hint).expanduser(), "pnpm")
+        if found is not None:
+            return str(found)
+
+    roots: list[Path] = []
+    direct_fallbacks: list[Path] = []
+    for name in _SHIM_NAMES["pnpm"]:
+        shim = _which(name)
+        if not shim:
+            continue
+        path = Path(shim)
+        if _is_js_cli(path) and path.is_file():
+            return str(path)
+        target = _shim_target(path, "pnpm")
+        if target:
+            return str(target)
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved != path and _is_js_cli(resolved) and resolved.is_file():
             return str(resolved)
-        for base in (Path(pnpm).parent, resolved.parent):
-            cand = base / "node_modules" / "pnpm" / "bin" / "pnpm.mjs"
-            if cand.is_file():
-                return str(cand)
-    npm = _which("npm")
-    if npm:
-        cand = Path(npm).parent / "node_modules" / "pnpm" / "bin" / "pnpm.mjs"
-        if cand.is_file():
-            return str(cand)
+        if path.is_file():
+            if path.suffix.lower() == ".exe":
+                return str(path)  # 独立安装的 pnpm.exe：自带运行时，不该再拼 node
+            # .cmd/.bat 包装：优先找出它背后真正的 JS 入口（cmd 中转会把含空格
+            # 的参数拆碎），只在实在找不到时兜底直接调它。
+            direct_fallbacks.append(path)
+        roots.extend([path.parent, path.parent.parent, resolved.parent, resolved.parent.parent])
+    roots.extend(_package_roots())
+
+    for root in _dedupe_paths(roots):
+        for candidate in _js_cli_candidates(root, "pnpm"):
+            if candidate.is_file():
+                return str(candidate)
+    if direct_fallbacks:
+        return str(direct_fallbacks[0])
+    for root in _dedupe_paths(roots):
+        for name in _SHIM_NAMES["pnpm"]:
+            candidate = root / name
+            if candidate.is_file() and _is_direct_cli(candidate):
+                return str(candidate)
     return None
 
 
 def _npm_cli() -> str | None:
     """定位 npm 的 JS CLI 入口（由 node 直调，绕开 .cmd 的空格引号坑）。"""
+    roots: list[Path] = []
     npm = _which("npm")
-    if not npm:
-        return None
-    resolved = Path(npm).resolve()
-    if resolved.name == "npm-cli.js" and resolved.is_file():
-        return str(resolved)
-    for base in (Path(npm).parent, resolved.parent):
-        cand = base / "node_modules" / "npm" / "bin" / "npm-cli.js"
-        if cand.is_file():
-            return str(cand)
+    if npm:
+        path = Path(npm)
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved.name in _JS_CLI_NAMES["npm"] and resolved.is_file():
+            return str(resolved)
+        target = _shim_target(path, "npm")
+        if target:
+            return str(target)
+        roots.extend([path.parent, path.parent.parent, resolved.parent])
+    roots.extend(_package_roots())
+    for root in _dedupe_paths(roots):
+        for candidate in _js_cli_candidates(root, "npm"):
+            if candidate.is_file():
+                return str(candidate)
     return None
 
 
@@ -149,6 +349,7 @@ def _pnpm_cli() -> str | None:
             [node, npm_cli, "install", "-g", "pnpm"],
             capture_output=True, text=True, timeout=300, shell=False,
             env={**os.environ, "PATH": _augmented_path()},
+            **_HIDDEN_KWARGS,
         )
     except Exception:
         return None
@@ -157,17 +358,40 @@ def _pnpm_cli() -> str | None:
     return _find_pnpm_cli()
 
 
+def _pnpm_command() -> list[str] | None:
+    """pnpm 的可执行命令前缀（JS 入口经 node 直调；独立可执行直接跑）。
+
+    Windows 上 `.cmd/.bat` 必须经 cmd 启动（与 harness_launcher._wrap_cmd 同款
+    实测结论）；`.exe`（pnpm 独立安装）自带运行时，不能再拼 node。
+    """
+    cli = _pnpm_cli()
+    if not cli:
+        return None
+    path = Path(cli)
+    if _is_js_cli(path):
+        node = _which("node")
+        return [node, str(path)] if node else None
+    suffix = path.suffix.lower()
+    if suffix in {".cmd", ".bat"}:
+        return ["cmd.exe", "/c", str(path)]
+    if suffix == ".ps1":
+        return [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(path),
+        ]
+    return [str(path)]
+
+
 def _run_pnpm(profile_dir: Path, *args: str) -> tuple[int, str]:
     """node 直调 pnpm CLI（数组传参，无 cmd 中转），返回 (返回码, 合并输出)。"""
-    node = _which("node")
-    cli = _pnpm_cli()
-    if not node:
-        return 127, "找不到 node，请先安装 Node.js"
-    if not cli:
-        return 127, "需要 pnpm，自动安装失败，请手动运行: npm install -g pnpm"
+    command = _pnpm_command()
+    if command is None:
+        if _which("node") is None:
+            return 127, "找不到 node，请先安装 Node.js"
+        return 127, _PNPM_MISSING_HINT
     try:
         proc = subprocess.run(
-            [node, cli, *args], capture_output=True, text=True,
+            [*command, *args], capture_output=True, text=True,
             timeout=300, shell=False, cwd=str(profile_dir),
             env={**os.environ, "PATH": _augmented_path()},
             **_HIDDEN_KWARGS,
@@ -970,10 +1194,10 @@ class DshMonitor(BaseAgentMonitor):
         plugin = cls.bundled_plugin_dir()
         if plugin is None:
             return False, "找不到内置桥接插件（integrations/dsh-pet-bridge）"
-        if _which("node") is None:
+        if _which("node") is None and _pnpm_command() is None:
             return False, "找不到 node，请先安装 Node.js（需包含 npm）"
-        if _pnpm_cli() is None:
-            return False, "需要 pnpm，自动安装失败，请手动运行: npm install -g pnpm"
+        if _pnpm_command() is None:
+            return False, _PNPM_MISSING_HINT
 
         profiles = _real_profiles()
         if not profiles:
@@ -1031,7 +1255,7 @@ class DshMonitor(BaseAgentMonitor):
 
         幂等：未安装的 profile 直接视为成功；不再依赖 dsh CLI（同 install_bridge）。
         """
-        if _which("node") is None or _pnpm_cli() is None:
+        if _pnpm_command() is None:
             return True  # 没有运行环境视为无残留
         ok = True
         for profile in _real_profiles():

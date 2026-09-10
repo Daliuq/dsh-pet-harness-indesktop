@@ -62,6 +62,40 @@ def test_unified_preset_phrases_survive_normalize(tmp_path):
     assert "claude" not in cleaned["agents"]
 
 
+def test_legacy_placeholder_fields_migrate_to_new_names(tmp_path):
+    """用户自定义文案里的旧占位符一次性迁移：{source}→{failureType}、
+    {errorText}→{errorMessage}（词表改名后不留兼容别名；新配置幂等 no-op）。
+
+    覆盖单层 flat 与双层 global/agents 两种形状、str/list 两种值。
+    """
+    cfg = Config(base=tmp_path)
+    cfg.set("dialogue_phrases", {
+        "global": {
+            "failure.retry": "本轮失败，来源是{source}",
+            "failure.tool": ["工具错误正文：{errorText}，码 {errorCode}"],
+        },
+        "agents": {
+            "dsh": {"failure.generic": "来源 {source} / {errorText}"},
+        },
+    })
+    cfg._normalize_pet_settings()
+    phrases = cfg.get("dialogue_phrases")
+    assert phrases["global"]["failure.retry"] == "本轮失败，来源是{failureType}"
+    assert phrases["global"]["failure.tool"] == ["工具错误正文：{errorMessage}，码 {errorCode}"]
+    assert phrases["agents"]["dsh"]["failure.generic"] == "来源 {failureType} / {errorMessage}"
+
+
+def test_placeholder_migration_idempotent_and_noop_on_fresh(tmp_path):
+    """迁移幂等：新文案（已用 failureType/errorMessage）重复清洗不再变化。"""
+    cfg = Config(base=tmp_path)
+    fresh = {"global": {"failure.retry": "重试失败：{failureType}"}}
+    cfg.set("dialogue_phrases", fresh)
+    cfg._normalize_pet_settings()
+    first = cfg.get("dialogue_phrases")
+    cfg._normalize_pet_settings()
+    assert cfg.get("dialogue_phrases") == first, "迁移应幂等（旧占位符不存在即 no-op）"
+
+
 # --- ticket 02：统一预设（global + agents delta）渲染路由 ---
 
 def test_phrase_lookup_prefers_agent_delta_over_global():

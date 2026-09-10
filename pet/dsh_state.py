@@ -109,7 +109,7 @@ _EVENT_TO_STATE = {
     # 完成 / 出错
     "turn/end": DshState.SUCCESS,
     "llm/retry": DshState.ERROR,
-    "llm/error": DshState.ERROR,  # PI_AI_ERROR（bad_response_status_code）等 API 级错误
+    "llm/error": DshState.ERROR,  # API 级错误（llm_error：errorCode 为真实上游码如 bad_response_status_code）
 }
 
 

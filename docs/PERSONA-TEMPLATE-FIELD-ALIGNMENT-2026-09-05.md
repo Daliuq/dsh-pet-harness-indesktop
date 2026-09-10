@@ -34,7 +34,7 @@
 | `command` | 命令文本（approval.command=待审批命令；activity.*=工具命令，上游记录提供时可用；已折叠单行、超长截断） |
 | `label` | 标签（approval.tool/activity.*=工具中文标签；approval.command/generic、question.*、rate_limit.*、failure.*=会话标签，上游提供时可用） |
 | `body` | 问题内容（question.one；含 header 前缀） |
-| `count` | 数量（question.many=问题数；rate_limit.many=连续限流次数） |
+| `count` | 数量（question.many=问题数；rate_limit.many=连续模型访问失败次数） |
 | `reasons` | 循环/行为检测的判断原因（watchdog.*、pattern.*；已格式化为文本） |
 | `detail` | 桥接安装失败详情（bridge.install.failed） |
 | `text` | 余额查询结果文本（balance.result） |
@@ -47,7 +47,7 @@
 | `projectName` | 会话所属项目名（含 sessionId 的弹窗均可用；上游记录提供时可用） |
 | `errorCode` | 错误码（rate_limit.*、failure.*；上游记录提供时可用） |
 | `errorMessage` | 错误信息原文（rate_limit.*、failure.*；上游记录提供时可用） |
-| `consecutiveRetryCount` | 已连续限流次数（rate_limit.*；上游记录提供时可用） |
+| `consecutiveRetryCount` | 已连续模型访问失败次数（rate_limit.*；上游记录提供时可用） |
 | `retry` | 本轮重试序号（rate_limit.*；上游记录提供时可用） |
 | `retries` | 本轮已重试次数（failure.*；上游记录提供时可用） |
 | `retryExhausted` | 是否重试耗尽（failure.*；上游记录提供时可用） |
@@ -84,8 +84,8 @@
 | `question.empty` | `name`, `sessionName`, `projectName`, `label` | `sessionName`, `projectName`, `label` | Agent 提问：等待用户从选项选择 |
 | `question.many` | `name`, `count`, `sessionName`, `projectName`, `label` | `sessionName`, `projectName`, `label` | Agent 提问：多个问题等待回答 |
 | `question.one` | `name`, `body`, `sessionName`, `projectName`, `label` | `sessionName`, `projectName`, `label` | Agent 提问：单个问题等待回答 |
-| `rate_limit.many` | `count`, `errorCode`, `errorMessage`, `consecutiveRetryCount`, `retry`, `sessionName`, `projectName` | `errorCode`, `errorMessage`, `consecutiveRetryCount`, `retry`, `sessionName`, `projectName` | 连续限流多次（服务侧 429，错误场景） |
-| `rate_limit.one` | `count`, `errorCode`, `errorMessage`, `consecutiveRetryCount`, `retry`, `sessionName`, `projectName` | `errorCode`, `errorMessage`, `consecutiveRetryCount`, `retry`, `sessionName`, `projectName` | 单次限流（服务侧 429，错误场景） |
+| `rate_limit.many` | `count`, `errorCode`, `errorMessage`, `consecutiveRetryCount`, `retry`, `sessionName`, `projectName` | `errorCode`, `errorMessage`, `consecutiveRetryCount`, `retry`, `sessionName`, `projectName` | 模型访问失败：连续多次（服务侧 429，错误场景） |
+| `rate_limit.one` | `count`, `errorCode`, `errorMessage`, `consecutiveRetryCount`, `retry`, `sessionName`, `projectName` | `errorCode`, `errorMessage`, `consecutiveRetryCount`, `retry`, `sessionName`, `projectName` | 模型访问失败：单次（服务侧 429，错误场景） |
 | `start` | `name` | - | Agent 开始工作（进行中状态提示，非出错） |
 | `stuck.reminder` | `name` | - | 卡住检测提醒：Agent 疑似钻牛角尖，建议人工介入 |
 | `thinking` | `name` | - | Agent 正在思考（进行中状态提示，非出错） |

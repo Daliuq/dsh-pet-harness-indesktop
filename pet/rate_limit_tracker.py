@@ -29,7 +29,7 @@ class RateLimitTracker:
         data = event.data
         failure = data.get("failure") if isinstance(data.get("failure"), dict) else data
         code = str(failure.get("code") or data.get("errorCode") or "").strip().upper()
-        message = str(failure.get("message") or data.get("errorMessage") or data.get("errorText") or "")
+        message = str(failure.get("message") or data.get("errorMessage") or "")
         return code in _RATE_CODES or bool(re.search(r"\b429\b|rate[ -]?limit|too many requests", message, re.I))
 
     def consume(self, event: AgentEvent) -> dict[str, Any] | None:

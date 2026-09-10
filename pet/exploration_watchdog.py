@@ -352,7 +352,7 @@ class ExplorationWatchdog(QObject):
             current.details.append({k: _text(record.get(k), 500) for k in (
                 "event", "tool", "toolName", "argsKey", "target", "filePath",
                 "path", "pattern", "query", "command", "text", "summary",
-                "resultSummary", "evidence", "errorText", "ok", "timeout",
+                "resultSummary", "evidence", "errorMessage", "ok", "timeout",
             ) if record.get(k) is not None})
             if cls in _EXPLORATION and event in {"tool/call", "command/run", "tool-workflow/run-start",
                          "exec_command_begin", "mcp_tool_call_begin"}:
@@ -374,7 +374,7 @@ class ExplorationWatchdog(QObject):
             else:
                 current.think_active = False
             if event.endswith("result") or event.endswith("end"):
-                current.evidence = _text(record.get("evidence") or record.get("resultSummary") or record.get("errorText"), 200)
+                current.evidence = _text(record.get("evidence") or record.get("resultSummary") or record.get("errorMessage"), 200)
                 current.evidence_new = str(record.get("evidenceStatus") or "") == "new"
             if len(state["steps"]) > 20:
                 state["steps"].popitem(last=False)

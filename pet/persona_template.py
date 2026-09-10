@@ -17,7 +17,7 @@ VARIABLES = {
     "command": "命令文本（approval.command=待审批命令；activity.*=工具命令，上游记录提供时可用；已折叠单行、超长截断）",
     "label": "标签（approval.tool/activity.*=工具中文标签；approval.command/generic、question.*、rate_limit.*、failure.*=会话标签，上游提供时可用）",
     "body": "问题内容（question.one；含 header 前缀）",
-    "count": "数量（question.many=问题数；rate_limit.many=连续限流次数）",
+    "count": "数量（question.many=问题数；rate_limit.many=连续模型访问失败次数）",
     "reasons": "循环/行为检测的判断原因（watchdog.*、pattern.*；已格式化为文本）",
     "detail": "桥接安装失败详情（bridge.install.failed）",
     "text": "余额查询结果文本（balance.result）",
@@ -28,12 +28,14 @@ VARIABLES = {
     "step": "turn 内步骤序号（activity.*；上游记录提供时可用）",
     "sessionName": "会话显示名（来自会话元数据 projectName/label/agentName；仅解析出真实名称时才注入，无元数据时占位符自动隐藏，不会回退成 sessionId）",
     "projectName": "会话所属项目名（含 sessionId 的弹窗均可用；上游记录提供时可用）",
-    "errorCode": "错误码（rate_limit.*、failure.*；上游记录提供时可用）",
-    "errorMessage": "错误信息原文（rate_limit.*、failure.*；上游记录提供时可用）",
-    "consecutiveRetryCount": "已连续限流次数（rate_limit.*；上游记录提供时可用）",
-    "retry": "本轮重试序号（rate_limit.*；上游记录提供时可用）",
-    "retries": "本轮已重试次数（failure.*；上游记录提供时可用）",
+    "errorCode": "错误码（rate_limit.*、failure.*、llm_error.*；上游记录提供时可用；llm_error 为上游真实码如 bad_response_status_code）",
+    "errorMessage": "错误信息原文（rate_limit.*、failure.*、llm_error.*；上游记录提供时可用）",
+    "errorKind": "错误分类（llm_error.*：api=AI API 请求失败；上游记录提供时可用）",
+    "consecutiveRetryCount": "已连续模型访问失败次数（rate_limit.*；连续 429 事件累计，非 turn 内重试序号，上游记录提供时可用）",
+    "retry": "本轮重试序号（rate_limit.*、llm_error.*；单次事件的重试步号，非累计次数，上游记录提供时可用）",
+    "retries": "本轮已重试次数（failure.*；turn 内累计，与 retry/consecutiveRetryCount 不同，上游记录提供时可用）",
     "retryExhausted": "是否重试耗尽（failure.*；上游记录提供时可用）",
+    "failureType": "失败类型（failure.*：model_retry_exhausted=模型重试耗尽 / tool_failed=工具最终失败；上游记录提供时可用）",
 }
 
 # 上游记录字段——以桥接插件源码（integrations/dsh-pet-bridge/index.js）逐事件
@@ -43,21 +45,22 @@ VARIABLES = {
 #   tool/call: tool/argsKey/command/callId/step/sessionId —— 无 target/ok（在 tool/result）
 #   approval/request: rpcId/approvalId/toolName/command/sessionId —— 无 requestId/callId/outcome
 #   question/requested: rpcId(mux)/callId/sessionId/questions —— 无 questionRpcId（在 resolved）
-#   execution/failed: source/errorCode/errorMessage/retries/retryExhausted
-# 审批/提问/限流/失败/工具类文案与记录同轮触发，这些字段可靠；状态机与本地
+#   execution/failed: failureType/errorCode/errorMessage/retries/retryExhausted
+#   （failureType=model_retry_exhausted|tool_failed；错误正文统一 errorMessage，无 errorText）
+# 审批/提问/模型访问失败/硬失败/工具类文案与记录同轮触发，这些字段可靠；状态机与本地
 # 检测触发的文案（start/thinking/agent.*/done.* 等）不保证拿到记录，勿依赖。
 BASE_FIELDS = ("ts", "agent", "agent_key", "event", "sessionId", "projectName", "sessionName", "label")
 UPSTREAM_FIELDS = {
     "base": BASE_FIELDS,
     "tool/call": ("tool", "argsKey", "command", "callId", "step"),
-    "tool/result": ("tool", "command", "callId", "ok", "timeout", "errorCode", "errorText", "resultSummary", "durationMs"),
+    "tool/result": ("tool", "command", "callId", "ok", "timeout", "errorCode", "errorMessage", "resultSummary", "durationMs"),
     "approval/request": ("rpcId", "approvalId", "toolName", "command", "sessionId"),
     "approval/resolved": ("rpcId", "approvalId", "outcome", "sessionId"),
     "question/requested": ("rpcId", "callId", "sessionId", "questions"),
     "question/resolved": ("rpcId", "callId", "sessionId"),
     "rate_limit": ("errorCode", "errorMessage", "consecutiveRetryCount", "retry", "sessionId"),
-    "llm_error": ("errorCode", "errorMessage", "retry"),
-    "execution/failed": ("source", "errorCode", "errorMessage", "retries", "retryExhausted"),
+    "llm_error": ("errorCode", "errorMessage", "errorKind", "retry"),
+    "execution/failed": ("failureType", "errorCode", "errorMessage", "retries", "retryExhausted"),
 }
 DISPLAY_HINTS = {
     "activity.default": "{name} 正在处理 {tool}。",
@@ -89,8 +92,8 @@ DISPLAY_HINTS = {
     "question.empty": "{name} 在等你回答。",
     "question.many": "{name} 有 {count} 个问题等你回答。",
     "question.one": "{name} 在问你：{body}",
-    "rate_limit.many": "已连续限流 {count} 次，请稍后再试。",
-    "rate_limit.one": "通信被限流了，请稍后再试。",
+    "rate_limit.many": "模型访问失败已连续 {count} 次，请稍后再试。",
+    "rate_limit.one": "模型访问失败，请稍后再试。",
     "start": "{name} 开始干活啦～",
     "stuck.reminder": "{name} 可能卡住了，去看一眼吧。",
     "thinking": "{name} 正在认真想办法……",
@@ -155,8 +158,8 @@ EVENT_DESCRIPTIONS: dict[str, str] = {
     "watchdog.warning": "循环检测（重复探索行为）风险预警，非阻断",
     "pattern.warning": "行为重复检测警告（模式提醒，非阻断）",
     "pattern.control": "行为重复检测达到干预级别（建议介入）",
-    "rate_limit.one": "单次限流（服务侧 429，错误场景）",
-    "rate_limit.many": "连续限流多次（服务侧 429，错误场景）",
+    "rate_limit.one": "模型访问失败：单次（服务侧 429，错误场景）",
+    "rate_limit.many": "模型访问失败：连续多次（服务侧 429，错误场景）",
     "llm_error.api": "AI 服务出错（错误场景）",
     "done.success": "本轮任务完成（收尾）",
     "done.attention": "任务停下等待用户确认（收尾）",
@@ -202,11 +205,11 @@ PARAMETERS: dict[str, tuple[str, ...]] = {
                         "sessionName", "projectName"),
     "llm_error.api": (),
     "done.success": ("name",), "done.attention": ("name",),
-    "failure.retry": ("name", "source", "errorCode", "errorMessage", "retries", "retryExhausted",
+    "failure.retry": ("name", "failureType", "errorCode", "errorMessage", "retries", "retryExhausted",
                       "sessionName", "projectName"),
-    "failure.tool": ("name", "source", "errorCode", "errorMessage", "retries", "retryExhausted",
+    "failure.tool": ("name", "failureType", "errorCode", "errorMessage", "retries", "retryExhausted",
                      "sessionName", "projectName"),
-    "failure.generic": ("name", "source", "errorCode", "errorMessage", "retries", "retryExhausted",
+    "failure.generic": ("name", "failureType", "errorCode", "errorMessage", "retries", "retryExhausted",
                         "sessionName", "projectName"),
     "pattern.warning": ("name", "reasons"),
     "pattern.control": ("name", "reasons"), "stuck.reminder": ("name",),
@@ -239,11 +242,11 @@ CONDITIONAL_PARAMETERS: dict[str, tuple[str, ...]] = {
                        "sessionName", "projectName"),
     "rate_limit.many": ("errorCode", "errorMessage", "consecutiveRetryCount", "retry",
                         "sessionName", "projectName"),
-    "failure.retry": ("source", "errorCode", "errorMessage", "retries", "retryExhausted",
+    "failure.retry": ("failureType", "errorCode", "errorMessage", "retries", "retryExhausted",
                       "sessionName", "projectName"),
-    "failure.tool": ("source", "errorCode", "errorMessage", "retries", "retryExhausted",
+    "failure.tool": ("failureType", "errorCode", "errorMessage", "retries", "retryExhausted",
                      "sessionName", "projectName"),
-    "failure.generic": ("source", "errorCode", "errorMessage", "retries", "retryExhausted",
+    "failure.generic": ("failureType", "errorCode", "errorMessage", "retries", "retryExhausted",
                         "sessionName", "projectName"),
 }
 
@@ -253,7 +256,7 @@ CONDITIONAL_PARAMETERS: dict[str, tuple[str, ...]] = {
 EXPORT_GUIDE: dict[str, Any] = {
     "这是什么": (
         "本文件是桌宠「表达风格」一键导出的角色台词模板（格式 persona-phrases/v1），"
-        "覆盖桌宠自言自语、Agent 状态、审批、提问、错误、限流等全部弹窗/气泡文案。"
+        "覆盖桌宠自言自语、Agent 状态、审批、提问、错误、模型访问失败等全部弹窗/气泡文案。"
         "本段（_说明）只是给人或 AI 阅读的注释，导入时会被自动忽略，整段删除也不影响使用。"
     ),
     "怎么改（最常用）": [
@@ -263,7 +266,7 @@ EXPORT_GUIDE: dict[str, Any] = {
         "每种弹窗能代入的字段 = 它对应上游方法显式注入的参数，见各 entries 的 parameters："
         "未标注的参数保证会被替换；标注「上游记录提供时可用」的条件参数，在上游未提供/为空/为 null 时会自动隐藏"
         "（占位符不会原样露出，无需自己写回退）。"
-        "upstream 是上游事件记录附带字段，审批/提问/限流/失败/工具类文案在事件触发时可读，其他场景不保证有值。",
+        "upstream 是上游事件记录附带字段，审批/提问/模型访问失败/硬失败/工具类文案在事件触发时可读，其他场景不保证有值。",
         "3. 想整体换风格：改 mode（legacy=默认模式 / whale_maid=鲸鱼娘女仆模式 / custom=自定义台词），"
         "并顺带改 name / description；导入后会自动切到「自定义台词」。",
         "4. 想精确改某一句：到 entries 按 key 找到同一项，参考 sources（什么事件触发）与 parameters（该项可用变量），"
@@ -284,7 +287,7 @@ EXPORT_GUIDE: dict[str, Any] = {
         "name": "这套台词的名字，仅作标识，可随意修改。",
         "description": "整份模板用途的一句话说明，可随意修改或删除。",
         "variables": "各事件保证可用的 {变量} 占位符及含义，写文案时对照参考，一般无需改动。",
-        "upstream": "上游事件记录附带字段（{任意字段}、{payload.xx}、{data.xx} 等）；审批/提问/限流/失败/工具类文案在事件触发时可读，其他场景不保证有值，依赖时请写好留空回退。",
+        "upstream": "上游事件记录附带字段（{任意字段}、{payload.xx}、{data.xx} 等）；审批/提问/模型访问失败/硬失败/工具类文案在事件触发时可读，其他场景不保证有值，依赖时请写好留空回退。",
         "phrases": "核心编辑区：事件 key → 候选文案数组（编辑方法见上方『怎么改』）。",
         "entries": "逐事件明细表，与 phrases 一一对应：列出每个 key 的触发来源 sources、可用变量 parameters 与示例 displayHint，"
         "方便人/AI 弄清每句台词在什么场景出现、能写哪些信息。",
@@ -305,7 +308,7 @@ EXPORT_GUIDE: dict[str, Any] = {
         "question.empty / one / many": "提问：无选项等待选择 / 单个问题 / 多个问题。",
         "watchdog.warning": "循环检测（重复排查）：风险预警。",
         "pattern.warning / pattern.control": "行为重复检测：警告 / 自动干预。",
-        "rate_limit.one / many、llm_error.api": "限流（单次/连续） / AI 服务出错。",
+        "rate_limit.one / many、llm_error.api": "模型访问失败（单次/连续） / AI 服务出错。",
         "done.success / done.attention": "收尾：任务完成 / 停下等你确认。",
         "failure.retry / tool / generic": "本轮失败：重试后仍失败 / 工具执行失败 / 通用失败。",
         "bridge.*、dsh.writeback.failed": "联动桥接的安装/卸载/回写提示。",

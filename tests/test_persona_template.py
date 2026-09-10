@@ -95,8 +95,8 @@ def test_all_advertised_fields_reach_presentation_layer():
         "name", "command", "label", "body", "count", "reasons", "detail", "text",
         "tool", "toolName", "argsKey", "callId", "step",
         "sessionName", "projectName",
-        "errorCode", "errorMessage", "consecutiveRetryCount", "retry",
-        "retries", "retryExhausted",
+        "errorCode", "errorMessage", "errorKind", "consecutiveRetryCount", "retry",
+        "retries", "retryExhausted", "failureType",
     }
     assert "cordis" not in data["upstream"]["fields"]
     assert "sessionName" in UPSTREAM_FIELDS["base"], "Bridge 必须直接写出 sessionName"

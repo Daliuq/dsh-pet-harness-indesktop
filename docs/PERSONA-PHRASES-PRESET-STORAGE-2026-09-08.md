@@ -70,7 +70,7 @@ mode ∈ {legacy, whale_maid} : 内置预设[key] → 调用方原文案
 - 专属层覆盖范围：只有渲染点把 `agent_key` 传给 `_dialogue()` 的事件才走
   per-Agent 专属层，且**专属层只在 custom 模式读**。当前带路由的转述事件：
   `start / thinking / activity.* / done.success / done.attention /
-  agent.attention / agent.error`。审批/提问/失败/限流/卡住/模式等「对你说」
+  agent.attention / agent.error`。审批/提问/失败/模型访问失败/卡住/模式等「对你说」
   的事件与 `bridge.*`、`agent.missing` 只走 global。
   （2026-09-08 用户确认：**不做**「内置风格 + per-Agent 覆盖」叠加，保持现状。）
 - 结构引导不随台词覆盖：自由文本问题/含文本分支的「请到 DSH 界面输入文本

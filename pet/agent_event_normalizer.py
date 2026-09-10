@@ -107,7 +107,7 @@ def normalize_event(record: AgentEvent | dict, *, source_hint: str = "", agent_n
         failure = data.get("failure") if isinstance(data.get("failure"), dict) else data
         return RetryEvent(**common, code=str(failure.get("code") or data.get("errorCode") or ""), message=str(failure.get("message") or data.get("errorMessage") or "")[:300], retry=data.get("retry"))
     if lower in {"agent/request-error", "execution/failed", "llm_error", "error"}:
-        return ErrorEvent(**common, code=str(data.get("errorCode") or data.get("code") or ""), message=str(data.get("errorMessage") or data.get("errorText") or "")[:300])
+        return ErrorEvent(**common, code=str(data.get("errorCode") or data.get("code") or ""), message=str(data.get("errorMessage") or "")[:300])
     if lower.startswith("approval/"): return ApprovalEvent(**common, status=lower.split("/", 1)[1])
     if lower.startswith("question/"): return QuestionEvent(**common, status=lower.split("/", 1)[1])
     if lower == "interaction/resolved":

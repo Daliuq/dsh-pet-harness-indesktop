@@ -197,17 +197,19 @@ def _default_agent_link_data() -> dict:
         # 自定义联动 Agent（协议见 docs/AGENT_LINK_PROTOCOL.md §4）：只读监听
         # 用户指定的事件文件，不写外部配置、无需授权弹窗，默认空
         "custom_agents": [],
-        # 联动气泡：开始干活提醒（可选，默认关）、任务完成通知（默认开）
-        "notify_state": False,
+        # 联动气泡：开始干活提醒（默认开）、任务完成通知（默认开）
+        "notify_state": True,
         "notify_done": True,
-        # 过程汇报（可选，默认关）：Agent 干活中报「正在读文件/跑命令/改代码…」
-        "notify_activity": False,
+        # 过程汇报（默认开，按概率抽稀）：Agent 干活中报「正在读文件/跑命令/改代码…」
+        # 是提醒量最大的一类，用 report_probability 抽稀（0=静音，100=全报）。
+        "notify_activity": True,
+        "report_probability": 60,
         # 硬失败提醒（默认开）：DSH 已决定本轮不再继续（重试耗尽/工具最终失败）
         # 时直接提醒，不经行为分析。与审批/问题（notify_approval）同级。
         "notify_exec_failed": True,
-        # 卡住检测（建议介入，默认关）：DSH 联动开启时，根据工具成败/超时/错误
+        # 卡住检测（默认开）：DSH 联动开启时，根据工具成败/超时/错误
         # 推断「Agent 钻牛角尖了」，档位 1 播焦急动画、档位 2 弹持续提醒气泡。
-        "stuck_detect": False,
+        "stuck_detect": True,
         "stuck_worried_threshold": 3,
         "stuck_intervene_threshold": 5,
         "stuck_window_seconds": 90,
@@ -220,12 +222,12 @@ def _default_agent_link_data() -> dict:
         "exploration_watchdog_early_grace_minutes": 5,
         "exploration_watchdog_long_run_minutes": 10,
         "exploration_watchdog_long_think_seconds": 120,
-        # 行为模式检测（默认关）：双窗口规则识别慢性循环 / 短时爆发 / 纯探索无产出。
+        # 行为模式检测（默认开）：双窗口规则识别慢性循环 / 短时爆发 / 纯探索无产出。
         # 细分类：W10 同类 >= 3 → warning；W10 >= 4 → control；W6 >= 3 → control。
         # 大类：W6 EXPLORATION >= 5 且 ACTION == 0 → control；W10 EXPLORATION >= 7 且
         # ACTION <= 1 → warning。触发后至少新增 pattern_min_steps_between 个 step
         # 且间隔 pattern_cooldown_seconds 秒才允许再次触发（step 去重防止误杀并行调用）。
-        "pattern_detect": False,
+        "pattern_detect": True,
         "pattern_w6_control": 3,
         "pattern_w10_warn": 3,
         "pattern_w10_control": 4,
@@ -329,6 +331,11 @@ def _clean_agent_link_data(raw: Any) -> dict:
         result["sound_cooldown_seconds"] = _float_or_default(
             raw.get("sound_cooldown_seconds"), defaults["sound_cooldown_seconds"], 0.0, 30.0
         )
+    if "report_probability" in raw:
+        # 汇报概率：非法值回落默认，越界收敛到 [0, 100]（0=过程汇报静音，100=全报）
+        result["report_probability"] = int(_float_or_default(
+            raw.get("report_probability"), defaults["report_probability"], 0.0, 100.0
+        ))
     return result
 
 
@@ -925,6 +932,46 @@ class Config:
                 cleaned[str(key)] = value.strip()[:240]
         return cleaned
 
+    # dialogue 文案占位符迁移表：旧字段名（链路语义曾错位/曾与协议保留字段撞名）
+    # → 新字段名。加载时幂等替换（新文案不含旧占位符即 no-op），只在用户
+    # 自定义 dialogue_phrases 上执行；内置 preset JSON 直接改源文件。
+    _DIALOGUE_PLACEHOLDER_MIGRATIONS = (
+        ("{source}", "{failureType}"),
+        ("{errorText}", "{errorMessage}"),
+    )
+
+    @classmethod
+    def _migrate_dialogue_phrase_fields(cls, phrases) -> None:
+        """把 dialogue_phrases（global/agents 各层文案）里的旧占位符替换为新名。
+
+        原地修改 phrases 的 list/str 值；对新配置（无旧占位符）幂等无副作用。
+        """
+        if not isinstance(phrases, dict):
+            return
+        stack = [phrases]
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict):
+                continue
+            for key, value in node.items():
+                if isinstance(value, str):
+                    replaced = value
+                    for old, new in cls._DIALOGUE_PLACEHOLDER_MIGRATIONS:
+                        replaced = replaced.replace(old, new)
+                    if replaced != value:
+                        node[key] = replaced
+                elif isinstance(value, list):
+                    for i, item in enumerate(value):
+                        if not isinstance(item, str):
+                            continue
+                        replaced = item
+                        for old, new in cls._DIALOGUE_PLACEHOLDER_MIGRATIONS:
+                            replaced = replaced.replace(old, new)
+                        if replaced != item:
+                            value[i] = replaced
+                elif isinstance(value, dict):
+                    stack.append(value)
+
     def _normalize_pet_settings(self):
         dialogue_mode = str(self.data.get("dialogue_mode") or "legacy").lower()
         self.data["dialogue_mode"] = dialogue_mode if dialogue_mode in {"legacy", "whale_maid", "custom"} else "legacy"
@@ -946,6 +993,8 @@ class Config:
         else:
             # 旧单层 {event: [...]}：视为 global
             self.data["dialogue_phrases"] = self._clean_phrase_events(raw_phrases)
+        # 旧占位符迁移（{source}→{failureType} 等；新配置幂等 no-op）
+        self._migrate_dialogue_phrase_fields(self.data.get("dialogue_phrases"))
         from . import physics as physics_mod
 
         self.data["playback_speed"] = _float_or_default(self.data.get("playback_speed"), 1.0, 0.1, 8.0)

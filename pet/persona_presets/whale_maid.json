@@ -1,32 +1,32 @@
 {
   "activity.default": [
-    "主人～{name}正在处理{label}呢，人家替您盯着{tool}～",
-    "哼，{name}正在用{tool}继续处理，已经到第{step}步啦，人家才没有偷懒。",
-    "{name}正在{projectName}的{sessionName}里继续忙活，主人不用一直守着，有人家呢～"
+    "主人～{name}正在当前会话 {sessionName} 里处理{label}，人家替您盯着{tool}～",
+    "哼，会话 {sessionName} 里的{name}正在用{tool}继续干活，已经到第{step}步啦。",
+    "{name}还在当前会话 {sessionName} 里处理任务呢，主人不用一直守着，有人家替您看着～"
   ],
   "activity.edit": [
-    "主人～{name}正在编辑{label}，{tool}已经开始干活啦。",
-    "哼，{name}已经改到第{step}步了，最好一次改好，人家可不喜欢返工。",
-    "{name}正在{projectName}的{sessionName}里继续修改，人家替主人盯着进度～"
+    "主人～{name}正在当前会话 {sessionName} 里编辑{label}，现在只是正常修改过程哦～",
+    "哼，会话 {sessionName} 里的{name}正通过{tool}修改内容，已经做到第{step}步啦。",
+    "{name}还在当前会话 {sessionName} 里继续编辑，调用编号{callId}人家也替主人记着呢～"
   ],
   "activity.read": [
-    "主人～{name}正在读取{label}，只是正常翻资料哦～",
-    "哼，{tool}正在认真读取内容，人家也勉强陪它看一会儿。",
-    "{name}正在{projectName}的{sessionName}里查看资料，主人先歇会儿吧～"
+    "主人～{name}正在当前会话 {sessionName} 里读取{label}，人家也陪您瞄两眼～",
+    "哼，会话 {sessionName} 里的{name}正在通过{tool}查看内容，只是正常读资料哦。",
+    "{name}正在当前会话 {sessionName} 里读取所需信息，已经到第{step}步啦～"
   ],
   "activity.run": [
-    "主人～{name}正在运行{label}，现在只是正常执行过程哦。",
-    "哼，{tool}已经跑起来啦，第{step}步最好一次通过。",
-    "{name}正在{projectName}的{sessionName}里运行任务，人家替主人等结果～"
+    "主人～{name}正在当前会话 {sessionName} 里运行{label}，现在是正常执行过程哦～",
+    "哼，会话 {sessionName} 里的{tool}已经跑起来啦，{name}做到第{step}步了。",
+    "{name}正在当前会话 {sessionName} 里继续执行，调用编号是{callId}，人家替主人等结果～"
   ],
   "activity.search": [
-    "主人～{name}正在搜索{label}，人家也下去帮忙捞线索啦。",
-    "哼，{tool}正在继续查找，希望别在信息海里游得太远。",
-    "{name}正在{projectName}的{sessionName}里搜索，第{step}步还在正常推进哦～"
+    "主人～{name}正在当前会话 {sessionName} 里搜索{label}，人家也下去帮忙捞线索啦～",
+    "哼，会话 {sessionName} 里的{name}正用{tool}继续查找，可别在信息海里游太远哦。",
+    "{name}在当前会话 {sessionName} 里已经搜索到第{step}步啦，还在正常推进～"
   ],
   "agent.attention": [
     "主人～{name}现在需要您看一眼。",
-    "{name}已经停下来等您处理啦，人家先替您守着。",
+    "{name}已经停下来等您处理啦，人家先替您守着～",
     "喂，主人，该您来决定啦，{name}正在等您呢～"
   ],
   "agent.error": [
@@ -36,23 +36,23 @@
   ],
   "agent.missing": [
     "主人～暂时没有检测到{name}，它是不是还没装好呀？",
-    "哼，{name}在本机找不到呢，人家都检查过啦。",
-    "当前没有发现{name}的安装，主人帮忙确认一下嘛～"
+    "哼，本机没有发现{name}，人家已经帮您看过啦。",
+    "当前检测不到{name}的安装，主人帮忙确认一下嘛～"
   ],
   "approval.command": [
-    "主人～{name}请求执行命令：{command}，得您点头才行哦。",
-    "哼，{name}正在{sessionName}里等您审批这条命令：{command}。",
-    "{projectName}里的{label}正在等待主人决定，命令是：{command}。"
+    "主人～当前会话 {sessionName} 里的{name}请求执行命令：{command}，得您点头才行哦。",
+    "哼，会话 {sessionName} 里的{name}正在等您审批，通过{toolName}执行的命令是：{command}",
+    "{name}在当前会话 {sessionName} 里的{label}正在等待主人决定，您批准以后才能继续～"
   ],
   "approval.generic": [
-    "主人～{name}有一项操作正在等您批准。",
-    "哼，{name}在{sessionName}里等您拍板呢，相关内容是{label}。",
-    "{projectName}里的{name}还没有继续执行，主人确认以后再放行哦～"
+    "主人～当前会话 {sessionName} 里的{name}有一项操作正在等您批准。",
+    "哼，会话 {sessionName} 里的{name}正在等您拍板呢，相关内容是{label}。",
+    "{name}在当前会话 {sessionName} 里正在等待确认，涉及工具{toolName}，主人说了算～"
   ],
   "approval.tool": [
-    "主人～{name}正在申请使用工具{toolName}，现在还没有执行哦。",
-    "哼，{name}想做{label}，没有主人批准可不许乱用{toolName}。",
-    "{projectName}的{sessionName}正在等待工具审批，主人来决定嘛～"
+    "主人～当前会话 {sessionName} 里的{name}正在申请使用工具{toolName}，现在还没有执行哦。",
+    "哼，会话 {sessionName} 里的{name}想做{label}，没有主人批准可不许乱用{toolName}。",
+    "{name}在当前会话 {sessionName} 里正在等待工具审批，主人来决定嘛～"
   ],
   "balance.loading": [
     "主人稍等～人家正在查余额，很快就回来。",
@@ -67,7 +67,7 @@
   "bridge.install.failed": [
     "呜～{name}的通信桥安装失败啦：{detail}",
     "哼，给{name}搭桥时出了问题：{detail}，主人帮忙看看嘛。",
-    "{name}暂时还没接通，具体情况是：{detail}。"
+    "{name}暂时还没接通，具体情况是：{detail}"
   ],
   "bridge.install.pending": [
     "正在给{name}安装通信桥呢，主人稍等一下哦～",
@@ -100,24 +100,24 @@
     "消息没能送回 DSH，主人需要去 DSH 界面确认一下哦。"
   ],
   "failure.generic": [
-    "主人～{name}本轮运行失败啦，来源是{source}。",
-    "哼，{name}在{projectName}的{sessionName}里遇到了错误{errorCode}：{errorMessage}",
-    "{name}已经重试{retries}次，当前重试耗尽状态是{retryExhausted}，主人来决定下一步嘛～"
+    "主人～当前会话 {sessionName} 里的{name}本轮运行失败啦，失败类型是{failureType}。",
+    "哼，会话 {sessionName} 里的{name}遇到了错误{errorCode}：{errorMessage}",
+    "{name}在当前会话 {sessionName} 里已经重试{retries}次，重试耗尽状态为{retryExhausted}，主人来决定下一步嘛～"
   ],
   "failure.retry": [
-    "主人～{name}已经重试{retries}次，还是没有成功。",
-    "哼，{name}在{projectName}的{sessionName}里反复尝试后仍然报错{errorCode}：{errorMessage}",
-    "本轮重试仍然失败，来源是{source}，重试耗尽状态为{retryExhausted}，主人我们换条路嘛～"
+    "主人～当前会话 {sessionName} 里的{name}已经重试{retries}次，还是没有成功。",
+    "哼，会话 {sessionName} 里的{name}多次重试后仍然报错{errorCode}：{errorMessage}",
+    "{name}在当前会话 {sessionName} 里的失败类型是{failureType}，重试耗尽状态为{retryExhausted}，主人我们换条路嘛～"
   ],
   "failure.tool": [
-    "呜～{name}调用工具时真的出错啦，来源是{source}。",
-    "哼，{name}的工具执行失败，错误{errorCode}：{errorMessage}",
-    "{name}在{projectName}的{sessionName}里已经重试{retries}次，重试耗尽状态是{retryExhausted}，主人来看看嘛～"
+    "呜～当前会话 {sessionName} 里的{name}工具最终执行失败啦，失败类型是{failureType}。",
+    "哼，会话 {sessionName} 里的{name}遇到了错误{errorCode}：{errorMessage}",
+    "{name}在当前会话 {sessionName} 里已经重试{retries}次，重试耗尽状态为{retryExhausted}，主人来看看嘛～"
   ],
   "llm_error.api": [
-    "呜～AI服务出错啦，主人稍后再看看嘛。",
+    "呜～AI 服务出错啦，主人稍后再看看嘛。",
     "模型服务暂时没有正常回应……哼，这次真的不是鲸鱼偷懒。",
-    "AI服务发生异常啦，主人检查一下服务状态哦～"
+    "AI API 请求失败啦，主人检查一下网络或模型服务状态哦～"
   ],
   "pattern.control": [
     "主人～{name}的重复行为已经达到需要干预的程度啦：{reasons}",
@@ -127,32 +127,32 @@
   "pattern.warning": [
     "主人～{name}出现重复行为迹象啦：{reasons}",
     "唔，{name}的行为模式有点重复，原因是{reasons}，不过现在只是提醒哦。",
-    "{name}当前需要留意一下：{reasons}，还没有到必须打断的程度～"
+    "{name}当前需要留意一下：{reasons}，还没有到必须干预的程度～"
   ],
   "question.empty": [
-    "主人～{name}正在等您从选项里做决定哦。",
-    "哼，{name}在{sessionName}里停在{label}这里，主人选一个嘛。",
-    "{name}正在{projectName}里等您的选择，选好以后它才能继续～"
+    "主人～当前会话 {sessionName} 里的{name}正在等您从选项里做决定哦。",
+    "哼，会话 {sessionName} 里的{name}还停在{label}这里，主人选一个嘛。",
+    "{name}正在当前会话 {sessionName} 里等您的选择，选好以后它才能继续～"
   ],
   "question.many": [
-    "主人～{name}有{count}个问题正在等您回答。",
-    "啊～{sessionName}里有{count}个问题呢，人家看着都觉得好多。",
-    "{name}正在{projectName}里等待这{count}个答案，主人慢慢处理嘛～"
+    "主人～当前会话 {sessionName} 里的{name}有{count}个问题正在等您回答。",
+    "啊～会话 {sessionName} 里居然有{count}个问题呢，人家看着都觉得好多。",
+    "{name}正在当前会话 {sessionName} 里等待这{count}个答案，主人慢慢处理嘛～"
   ],
   "question.one": [
-    "主人～{name}正在问您：{body}",
-    "{name}在{sessionName}里有一个问题需要您决定：{body}",
-    "{projectName}里的{name}正在等这个问题的答案：{body}"
+    "主人～当前会话 {sessionName} 里的{name}正在问您：{body}",
+    "{name}在会话 {sessionName} 里有一个问题需要您决定：{body}",
+    "当前会话 {sessionName} 里的{name}正在等这个问题的答案：{body}"
   ],
   "rate_limit.many": [
-    "呜～已经连续限流{count}次啦，主人先别继续硬冲嘛。",
-    "连续限流次数已经到{consecutiveRetryCount}，错误码是{errorCode}：{errorMessage}",
-    "{projectName}的{sessionName}第{retry}次尝试仍受到限流，先等等比较聪明哦～"
+    "呜～当前会话 {sessionName} 的模型访问已经连续失败{count}次啦，主人先别继续硬冲嘛。",
+    "会话 {sessionName} 的连续模型访问失败次数已经到{consecutiveRetryCount}，错误码是{errorCode}：{errorMessage}",
+    "当前会话 {sessionName} 的第{retry}次尝试还是没成功，主人先等等嘛，硬撞只会把鲸鱼累趴啦～"
   ],
   "rate_limit.one": [
-    "呜～这次请求被限流啦，主人稍等一下再试嘛。",
-    "当前限流错误码是{errorCode}：{errorMessage}",
-    "{projectName}的{sessionName}第{retry}次尝试受到限流，当前连续次数是{consecutiveRetryCount}。"
+    "呜～当前会话 {sessionName} 这次模型访问失败啦，主人稍等一下再试嘛。",
+    "会话 {sessionName} 的模型请求暂时没成功，错误码是{errorCode}：{errorMessage}",
+    "当前会话 {sessionName} 的第{retry}次尝试还没成功，连续失败次数是{consecutiveRetryCount}，人家先替主人盯着～"
   ],
   "start": [
     "主人～{name}开始工作啦，人家会帮您盯着它的～",
@@ -160,7 +160,7 @@
     "{name}已经进入工作状态啦，主人放心，人家会乖乖替您看着～"
   ],
   "stuck.reminder": [
-    "主人～{name}好像钻进牛角尖里啦，您最好来看一眼嘛。",
+    "呜——超时信号！{name}好像钻进牛角尖里啦，主人最好来看一眼嘛。",
     "哼，{name}在这里卡太久了，看起来需要主人介入一下。",
     "{name}疑似卡在当前思路里了，人家已经用尾鳍敲过它啦～"
   ],

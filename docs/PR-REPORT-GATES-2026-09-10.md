@@ -236,7 +236,8 @@ result[key] = min(1.0, max(0.0, number))
 | 文件 | 作用 |
 |---|---|
 | `ptmp-gate-drive.py` | **新增**：门行为驱动，注入 `rng` 自证 8 个门「关=静音 / 开=必报」 |
-| `ptmp-ui-entry-drive.py` | **重写**：设置页入口驱动（原为旧 `report_probability` 数值项验证） |
+| `ptmp-gate-live-drive.py` | **新增**：概率真的生效驱动，**不注入 rng**（真随机），自证实测出泡率 ≈ 设定概率、端点硬保证、装配链路闭环 |
+| `ptmp-ui-entry-drive.py` | **重写**：设置页入口驱动（原为旧 `report_probability` 数值项验证），含标题与顶层位置自证 |
 
 ---
 
@@ -248,8 +249,37 @@ result[key] = min(1.0, max(0.0, number))
 | 契约（纯逻辑） | `python -m pytest tests/test_report_gates.py -q` | **54 passed** |
 | 联动主套件 | `python -m pytest tests/test_agent_link.py -q` | **151 passed / 0 failed** |
 | 门实际生效 | `python ptmp-gate-drive.py` | **44 通过 / 0 失败** |
-| 设置页入口 | `python ptmp-ui-entry-drive.py` | **60 通过 / 0 失败** |
+| 概率真的生效（真随机） | `python ptmp-gate-live-drive.py` | **17 通过 / 0 失败** |
+| 设置页入口 | `python ptmp-ui-entry-drive.py` | **67 通过 / 0 失败** |
 | 全量 | `python -m pytest -q` | **全绿**（用户本地执行确认） |
+
+### 概率真的生效（`ptmp-gate-live-drive.py`）
+
+`ptmp-gate-drive.py` 注入固定 roll，只能证明**判决逻辑**对；要证明概率**在真实运行路径上确实
+按比例抽稀**，必须用真随机源、真配置往返、真气泡出口。本驱动**不注入 rng**（默认 `random.random`），
+N=3000 × 3 轮：
+
+| 试验 | 设定概率 | 实测出泡 | 偏离 |
+|---|---|---|---|
+| 默认配置（出厂值） | 0.60 | 1806/3000 = 0.6020 | 0.22σ |
+| | 0.60 | 1829/3000 = 0.6097 | 1.08σ |
+| | 0.60 | 1818/3000 = 0.6060 | 0.67σ |
+| 设置页滑块 → 落盘 → 重载 | 0.25 | 756/3000 = 0.2520 | 0.25σ |
+| | 0.25 | 721/3000 = 0.2403 | 1.22σ |
+| | 0.25 | 771/3000 = 0.2570 | 0.89σ |
+| 同一 Config 实例当场改值 | 0.42 | 1228/3000 = 0.4093 | — |
+
+其它自证项：
+
+- **端点硬保证**：`0.00` → 0/3000 一条不出；`1.00` → 3000/3000 一条不漏。
+- **概率只作用于气泡**：过程汇报门关的 50 次投喂里 `win.mark_activity()` 照常被调用 50 次；
+  卡住门关时档位 1 的**焦急动画照旧播放**、只静音档位 2 的气泡。
+- **真实装配链路闭环**：`app.py` 用 `self.config` 打开设置页、`PetWindow(lib, self.config, …)`
+  与桌宠共用**同一 Config 实例**、`window_optional_services.py` 用 `AgentLinkManager(self, self.cfg)`
+  构造管理器且**不注入 rng**；运行时在同一实例上把滑块改成 0.42，管理器当场按 0.42 抽稀。
+
+> 命中率是二项分布：N=3000、p=0.6 时 σ≈0.0089，容差 ±0.05 约 5.6σ，所以真实随机也不会偶发飘红。
+
 
 ### 提交点自检（干净检出 HEAD 能跑）
 
@@ -368,6 +398,7 @@ python -m pytest tests/test_agent_link.py -q
 
 # 工作区驱动自证（注入 rng，确定性判决）
 python ptmp-gate-drive.py        # 门实际生效：8 门 + 边界 + 不记账 + 未知事件放行
+python ptmp-gate-live-drive.py   # 概率真的生效：真随机源下的实测出泡率 + 装配链路闭环
 python ptmp-ui-entry-drive.py    # 设置页入口：8 滑块 + 折叠框 + 搜索展开 + 落盘 + 菜单 0/1
 
 # 全量

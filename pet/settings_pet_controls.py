@@ -37,6 +37,7 @@ from .context_menus.icons import vector_widget_icon
 from .fun_image_popup import oijingjing_image_path, resolve_fun_asset
 from .persona_phrases import PUBLIC_DIALOGUE_EVENTS, default_phrases, phrase_keys
 from .persona_template import build_persona_template
+from .report_gates import REPORT_GATE_DEFAULTS, REPORT_GATE_KEYS
 from .settings_widgets import (
     AUDIO_NAME_FILTER,
     BrowserDoubleSpinBox,
@@ -44,6 +45,7 @@ from .settings_widgets import (
     ClickSoundPackPicker,
     ColorPicker,
     ModernSelect,
+    ProbabilitySlider,
     ResourcePathPicker,
     ResponsiveToggleActionRow,
     SettingRow,
@@ -431,13 +433,19 @@ def build_pet_controls(host) -> None:
     host.agent_sound_cooldown_spin.setSuffix(" 秒")
     host.agent_sound_cooldown_spin.setValue(float(agent_link_cfg.get("sound_cooldown_seconds", 2.0)))
 
-    # 过程汇报概率（0-100%）：过程汇报是提醒量最大的一类，按概率抽稀。
-    # 0 = 过程汇报静音（等同关闭），100 = 全报。
-    host.report_probability_spin = BrowserSpinBox(host)
-    host.report_probability_spin.setRange(0, 100)
-    host.report_probability_spin.setSingleStep(5)
-    host.report_probability_spin.setSuffix(" %")
-    host.report_probability_spin.setValue(int(agent_link_cfg.get("report_probability", 60)))
+    # 事件汇报概率门（0.00–1.00 滑块，无开关）：按事件聚合类别逐类调通过概率。
+    # 0.00 = 该类完全不汇报（等同关闭），1.00 = 全部汇报。滑块是唯一控制项，
+    # 右键菜单只给 0/1 两端快捷入口；键名即门名（见 pet/report_gates.py）。
+    gates_cfg = agent_link_cfg.get("report_gates")
+    if not isinstance(gates_cfg, dict):
+        gates_cfg = {}
+    host.report_gate_sliders = {}
+    for gate in REPORT_GATE_KEYS:
+        slider = ProbabilitySlider(
+            host, value=float(gates_cfg.get(gate, REPORT_GATE_DEFAULTS[gate]))
+        )
+        slider.setObjectName(f"reportGateSlider_{gate}")
+        host.report_gate_sliders[gate] = slider
 
     host.agent_sound_check.toggled.connect(host._update_agent_sound_controls)
     host.agent_sound_check.toggled.connect(host._apply_agent_sound_enabled_now)

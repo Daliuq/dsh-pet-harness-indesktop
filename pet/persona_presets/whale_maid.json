@@ -144,12 +144,12 @@
     "{name}在会话 {sessionName} 里有一个问题需要您决定：{body}",
     "当前会话 {sessionName} 里的{name}正在等这个问题的答案：{body}"
   ],
-  "rate_limit.many": [
+  "model_access.many": [
     "呜～当前会话 {sessionName} 的模型访问已经连续失败{count}次啦，主人先别继续硬冲嘛。",
     "会话 {sessionName} 的连续模型访问失败次数已经到{consecutiveRetryCount}，错误码是{errorCode}：{errorMessage}",
     "当前会话 {sessionName} 的第{retry}次尝试还是没成功，主人先等等嘛，硬撞只会把鲸鱼累趴啦～"
   ],
-  "rate_limit.one": [
+  "model_access.one": [
     "呜～当前会话 {sessionName} 这次模型访问失败啦，主人稍等一下再试嘛。",
     "会话 {sessionName} 的模型请求暂时没成功，错误码是{errorCode}：{errorMessage}",
     "当前会话 {sessionName} 的第{retry}次尝试还没成功，连续失败次数是{consecutiveRetryCount}，人家先替主人盯着～"

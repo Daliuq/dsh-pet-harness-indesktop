@@ -85,6 +85,7 @@ from .config import (
 )
 from .library import MovieLibrary
 from .predictive_prewarm import PredictivePrewarm, pick_from_pool, roll_next
+from .report_gates import REPORT_GATE_DEFAULTS
 from . import slot_manager as slot_manager_mod
 from . import window_placement
 from . import window_screen
@@ -3858,9 +3859,19 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._toggle_agent_link(agent_key, on, action)
 
     def _set_agent_link_option(self, key: str, on: bool) -> None:
-        """联动气泡提醒子项开关（开始干活 / 任务完成 / 卡住检测），立即写入配置。"""
+        """联动气泡提醒子项：右键菜单的 0/1 两端快捷入口。
+
+        概率门模型下（见 pet/report_gates.py），菜单只写两端值——开=1.0 全报、
+        关=0.0 静音；细粒度概率一律回设置页滑块调。键名即概率门名，写进
+        ``agent_link.report_gates``，不再产生旧的 notify_* 平铺键。
+        """
         ag_data = dict(self.cfg.get('agent_link', {}))
-        ag_data[key] = bool(on)
+        if key in REPORT_GATE_DEFAULTS:
+            gates = dict(ag_data.get('report_gates') or {})
+            gates[key] = 1.0 if on else 0.0
+            ag_data['report_gates'] = gates
+        else:
+            ag_data[key] = bool(on)
         self.cfg.set('agent_link', ag_data)
         self.cfg.save()
         # 卡住检测/行为模式检测开关是 AgentLinkManager.apply_config 在启动/切换时
@@ -3890,8 +3901,8 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             ("approval.generic", "审批提示"),
             ("question.empty", "无选项问题"), ("question.one", "用户问题"),
             ("question.many", "多个问题"),
-            ("watchdog.warning", "循环警告"), ("rate_limit.one", "模型访问失败"),
-            ("rate_limit.many", "模型访问失败（连续）"),
+            ("watchdog.warning", "循环警告"), ("model_access.one", "模型访问失败"),
+            ("model_access.many", "模型访问失败（连续）"),
             ("done.success", "任务完成"), ("done.attention", "任务暂停"),
             ("failure.retry", "重试失败"), ("failure.tool", "工具失败"),
             ("failure.generic", "执行失败"),

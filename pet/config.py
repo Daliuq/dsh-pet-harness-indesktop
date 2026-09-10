@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from . import catalog
+from .report_gates import (
+    LEGACY_PERCENT_GATES,
+    LEGACY_SWITCH_GATES,
+    REPORT_GATE_DEFAULTS,
+    clean_report_gates,
+)
 
 
 DEFAULT_ANIMATION_GAP_SECONDS = 0.0
@@ -197,16 +203,10 @@ def _default_agent_link_data() -> dict:
         # 自定义联动 Agent（协议见 docs/AGENT_LINK_PROTOCOL.md §4）：只读监听
         # 用户指定的事件文件，不写外部配置、无需授权弹窗，默认空
         "custom_agents": [],
-        # 联动气泡：开始干活提醒（默认开）、任务完成通知（默认开）
-        "notify_state": True,
-        "notify_done": True,
-        # 过程汇报（默认开，按概率抽稀）：Agent 干活中报「正在读文件/跑命令/改代码…」
-        # 是提醒量最大的一类，用 report_probability 抽稀（0=静音，100=全报）。
-        "notify_activity": True,
-        "report_probability": 60,
-        # 硬失败提醒（默认开）：DSH 已决定本轮不再继续（重试耗尽/工具最终失败）
-        # 时直接提醒，不经行为分析。与审批/问题（notify_approval）同级。
-        "notify_exec_failed": True,
+        # 事件汇报概率门（默认值见 pet/report_gates.py）：设置页把它们收进
+        # 「自动化与联动 → Agent 联动文案风格」下的可折叠框，按事件聚合类别逐类调。
+        # 值是**通过概率** 0.00–1.00（0 = 该类完全不汇报，1 = 全部汇报），没有布尔开关。
+        "report_gates": dict(REPORT_GATE_DEFAULTS),
         # 卡住检测（默认开）：DSH 联动开启时，根据工具成败/超时/错误
         # 推断「Agent 钻牛角尖了」，档位 1 播焦急动画、档位 2 弹持续提醒气泡。
         "stuck_detect": True,
@@ -316,7 +316,7 @@ def _clean_agent_link_data(raw: Any) -> dict:
     result.update(raw)
     result["custom_agents"] = _clean_custom_agents(raw.get("custom_agents"))
     for key in (
-        "dsh", "claude", "cursor", "opencode", "notify_state", "notify_done", "notify_activity",
+        "dsh", "claude", "cursor", "opencode",
         "sound_enabled", "sound_start_enabled", "sound_done_enabled", "sound_error_enabled",
     ):
         if key in raw:
@@ -331,11 +331,25 @@ def _clean_agent_link_data(raw: Any) -> dict:
         result["sound_cooldown_seconds"] = _float_or_default(
             raw.get("sound_cooldown_seconds"), defaults["sound_cooldown_seconds"], 0.0, 30.0
         )
-    if "report_probability" in raw:
-        # 汇报概率：非法值回落默认，越界收敛到 [0, 100]（0=过程汇报静音，100=全报）
-        result["report_probability"] = int(_float_or_default(
-            raw.get("report_probability"), defaults["report_probability"], 0.0, 100.0
-        ))
+    # 事件汇报概率门：新形状（report_gates 字典）优先；旧键一次性迁移——
+    # 布尔开关 → 1.0/0.0，旧百分比 report_probability(0-100) → activity 概率。
+    # 迁移后**不再写出旧键**，配置里不留兼容别名（用户可编辑文案的键名另见
+    # docs/PERSONA-PHRASES-PRESET-STORAGE-2026-09-08.md）。
+    raw_gates = raw.get("report_gates")
+    gates = clean_report_gates(raw_gates)
+    if not isinstance(raw_gates, dict):
+        for legacy_key, gate in LEGACY_SWITCH_GATES.items():
+            if legacy_key in raw:
+                gates[gate] = 1.0 if bool(raw[legacy_key]) else 0.0
+        for legacy_key, gate in LEGACY_PERCENT_GATES.items():
+            if legacy_key in raw:
+                percent = _float_or_default(
+                    raw.get(legacy_key), REPORT_GATE_DEFAULTS[gate] * 100.0, 0.0, 100.0
+                )
+                gates[gate] = min(1.0, max(0.0, percent / 100.0))
+    result["report_gates"] = gates
+    for legacy_key in (*LEGACY_SWITCH_GATES, *LEGACY_PERCENT_GATES):
+        result.pop(legacy_key, None)
     return result
 
 
@@ -940,11 +954,21 @@ class Config:
         ("{errorText}", "{errorMessage}"),
     )
 
+    # 事件键改名表：旧事件键（曾按状态码命名）→ 新语义键。内置 preset JSON 直接
+    # 改源文件；用户自定义 dialogue_phrases 里的旧键在加载时迁移一次（幂等）。
+    # 新键已存在时以新配置为准，丢弃旧键（不合并、不留别名）。
+    _DIALOGUE_EVENT_KEY_MIGRATIONS = (
+        ("rate_limit.one", "model_access.one"),
+        ("rate_limit.many", "model_access.many"),
+    )
+
     @classmethod
     def _migrate_dialogue_phrase_fields(cls, phrases) -> None:
-        """把 dialogue_phrases（global/agents 各层文案）里的旧占位符替换为新名。
+        """迁移 dialogue_phrases（global/agents 各层文案）里的旧事件键与旧占位符。
 
-        原地修改 phrases 的 list/str 值；对新配置（无旧占位符）幂等无副作用。
+        先按 ``_DIALOGUE_EVENT_KEY_MIGRATIONS`` 改键，再把 list/str 值里的旧占位符
+        替换为新名（``_DIALOGUE_PLACEHOLDER_MIGRATIONS``）。原地修改；对新配置
+        （无旧键、无旧占位符）幂等无副作用。
         """
         if not isinstance(phrases, dict):
             return
@@ -953,6 +977,13 @@ class Config:
             node = stack.pop()
             if not isinstance(node, dict):
                 continue
+            for old_key, new_key in cls._DIALOGUE_EVENT_KEY_MIGRATIONS:
+                if old_key not in node:
+                    continue
+                if new_key in node:
+                    node.pop(old_key)  # 新配置优先：同名新键已在，丢弃旧键
+                else:
+                    node[new_key] = node.pop(old_key)
             for key, value in node.items():
                 if isinstance(value, str):
                     replaced = value

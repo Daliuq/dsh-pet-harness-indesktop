@@ -220,7 +220,7 @@ def test_dialogue_key_params_match_runtime_call_sites():
     assert "target" not in DIALOGUE_KEY_PARAMS["activity.read"]
     assert "ok" not in DIALOGUE_KEY_PARAMS["activity.read"]
     assert {"errorCode", "errorMessage", "consecutiveRetryCount", "retry"} <= set(
-        DIALOGUE_KEY_PARAMS["rate_limit.one"])
+        DIALOGUE_KEY_PARAMS["model_access.one"])
     assert DIALOGUE_KEY_PARAMS["dsh.writeback.failed"] == ()
 
 

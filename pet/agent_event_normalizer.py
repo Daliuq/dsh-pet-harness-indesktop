@@ -12,7 +12,7 @@ class SemanticEvent:
     step: int | str | None = None
     data: dict[str, Any] = field(default_factory=dict)
     # 上游事件名（归一化后的规范名）。语义事件的消费端按它判定事件语义：
-    # RateLimitTracker 用它识别 llm/retry 的限流计数与复位时机。原始写法仍保留在
+    # ModelAccessTracker 用它识别 llm/retry 的限流计数与复位时机。原始写法仍保留在
     # AgentEvent.event（协议层）上，这里给的是语义层统一后的规范名。
     event: str = ""
 
@@ -75,7 +75,7 @@ _EXPLORATION = {"read", "grep", "glob", "search", "web_search", "web_search_begi
 _ACTION = {"edit", "write", "patch", "shell", "pwsh", "bash", "pytest", "npm test", "playwright", "run"}
 
 # 上游可能用非语义名书写同一事件：DSH 状态记录写 "AgentStatus"，而消费端复位词表
-# （rate_limit_tracker._resets）按 "agent/status" 判定。归一化点负责统一成规范名，
+# （model_access_tracker._resets）按 "agent/status" 判定。归一化点负责统一成规范名，
 # 使产物字段 event 与消费端词表严格一致（原始写法仍留在协议层 AgentEvent.event）。
 _EVENT_ALIASES = {"agentstatus": "agent/status"}
 

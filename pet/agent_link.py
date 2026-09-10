@@ -38,10 +38,11 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox
 
 from .click_sound import play_sound, resolve_builtin_sound
+from .report_gates import should_report, should_report_event
 from .agent_event_protocol import parse_agent_event
 from .agent_event_normalizer import normalize_event
 from .agent_event_runtime import AgentEventRuntime
-from .rate_limit_tracker import RateLimitTracker
+from .model_access_tracker import ModelAccessTracker
 from .node_runtime import augmented_path as _augmented_path
 
 from .persona_phrases import PhrasePicker
@@ -548,8 +549,8 @@ class BaseAgentMonitor(QObject):
     execution_failed = Signal(str, object)   # (agent_key, payload)
     # 会话元数据更新（session/meta 事件）：(agent_key, record)
     session_meta = Signal(str, object)
-    # 模型访问失败提醒（rate_limit 事件，errorCode=429）：(agent_key, record)
-    rate_limit = Signal(str, object)
+    # 模型访问失败提醒（model_access 事件，errorCode 为服务端限流码）：(agent_key, record)
+    model_access = Signal(str, object)
     # LLM API 错误（llm_error 事件，errorCode=真实码如 bad_response_status_code，
     # errorKind=api）：(agent_key, record)
     llm_error = Signal(str, object)
@@ -840,9 +841,9 @@ class BaseAgentMonitor(QObject):
                 # 调试输出：debug/session-shape（仅首次，之后可通过配置关闭）
                 if meta_type == "debug/session-shape":
                     log.info("[dsh-pet-bridge] session shape: %s", json.dumps(data, ensure_ascii=False)[:500])
-                # 模型访问失败事件：rate_limit（errorCode=429）→ 信号转发给 Manager 显示提醒
-                if ev == "rate_limit":
-                    self._emit(self.rate_limit, (self.agent_key, data))
+                # 模型访问失败事件：model_access（服务端限流/过载码）→ 信号转发给 Manager 显示提醒
+                if ev == "model_access":
+                    self._emit(self.model_access, (self.agent_key, data))
                 # LLM API 错误事件：llm_error（errorCode=真实上游码，errorKind=api）→ 信号转发给 Manager
                 if ev == "llm_error":
                     self._emit(self.llm_error, (self.agent_key, data))
@@ -1472,18 +1473,15 @@ def other_instances_use_agent(config, agent_key: str) -> bool:
 # 汇报抽稀
 # ----------------------------------------------------------------------
 
-def should_report_activity(probability: int, roll: float) -> bool:
-    """过程汇报抽稀判决：``probability`` 为 0-100 的百分比，``roll`` ∈ [0, 1)。
+def should_report_activity(probability: float, roll: float) -> bool:
+    """事件汇报概率门判决：``roll`` ∈ [0, 1) 小于通过概率则放行。
 
-    - 0   → 永不汇报（等效于关闭过程汇报）
-    - 100 → 全报
-    - 其余按 ``roll * 100 < probability`` 判定（边界取「小于」，故
-      probability=60 时 roll=0.6 不汇报）。
-
-    只用于**出气泡的汇报路径**：原始记录（raw_record → 卡住检测 / 行为识别 /
-    探索看门狗 / 对话记忆）不经过这里。
+    量纲已随概率门统一为 0.0–1.0（旧版是 0-100 百分比）：0 永不汇报、1 全报；
+    边界取「小于」，故 0.6 时 roll=0.6 不汇报。只用于**出气泡的汇报路径**：
+    原始记录（raw_record → 卡住检测 / 行为识别 / 探索看门狗 / 对话记忆）
+    不经过这里。
     """
-    return roll * 100.0 < float(probability)
+    return should_report(probability, roll)
 
 
 # ----------------------------------------------------------------------
@@ -1572,7 +1570,7 @@ class AgentLinkManager(QObject):
         # 不再依赖「恰好是最后一条记录」的隐式上下文。
         self._last_tool_records: dict[str, dict[str, Any]] = {}
         self._event_runtime = AgentEventRuntime()
-        self._rate_limit_tracker = RateLimitTracker()
+        self._model_access_tracker = ModelAccessTracker()
         # 待处理阻塞型交互：interaction_id → {"agent_key", "kind": "approval"|"question",
         # "text": str, "tool"?: str, "questions"?: list, "rpc_id"?, "approval_id"?,
         # "session_id"?, "alert_id"}。审批 / 用户问题都是「阻塞 Agent 等待用户输入」的
@@ -1650,14 +1648,14 @@ class AgentLinkManager(QObject):
             mon.cordis_resolved.connect(self._on_cordis_resolved)
             mon.execution_failed.connect(self._on_execution_failed)
         self.monitors["dsh"].session_meta.connect(self._on_session_meta)
-        self.monitors["dsh"].rate_limit.connect(self._on_rate_limit)
+        self.monitors["dsh"].model_access.connect(self._on_model_access)
         self.monitors["dsh"].llm_error.connect(self._on_llm_error)
         self.monitors["dsh"].user_action.connect(self._on_user_action)
-        # 429 模型访问失败提醒缓存：session_key → { "count": int, "_ts": float, "_first_ts": float, "_dismissed": bool }
-        self._429_cache: dict[str, dict] = {}
-        self._429_timers: dict[str, QTimer] = {}   # session_key → 自动收起定时器
-        self._429_retry_counts: dict[tuple[str, str], int] = {}
-        self._429_anonymous_seq = 0
+        # 模型访问失败提醒缓存：session_key → { "count": int, "_ts": float, "_first_ts": float, "_dismissed": bool }
+        self._model_access_cache: dict[str, dict] = {}
+        self._model_access_timers: dict[str, QTimer] = {}   # session_key → 自动收起定时器
+        self._model_access_retry_counts: dict[tuple[str, str], int] = {}
+        self._model_access_anonymous_seq = 0
         # LLM API 错误缓存：session_key → { "_ts": float, "_dismissed": bool }
         self._llm_error_cache: dict[str, dict] = {}
         self._llm_error_timers: dict[str, QTimer] = {}
@@ -1673,14 +1671,14 @@ class AgentLinkManager(QObject):
         """Consume semantic events for streak tracking and interaction cleanup."""
         from .agent_event_normalizer import InteractionResolvedEvent, RetryEvent
         if isinstance(event, RetryEvent):
-            streak = self._rate_limit_tracker.consume(event)
+            streak = self._model_access_tracker.consume(event)
             if streak:
-                self._429_retry_counts[(event.source, event.session_id)] = int(streak["consecutiveRetryCount"])
+                self._model_access_retry_counts[(event.source, event.session_id)] = int(streak["consecutiveRetryCount"])
             return
         # The tracker resets its streak on successful/lifecycle events.
         if getattr(event, "session_id", ""):
-            self._rate_limit_tracker.consume(event)
-            self._429_retry_counts.pop((event.source, event.session_id), None)
+            self._model_access_tracker.consume(event)
+            self._model_access_retry_counts.pop((event.source, event.session_id), None)
         if not isinstance(event, InteractionResolvedEvent):
             return
         candidates = []
@@ -1707,7 +1705,7 @@ class AgentLinkManager(QObject):
         否则"隐藏期间关配置"不会真正 stop，恢复显示时又会被 resume 拉起。"""
         agent_cfg = self.cfg.get("agent_link", {})
         if not agent_cfg.get("dsh", False):
-            self._clear_429_alerts()
+            self._clear_model_access_alerts()
         for key, monitor in self.monitors.items():
             should_run = bool(agent_cfg.get(key, False))
             if should_run and not monitor._running:
@@ -1778,12 +1776,14 @@ class AgentLinkManager(QObject):
             self.apply_config()
             if hasattr(self.win, "show_bubble"):
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
-                self.win.show_bubble(self._dialogue("bridge.install.success", "DSH 桥接插件已装好，联动开启～", name=name), duration_ms=4000)
+                if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.success"):
+                    self.win.show_bubble(self._dialogue("bridge.install.success", "DSH 桥接插件已装好，联动开启～", name=name), duration_ms=4000)
         else:
             log.warning("DSH 桥接插件安装失败: %s", msg)
             if hasattr(self.win, "show_bubble"):
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
-                self.win.show_bubble(self._dialogue("bridge.install.failed", f"DSH 桥接插件安装失败：{msg}", name=name, detail=msg), duration_ms=6000)
+                if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.failed"):
+                    self.win.show_bubble(self._dialogue("bridge.install.failed", f"DSH 桥接插件安装失败：{msg}", name=name, detail=msg), duration_ms=6000)
 
     def _other_instances_enabled(self, agent_key: str) -> bool:
         """其他多开实例（含默认实例）是否也开着该 Agent 联动。
@@ -1835,7 +1835,8 @@ class AgentLinkManager(QObject):
                 self._install_pending["dsh"] = token
                 if hasattr(self.win, "show_bubble"):
                     name = self.AGENT_NAMES.get(agent_key, agent_key)
-                    self.win.show_bubble(self._dialogue("bridge.install.pending", "正在安装 DSH 桥接插件…", name=name), duration_ms=4000)
+                    if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.pending"):
+                        self.win.show_bubble(self._dialogue("bridge.install.pending", "正在安装 DSH 桥接插件…", name=name), duration_ms=4000)
                 import threading
                 threading.Thread(
                     target=self._install_dsh_worker, args=(token,), daemon=True,
@@ -1855,7 +1856,8 @@ class AgentLinkManager(QObject):
                     log.warning("Claude hooks 卸载未完全成功（配置已关闭，hooks 可能残留）")
                     if hasattr(self.win, "show_bubble"):
                         name = self.AGENT_NAMES.get(agent_key, agent_key)
-                        self.win.show_bubble(self._dialogue("bridge.uninstall.failed", "Claude hooks 卸载未完全成功，可手动检查 ~/.claude/settings.json", name=name), duration_ms=6000)
+                        if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.uninstall.failed"):
+                            self.win.show_bubble(self._dialogue("bridge.uninstall.failed", "Claude hooks 卸载未完全成功，可手动检查 ~/.claude/settings.json", name=name), duration_ms=6000)
             elif agent_key == "dsh":
                 if self._other_instances_enabled("dsh"):
                     log.info("其他实例仍在使用 DSH 联动，保留桥接插件")
@@ -1863,7 +1865,8 @@ class AgentLinkManager(QObject):
                     log.warning("DSH 桥接插件卸载未完全成功（配置已关闭，插件可能残留）")
                     if hasattr(self.win, "show_bubble"):
                         name = self.AGENT_NAMES.get(agent_key, agent_key)
-                        self.win.show_bubble(self._dialogue("bridge.uninstall.failed", "DSH 桥接插件卸载未完全成功", name=name), duration_ms=6000)
+                        if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.uninstall.failed"):
+                            self.win.show_bubble(self._dialogue("bridge.uninstall.failed", "DSH 桥接插件卸载未完全成功", name=name), duration_ms=6000)
 
         ag_cfg = dict(self.cfg.get("agent_link", {}))
         ag_cfg[agent_key] = bool(enabled)
@@ -2202,11 +2205,23 @@ class AgentLinkManager(QObject):
             name=name,
         )
 
+    def _report_allowed(self, agent_cfg: dict, event_key: str) -> bool:
+        """事件汇报概率门：按事件聚合类别取该类通过概率并抽稀。
+
+        - 门值 ``0.0`` → 该类完全不汇报；``1.0`` → 全部汇报；
+        - 未知事件**不抽稀**（直接放行），新事件上线不会被静默丢弃；
+        - 只作用于**出气泡**这一步：检测器本身与 ``raw_record`` 链路不受影响。
+        """
+        gates = agent_cfg.get("report_gates", {})
+        if not isinstance(gates, dict):
+            gates = {}
+        return should_report_event(gates, event_key, self._rng())
+
     def _maybe_notify_start(self, agent_key: str, prev_raw: str | None, state: str = "working") -> None:
         """开始干活气泡：仅「非 busy → busy」时提示（thinking↔working 互跳不弹）。
         低优先级：气泡位被占时直接丢弃。thinking 状态用更有趣的文案。"""
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_state", False):
+        if not self._report_allowed(agent_cfg, "thinking" if state == "thinking" else "start"):
             return
         if prev_raw in self._BUSY_STATES:
             return
@@ -2228,8 +2243,6 @@ class AgentLinkManager(QObject):
         if callable(mark):
             mark()
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_activity", False):
-            return
         label = self.TOOL_LABELS.get(str(tool).strip().lower(), self._UNKNOWN_TOOL_LABEL)
         now = self._clock()
         last = self._last_activity.get(agent_key)
@@ -2240,13 +2253,11 @@ class AgentLinkManager(QObject):
                 return
         if now - self._activity_global_last < self._ACTIVITY_GLOBAL_MIN:
             return
-        # 汇报概率抽稀（默认 60%）：只作用在出气泡这一步，且**不记账**——
+        # 事件汇报概率门（过程汇报默认 0.6）：只作用在出气泡这一步，且**不记账**——
         # 抽稀丢弃不更新 _last_activity/_activity_global_last，否则概率会与三重
         # 节流叠加、把过程汇报过度衰减。raw_record 链路不经过本函数，检测类
         # 消费者（卡住/行为/探索/对话记忆）不受影响。
-        if not should_report_activity(
-            agent_cfg.get("report_probability", 60), self._rng()
-        ):
+        if not self._report_allowed(agent_cfg, "activity.default"):
             return
         self._last_activity[agent_key] = (label, now)
         self._activity_global_last = now
@@ -2296,7 +2307,7 @@ class AgentLinkManager(QObject):
         气泡文案优先展示被审批命令的完整内容（payload.command，来自 bridge
         的 arguments），让用户不用去 DSH 界面就能看到要批准什么。"""
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_approval", True):
+        if not self._report_allowed(agent_cfg, "approval.command"):
             return
         payload = payload if isinstance(payload, dict) else {}
         # 可关联身份门禁：无 rpcId/approvalId/requestId/callId 一律不弹窗。
@@ -2384,7 +2395,7 @@ class AgentLinkManager(QObject):
         只登记**具备可关联身份**的问题（rpcId 或 callId 任一非空），靠它与
         question/resolved 配对精确关闭；两者皆无的记录无法可靠关闭，直接忽略。"""
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_approval", True):  # 与审批同一开关
+        if not self._report_allowed(agent_cfg, "question.one"):  # 与审批同门（审批与提问类）
             return
         payload = payload if isinstance(payload, dict) else {}
         # 可关联身份门禁：rpcId（mux）或 callId（tool/call 兜底）任一非空才登记。
@@ -2623,7 +2634,7 @@ class AgentLinkManager(QObject):
 
     def dismiss_all_interactions(self) -> None:
         """清空全部待处理阻塞交互并关闭气泡（DSH 离线/重启时交互必然失效）。"""
-        self._clear_429_alerts()
+        self._clear_model_access_alerts()
         if not self._pending_interactions and not getattr(self.win, "_sticky_bubble_active", False):
             return
         self._pending_interactions.clear()
@@ -2906,7 +2917,7 @@ class AgentLinkManager(QObject):
         if agent_key not in self._saw_error:
             self._emit_sound("done", agent_key)
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_done", True):
+        if not self._report_allowed(agent_cfg, "done.success"):
             return
         now = self._clock()
         if now - self._done_cooldown.get(agent_key, 0.0) < self._DONE_COOLDOWN_S:
@@ -3014,6 +3025,9 @@ class AgentLinkManager(QObject):
         agent_cfg = self.cfg.get("agent_link", {})
         custom = str((agent_cfg.get("stuck_reminder_text") or "") if isinstance(agent_cfg, dict) else "")
         text = stuck_reminder_text(name, custom)
+        # 事件汇报概率门（检测类）：档位 1 的动画不受影响，只有气泡受门控制。
+        if not self._report_allowed(agent_cfg, "stuck.reminder"):
+            return
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(self._dialogue("stuck.reminder", text, name=name), duration_ms=self._STUCK_REMINDER_MS, sticky=False)
         elif hasattr(self.win, "show_bubble"):
@@ -3075,6 +3089,10 @@ class AgentLinkManager(QObject):
             )
         key = "pattern.control" if verdict in ("STOP", "ASK_USER", "REPLAN") else "pattern.warning"
         text = self._dialogue(key, text, name=name, reasons=reason)
+        agent_cfg = self.cfg.get("agent_link", {})
+        # 事件汇报概率门（检测类）：动画照旧，只有气泡受门控制。
+        if not self._report_allowed(agent_cfg, key):
+            return
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(text, duration_ms=self._PATTERN_REMINDER_MS, sticky=False)
         elif hasattr(self.win, "show_bubble"):
@@ -3094,6 +3112,10 @@ class AgentLinkManager(QObject):
             "watchdog.warning", f"{name} 近期存在重复探索行为：{reasons}，暂不打断运行。",
             name=name, reasons=reasons,
         )
+        agent_cfg = self.cfg.get("agent_link", {})
+        # 事件汇报概率门（检测类）：循环检测提醒按门抽稀。
+        if not self._report_allowed(agent_cfg, "watchdog.warning"):
+            return
         if hasattr(self.win, "show_alert"):
             self._show_alert_compat(text, duration_ms=self._EXPLORATION_REMINDER_MS,
                                 sticky=False, alert_id=f"exploration-warning:{session_key}",
@@ -3174,49 +3196,54 @@ class AgentLinkManager(QObject):
         log.debug("session_meta cached: %s → %s", session_id[:12], self._session_meta_cache[session_id])
 
     # ------------------------------------------------------------------
-    # 429 模型访问失败提醒
+    # 模型访问失败提醒
     # ------------------------------------------------------------------
-    # alert_id 带 sessionId：多 session 并发 429 时互不顶替。
-    # show_alert 的 duration_ms 对 sticky 项无效，寿命由 _429_timer 自行管理。
-    _429_COOLDOWN_S = 8.0          # 同 session 8 秒内合并为一次
-    _429_DURATION_MS = 15000       # 基础展示 15 秒
-    _429_MAX_LIFETIME_MS = 30000   # 同一 session 从首次触发起最长保留 30 秒
-    _429_PRIORITY = 1              # 高于普通状态气泡和 Watchdog（3）；审批(0)可抢占
+    # alert_id 带 sessionId：多 session 并发模型访问失败时互不顶替。
+    # show_alert 的 duration_ms 对 sticky 项无效，寿命由 _model_access_timer 自行管理。
+    _MODEL_ACCESS_COOLDOWN_S = 8.0          # 同 session 8 秒内合并为一次
+    _MODEL_ACCESS_DURATION_MS = 15000       # 基础展示 15 秒
+    _MODEL_ACCESS_MAX_LIFETIME_MS = 30000   # 同一 session 从首次触发起最长保留 30 秒
+    _MODEL_ACCESS_PRIORITY = 1              # 高于普通状态气泡和 Watchdog（3）；审批(0)可抢占
 
     @staticmethod
-    def _429_alert_id(session_key: str) -> str:
-        return f"429-rate-limit:{session_key}"
+    def _model_access_alert_id(session_key: str) -> str:
+        return f"model-access:{session_key}"
 
-    def _on_rate_limit(self, agent_key: str, record: dict) -> None:
-        """处理模型访问失败（429）事件：合并同 session 短时间内连续报错，弹窗提醒。"""
+    def _on_model_access(self, agent_key: str, record: dict) -> None:
+        """处理模型访问失败事件：合并同 session 短时间内连续报错，弹窗提醒。"""
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
         if not isinstance(record, dict):
             return
+        # 汇报概率门放在**记账之前**：被抽稀掉的一次不应写入 _model_access_cache，
+        # 否则「关掉模型访问失败提醒」会连带压掉随后的通用失败横幅（缓存里的活跃
+        # 提醒会触发抑制分支），用户看到的是一类静音把另一类也吞了。
+        if not self._report_allowed(self.cfg.get("agent_link", {}), "model_access.one"):
+            return
         session_id = str(record.get("sessionId") or "")
         if not session_id:
-            self._429_anonymous_seq += 1
-            session_key = f"{agent_key}:anonymous:{self._429_anonymous_seq}"
+            self._model_access_anonymous_seq += 1
+            session_key = f"{agent_key}:anonymous:{self._model_access_anonymous_seq}"
         else:
             session_key = session_id
         now = self._clock()
-        cache = self._429_cache
+        cache = self._model_access_cache
         existing = cache.get(session_key)
         supplied_count = record.get("consecutiveRetryCount")
         if supplied_count is None and session_id:
-            supplied_count = self._429_retry_counts.get((agent_key, session_id), 0)
+            supplied_count = self._model_access_retry_counts.get((agent_key, session_id), 0)
         try:
             supplied_count = int(supplied_count) if supplied_count is not None else 0
         except (TypeError, ValueError):
             supplied_count = 0
-        if existing and now - existing.get("_ts", 0) < self._429_COOLDOWN_S:
+        if existing and now - existing.get("_ts", 0) < self._MODEL_ACCESS_COOLDOWN_S:
             # Prefer the bridge's actual streak; legacy payloads increment locally.
             existing_count = int(existing.get("count", 1) or 1)
             existing["count"] = max(existing_count, supplied_count) if supplied_count else existing_count + 1
             existing["_ts"] = now
             existing["_dismissed"] = False
-            self._remember_429_record_fields(existing, record)
-            self._show_429_alert(session_key, existing["count"])
+            self._remember_model_access_record_fields(existing, record)
+            self._show_model_access_alert(session_key, existing["count"])
             return
         entry = {
             "count": max(1, supplied_count),
@@ -3224,11 +3251,11 @@ class AgentLinkManager(QObject):
             "_first_ts": now,
             "_dismissed": False,
         }
-        self._remember_429_record_fields(entry, record)
+        self._remember_model_access_record_fields(entry, record)
         cache[session_key] = entry
-        self._show_429_alert(session_key, entry["count"])
+        self._show_model_access_alert(session_key, entry["count"])
 
-    def _remember_429_record_fields(self, entry: dict, record: dict) -> None:
+    def _remember_model_access_record_fields(self, entry: dict, record: dict) -> None:
         """把限流记录的条件字段缓存进条目，供弹窗模板条件注入（缺失自动隐藏）。"""
         record = record if isinstance(record, dict) else {}
         for field in ("errorCode", "errorMessage", "consecutiveRetryCount", "retry"):
@@ -3236,15 +3263,15 @@ class AgentLinkManager(QObject):
             if value not in (None, ""):
                 entry[field] = value
 
-    def _show_429_alert(self, session_key: str, count: int) -> None:
-        """展示模型访问失败（429）提醒弹窗，高优先级，带「知道了」按钮，15 秒自动收起。"""
+    def _show_model_access_alert(self, session_key: str, count: int) -> None:
+        """展示模型访问失败提醒弹窗，高优先级，带「知道了」按钮，15 秒自动收起。"""
         fallback = (
-            "DSH 模型访问失败（429），本次请求未完成；请稍后重试。"
+            "DSH 模型访问失败，本次请求未完成；请稍后重试。"
             if count <= 1 else
-            f"DSH 模型访问失败（429），已连续 {count} 次；请稍后重试。"
+            f"DSH 模型访问失败，已连续 {count} 次；请稍后重试。"
         )
-        key = "rate_limit.many" if count > 1 else "rate_limit.one"
-        entry = self._429_cache.get(session_key) or {}
+        key = "model_access.many" if count > 1 else "model_access.one"
+        entry = self._model_access_cache.get(session_key) or {}
         conditional: dict[str, Any] = {}
         for field in ("errorCode", "errorMessage", "consecutiveRetryCount", "retry"):
             value = entry.get(field)
@@ -3258,48 +3285,48 @@ class AgentLinkManager(QObject):
         # different wording; only an unavailable/empty renderer falls back.
         if not str(text or '').strip():
             text = fallback
-        buttons = [("知道了", lambda sk=session_key: self._dismiss_429_alert(sk))]
+        buttons = [("知道了", lambda sk=session_key: self._dismiss_model_access_alert(sk))]
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(
                 text,
                 duration_ms=0,             # sticky 项忽略 duration，寿命由 timer 管理
                 sticky=True,
                 buttons=buttons,
-                alert_id=self._429_alert_id(session_key),
-                priority=self._429_PRIORITY,
-                alert_type="rate_limit",
+                alert_id=self._model_access_alert_id(session_key),
+                priority=self._MODEL_ACCESS_PRIORITY,
+                alert_type="model_access",
                 metadata={"sessionId": session_key},
             )
         elif hasattr(self.win, "show_bubble"):
-            self.win.show_bubble(text, duration_ms=self._429_DURATION_MS)
+            self.win.show_bubble(text, duration_ms=self._MODEL_ACCESS_DURATION_MS)
         # 自动收起：默认 15s；如被合并刷新，则按「首次触发 + 30s」硬上限收敛。
-        self._schedule_429_dismiss(session_key)
+        self._schedule_model_access_dismiss(session_key)
 
-    def _schedule_429_dismiss(self, session_key: str) -> None:
-        """排定 429 提醒的自动收起时间。
+    def _schedule_model_access_dismiss(self, session_key: str) -> None:
+        """排定模型访问失败提醒的自动收起时间。
 
         优先按最近一次触发 + 15s；但不超过该 session 首次触发 + 30s 硬上限，
         避免合并刷新把弹窗无限续命。无 QTimer 环境（测试桩）时跳过。"""
         if not hasattr(self.win, "_bubble_busy_until"):
             return  # 测试桩无 QTimer 环境：跳过自动收起，由 dismiss 兜底
-        entry = self._429_cache.get(session_key)
+        entry = self._model_access_cache.get(session_key)
         if not entry:
             return
         now = self._clock()
-        cap_remaining = self._429_MAX_LIFETIME_MS / 1000.0 - (now - entry.get("_first_ts", now))
-        base_remaining = self._429_DURATION_MS / 1000.0 - (now - entry.get("_ts", now))
+        cap_remaining = self._MODEL_ACCESS_MAX_LIFETIME_MS / 1000.0 - (now - entry.get("_first_ts", now))
+        base_remaining = self._MODEL_ACCESS_DURATION_MS / 1000.0 - (now - entry.get("_ts", now))
         delay_s = max(0.2, min(base_remaining, cap_remaining))
-        self._cancel_429_timer(session_key)
+        self._cancel_model_access_timer(session_key)
         # win 可能是非 QObject 的测试桩：parent 传 None，定时器由本管理器持有生命周期
         parent = self.win if isinstance(self.win, QObject) else None
         timer = QTimer(parent)
         timer.setSingleShot(True)
-        timer.timeout.connect(lambda sk=session_key: self._dismiss_429_alert(sk))
-        self._429_timers[session_key] = timer
+        timer.timeout.connect(lambda sk=session_key: self._dismiss_model_access_alert(sk))
+        self._model_access_timers[session_key] = timer
         timer.start(int(delay_s * 1000))
 
-    def _cancel_429_timer(self, session_key: str) -> None:
-        timer = self._429_timers.pop(session_key, None)
+    def _cancel_model_access_timer(self, session_key: str) -> None:
+        timer = self._model_access_timers.pop(session_key, None)
         if timer is not None:
             try:
                 timer.stop()
@@ -3307,25 +3334,25 @@ class AgentLinkManager(QObject):
                 pass
             timer.deleteLater()
 
-    def _clear_429_alerts(self) -> None:
-        """清理全部 429 提醒、计数和定时器。"""
-        session_keys = set(self._429_cache) | set(self._429_timers)
-        self._429_cache.clear()
-        self._429_retry_counts.clear()
-        for session_key in list(self._429_timers):
-            self._cancel_429_timer(session_key)
+    def _clear_model_access_alerts(self) -> None:
+        """清理全部模型访问失败提醒、计数和定时器。"""
+        session_keys = set(self._model_access_cache) | set(self._model_access_timers)
+        self._model_access_cache.clear()
+        self._model_access_retry_counts.clear()
+        for session_key in list(self._model_access_timers):
+            self._cancel_model_access_timer(session_key)
         for session_key in session_keys:
             if hasattr(self.win, "resolve_alert"):
-                self.win.resolve_alert(self._429_alert_id(session_key))
+                self.win.resolve_alert(self._model_access_alert_id(session_key))
 
-    def _dismiss_429_alert(self, session_key: str) -> None:
+    def _dismiss_model_access_alert(self, session_key: str) -> None:
         """用户点击「知道了」或超时自动收起：清理缓存并关闭提醒。"""
-        cache = self._429_cache
+        cache = self._model_access_cache
         entry = cache.pop(session_key, None)
         if entry:
             entry["_dismissed"] = True
-        self._cancel_429_timer(session_key)
-        alert_id = self._429_alert_id(session_key)
+        self._cancel_model_access_timer(session_key)
+        alert_id = self._model_access_alert_id(session_key)
         if hasattr(self.win, "resolve_alert"):
             self.win.resolve_alert(alert_id)
 
@@ -3337,7 +3364,7 @@ class AgentLinkManager(QObject):
         """处理 LLM API 错误事件（llm_error，errorKind=api）：弹窗提醒。
 
         errorCode 是上游真实错误码（如 bad_response_status_code），不再替换成
-        分类别名；errorKind 承载分类语义（api=AI 服务错误，非 429 模型访问失败）。
+        分类别名；errorKind 承载分类语义（api=AI 服务错误，非模型访问失败）。
         """
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
@@ -3348,7 +3375,7 @@ class AgentLinkManager(QObject):
         cache = self._llm_error_cache
         # LLM API 错误不合并，每次错误都提醒（但用冷却时间防刷屏）
         existing = cache.get(session_key)
-        if existing and now - existing.get("_ts", 0) < self._429_COOLDOWN_S:
+        if existing and now - existing.get("_ts", 0) < self._MODEL_ACCESS_COOLDOWN_S:
             return  # 冷却期内忽略
         cache[session_key] = {
             "_ts": now,
@@ -3368,12 +3395,12 @@ class AgentLinkManager(QObject):
                 sticky=True,
                 buttons=buttons,
                 alert_id=self._llm_error_alert_id(session_key),
-                priority=self._429_PRIORITY,
+                priority=self._MODEL_ACCESS_PRIORITY,
                 alert_type="llm_error",
                 metadata={"sessionId": session_key, "errorCode": error_code, "errorKind": error_kind},
             )
         elif hasattr(self.win, "show_bubble"):
-            self.win.show_bubble(text, duration_ms=self._429_DURATION_MS)
+            self.win.show_bubble(text, duration_ms=self._MODEL_ACCESS_DURATION_MS)
         self._schedule_llm_error_dismiss(session_key)
 
     def _schedule_llm_error_dismiss(self, session_key: str) -> None:
@@ -3383,7 +3410,7 @@ class AgentLinkManager(QObject):
         entry = self._llm_error_cache.get(session_key)
         if not entry:
             return
-        delay_s = self._429_DURATION_MS / 1000.0
+        delay_s = self._MODEL_ACCESS_DURATION_MS / 1000.0
         self._cancel_llm_error_timer(session_key)
         parent = self.win if isinstance(self.win, QObject) else None
         timer = QTimer(parent)
@@ -3582,26 +3609,26 @@ class AgentLinkManager(QObject):
         failureType 取值（与活动/过程事件的 tool 字段解耦）：
           - model_retry_exhausted：模型请求链连续重试后仍失败
           - tool_failed：工具调用最终失败
-        429 抑制只认真正的模型访问失败（errorCode 属 429 类码或消息含 429/rate limit），
-        重试耗尽失败不并入 429 抑制——那是另一条语义（failure.retry），不重复提醒。
+        模型访问失败抑制只认真正的模型访问失败（errorCode 属限流类码或消息含限流关键字），
+        重试耗尽失败不并入模型访问失败抑制——那是另一条语义（failure.retry），不重复提醒。
         """
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_exec_failed", True):
+        if not self._report_allowed(agent_cfg, "failure.generic"):
             return
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
         payload = payload if isinstance(payload, dict) else {}
         name = self.AGENT_NAMES.get(agent_key, agent_key)
-        # 若该 session 有活跃的 429 提醒且本次失败确实是限流错误，才不再重复弹
+        # 若该 session 有活跃的模型访问失败提醒且本次失败确实是模型访问失败，才不再重复弹
         # 通用失败横幅（避免双重通知）。
         session_key = str(payload.get("sessionId") or agent_key)
-        active_429 = self._429_cache.get(session_key)
+        active_model_access = self._model_access_cache.get(session_key)
         error_code = str(payload.get("errorCode") or "").strip().upper()
         error_message = str(payload.get("errorMessage") or "")
-        rate_limit_codes = {"429", "RATE_LIMIT", "TOO_MANY_REQUESTS", "RESOURCE_EXHAUSTED"}
-        is_rate_limit_failure = error_code in rate_limit_codes or "429" in error_message or "rate limit" in error_message.lower()
-        if active_429 and not active_429.get("_dismissed") and \
-                self._clock() - active_429.get("_ts", 0) < self._429_COOLDOWN_S and is_rate_limit_failure:
+        MODEL_ACCESS_ERROR_CODES = {"429", "RATE_LIMIT", "TOO_MANY_REQUESTS", "RESOURCE_EXHAUSTED"}
+        is_model_access_failure = error_code in MODEL_ACCESS_ERROR_CODES or "429" in error_message or "rate limit" in error_message.lower()
+        if active_model_access and not active_model_access.get("_dismissed") and \
+                self._clock() - active_model_access.get("_ts", 0) < self._MODEL_ACCESS_COOLDOWN_S and is_model_access_failure:
             return
         # 失败动画（若角色素材有）；没有就保持当前动作，仅弹气泡
         anim = self._pick_fail_anim()

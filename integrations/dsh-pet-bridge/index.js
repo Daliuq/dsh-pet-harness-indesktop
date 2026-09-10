@@ -41,9 +41,9 @@ function aggregateWrite() {
   writeRecord({ state: next });
 }
 
-// 判定是否为限流/429 错误。DSH 实测 errorCode 为 "RATE_LIMIT"（消息如 "429: ..."），
+// 判定是否为模型访问失败（服务端限流/过载）。DSH 实测 errorCode 为 "RATE_LIMIT"（消息如 "429: ..."），
 // 偶见直接 "429"。必须同时匹配 code 与 message，避免漏判。
-function isRateLimitError(code, message) {
+function isModelAccessError(code, message) {
   const c = String(code || "").trim().toUpperCase();
   const m = String(message || "");
   if (c === "RATE_LIMIT" || c === "429" || c === "TOO_MANY_REQUESTS") return true;
@@ -287,7 +287,7 @@ const TEXT_MAX = 300;
 const RETRY_EXHAUSTED_THRESHOLD = 4;
 // 限流/连接重试只在同一 session 连续达到 5 次时提醒一次。
 // 原始 llm/retry 仍然逐条转发，便于桌宠侧做详细诊断；这里只抑制高优先级
-// rate_limit 事件，避免一次短暂抖动连续轰炸桌宠。
+// model_access 事件，避免一次短暂抖动连续轰炸桌宠。
 const RETRY_EVENT_THRESHOLD = 5;
 
 // 每个 turn 的状态：sessionKey -> {retries, hadSuccess, hadFailure,
@@ -1174,15 +1174,15 @@ export function apply(ctx) {
         const retrySessionKey = String(agent.session?.id || agent.id || "");
         // 只有同一 session 连续累计达到阈值才写高优先级提醒；每次
         // request-error 仍保留原始记录，便于诊断真实重试过程。
-        if (isRateLimitError(errCode, errMsg) && noteRetryConnection(retrySessionKey)) {
+        if (isModelAccessError(errCode, errMsg) && noteRetryConnection(retrySessionKey)) {
           writeRecord({
-            event: "rate_limit",
+            event: "model_access",
             errorCode: errCode.slice(0, 48) || "RATE_LIMIT",
             errorMessage: truncate(errMsg),
             sessionId: retrySessionKey,
             consecutiveRetryCount: retryConnectionStats.get(retrySessionKey)?.count || RETRY_EVENT_THRESHOLD,
           });
-        } else if (!isRateLimitError(errCode, errMsg)) {
+        } else if (!isModelAccessError(errCode, errMsg)) {
           resetRetryConnection(retrySessionKey);
         }
       });
@@ -1387,7 +1387,7 @@ export function apply(ctx) {
           ok: !info.isError,
           timeout: !!timeout,
           errorCode: info.errorCode,
-          // 错误正文统一用 errorMessage（与 llm/retry / rate_limit / llm_error /
+          // 错误正文统一用 errorMessage（与 llm/retry / model_access / llm_error /
           // execution/failed 同一字段名），不再用并行的 errorText 别名。
           errorMessage: info.errorText,
           evidenceStatus,
@@ -1431,13 +1431,13 @@ export function apply(ctx) {
           step: stepOf(event),
           sessionId,
         });
-        // 429 限流即时提醒：不等到 turn/end，LLM 重试时直接写 rate_limit 事件。
+        // 模型访问失败即时提醒：不等到 turn/end，LLM 重试时直接写 model_access 事件。
         // DSH 实测 errorCode 为 "RATE_LIMIT"（消息形如 "429: ..."），旧实现仅
-        // 匹配 code==="429"，导致真实限流永远不触发。改用 isRateLimitError 判定。
-        if (isRateLimitError(errorCode, errorMessage) &&
+        // 匹配 code==="429"，导致真实模型访问失败永远不触发。改用 isModelAccessError 判定。
+        if (isModelAccessError(errorCode, errorMessage) &&
             noteRetryConnection(sessionKeyOf(_session, event))) {
           writeRecord({
-            event: "rate_limit",
+            event: "model_access",
             errorCode: errorCode.slice(0, 48) || "RATE_LIMIT",
             errorMessage: truncate(errorMessage),
             sessionId,

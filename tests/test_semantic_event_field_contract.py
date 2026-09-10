@@ -2,11 +2,11 @@
 """语义事件字段契约：归一化产物必须携带真实上游事件名。
 
 回归背景（2026-09-10 真实链路取证）：`SemanticEvent` 基类没有 `event` 字段
-（只有 `LifecycleEvent` 定义了它），而 `RateLimitTracker.consume`/`_resets`
+（只有 `LifecycleEvent` 定义了它），而 `ModelAccessTracker.consume`/`_resets`
 依赖 `event.event` 判定「llm/retry 限流计数」与「哪些事件复位计数」。
 结果是真实链路上除 turn/* 之外的每个语义事件都抛 AttributeError——
-异常在 Qt 槽里被吞掉只打印不中断，导致 `_429_retry_counts` 静默恒为空：
-rate_limit 记录未带 consecutiveRetryCount 时兜底计数恒为 0，语义上「连续
+异常在 Qt 槽里被吞掉只打印不中断，导致 `_model_access_retry_counts` 静默恒为空：
+model_access 记录未带 consecutiveRetryCount 时兜底计数恒为 0，语义上「连续
 限流次数」退化成「桌宠收到几次」。线上 125 条真实记录触发 77 次该异常。
 
 修复口径：归一化点（normalize_event）把上游事件名写进基类字段 `event`
@@ -15,7 +15,7 @@ rate_limit 记录未带 consecutiveRetryCount 时兜底计数恒为 0，语义�
 from __future__ import annotations
 
 from pet.agent_event_normalizer import normalize_event
-from pet.rate_limit_tracker import RateLimitTracker
+from pet.model_access_tracker import ModelAccessTracker
 
 
 def _norm(event: str, **data):
@@ -40,9 +40,9 @@ def test_agent_status_record_normalizes_to_canonical_name():
     assert _norm("AgentStatus", state="idle").event == "agent/status"
 
 
-def test_consume_counts_consecutive_rate_limit_retries():
-    """连续限流重试必须累加，并带上 session 与计数（429 兜底计数的唯一来源）。"""
-    tracker = RateLimitTracker()
+def test_consume_counts_consecutive_model_access_retries():
+    """连续限流重试必须累加，并带上 session 与计数（连续计数兜底的唯一来源）。"""
+    tracker = ModelAccessTracker()
     for i in (1, 2, 3):
         out = tracker.consume(_norm("llm/retry", retry=i, errorCode="RATE_LIMIT",
                                     errorMessage="429 too many requests"))
@@ -52,8 +52,8 @@ def test_consume_counts_consecutive_rate_limit_retries():
     assert tracker.count("dsh", "s-1") == 3
 
 
-def test_consume_does_not_count_non_rate_limit_retry():
-    tracker = RateLimitTracker()
+def test_consume_does_not_count_non_model_access_retry():
+    tracker = ModelAccessTracker()
     out = tracker.consume(_norm("llm/retry", retry=1, errorCode="server_error",
                                 errorMessage="upstream boom"))
     assert out is None
@@ -61,8 +61,8 @@ def test_consume_does_not_count_non_rate_limit_retry():
 
 
 def test_consume_resets_streak_on_recovery_events():
-    """恢复/交互类事件必须复位连续限流计数（否则 429 提示会一直叠加）。"""
-    tracker = RateLimitTracker()
+    """恢复/交互类事件必须复位连续限流计数（否则模型访问失败提示会一直叠加）。"""
+    tracker = ModelAccessTracker()
     resetting = (
         ("tool/call", {"tool": "pwsh"}),
         ("turn/start", {}),
@@ -79,17 +79,17 @@ def test_consume_resets_streak_on_recovery_events():
         assert tracker.count("dsh", "s-1") == 0, f"{event_name} 必须复位连续限流计数"
 
 
-def test_non_rate_limit_error_also_resets():
-    tracker = RateLimitTracker()
+def test_non_model_access_error_also_resets():
+    tracker = ModelAccessTracker()
     tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT", errorMessage="429"))
     assert tracker.count("dsh", "s-1") == 1
     tracker.consume(_norm("error", errorCode="EACCES", errorMessage="permission denied"))
     assert tracker.count("dsh", "s-1") == 0
 
 
-def test_rate_limit_error_itself_does_not_reset():
+def test_model_access_error_itself_does_not_reset():
     """限流错误的 error 事件不得复位自己（否则计数会被自己清零）。"""
-    tracker = RateLimitTracker()
+    tracker = ModelAccessTracker()
     tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT", errorMessage="429"))
     assert tracker.count("dsh", "s-1") == 1
     tracker.consume(_norm("agent/request-error", errorCode="RATE_LIMIT", errorMessage="429 too many requests"))

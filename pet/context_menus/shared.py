@@ -352,7 +352,7 @@ def add_agent_link_menu(menu: QMenu, pet) -> None:
         act.setChecked(bool(agent_cfg.get(key, False)))
         act.toggled.connect(lambda on, k=key, a=act: pet.toggle_agent_link(k, on, a))
     sub.addSeparator()
-    # 事件汇报：与设置页「事件汇报概率门」同一份数据（agent_link.report_gates）。
+    # 事件气泡触发概率：与设置页「事件气泡触发概率」同一份数据（agent_link.report_gates）。
     # 菜单只做 0/1 两端快捷入口（勾选=1.0 全报，取消=0.0 静音），细粒度概率
     # 由设置页滑块决定；勾选态按当前概率是否 > 0 呈现，并提示当前值。
     gate_cfg = agent_cfg.get('report_gates')
@@ -368,7 +368,7 @@ def add_agent_link_menu(menu: QMenu, pet) -> None:
         act.setCheckable(True)
         act.setChecked(probability > 0.0)
         act.setToolTip(
-            f"当前通过概率 {probability:.2f}；设置页「事件汇报概率门」可逐类调 0.00–1.00"
+            f"当前通过概率 {probability:.2f}；设置页「事件气泡触发概率」可逐类调 0.00–1.00"
         )
         act.toggled.connect(lambda on, k=gate_key: pet.set_agent_link_option(k, on))
 

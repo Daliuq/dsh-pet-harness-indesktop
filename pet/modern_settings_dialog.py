@@ -469,8 +469,8 @@ class ModernSettingsDialog(QDialog):
             SettingRow("agent_sound_cooldown", "冷却时间", "防止短时间内频繁触发音效；0 表示无时间冷却（仍单次去重）。", self.agent_sound_cooldown_spin),
         ]
         behavior_layout.addWidget(SettingsSection("Agent 联动 · 提示音效", agent_sound_rows, behavior_content))
-        # 事件汇报概率门：每个事件聚合类别一个 0.00–1.00 滑块（没有开关），
-        # 与该类的气泡文案行同组；域导航重建时整体收进「Agent 联动文案风格」
+        # 事件气泡触发概率：每个事件聚合类别一个 0.00–1.00 滑块（没有开关），
+        # 与该类的气泡文案行同组；域导航重建时整体收进「事件气泡触发概率」
         # 下的可折叠框，让设置位置与真正控制的位置绑定。
         self.report_gate_rows = {}
         report_gate_rows = []
@@ -489,7 +489,7 @@ class ModernSettingsDialog(QDialog):
             row.control.setAccessibleName(f"{gate_label}：汇报概率")
             self.report_gate_rows[gate] = row
             report_gate_rows.append(row)
-        # 暂存宿主：这些行由域导航重建时认领并移入「Agent 联动文案风格」可折叠框，
+        # 暂存宿主：这些行由域导航重建时认领并移入「事件气泡触发概率」可折叠框，
         # 认领后本卡片为空（不残留空标题小节）。与气泡文案行同一处理方式。
         behavior_layout.addWidget(SettingsCard(report_gate_rows, behavior_content))
         labels = DIALOGUE_LABELS
@@ -1376,9 +1376,9 @@ class ModernSettingsDialog(QDialog):
             ("循环检测", loop_rows),
             ("卡住检测", stuck_rows),
         ])
-        # 「Agent 联动文案风格」＝一个可折叠框：按**事件聚合类别**分组，每组是
-        # 「该类汇报概率滑块 + 该类气泡文案行」，让设置位置与真正控制的位置绑定。
-        gates_box = CollapsibleGroup("Agent 联动文案风格 · 事件汇报概率门", automation)
+        # 「事件气泡触发概率」＝一个可折叠框：按**事件聚合类别**分组，每组是
+        # 「该类触发概率滑块 + 该类气泡文案行」，让设置位置与真正控制的位置绑定。
+        gates_box = CollapsibleGroup("事件气泡触发概率", automation)
         gate_row_by_id = {row.objectName(): row for row in gate_rows}
         phrase_rows_by_gate: dict[str, list] = {}
         for row in dialogue_rows:
@@ -1397,17 +1397,23 @@ class ModernSettingsDialog(QDialog):
         gates_box.set_expanded(True)
         self.report_gates_box = gates_box
         automation_layout = automation.layout()
-        automation_layout.insertWidget(0, gates_box)
         # dialogue_* 里有一类行**不属于任何事件门**（表达风格、专属文案对象、弹窗文案
         # 模板 JSON）：它们不是某个事件的气泡文案，而是文案风格的全局控件，因此
         # gate_for_event 返回 None、只会落到上面那个空串桶里。这些行已被
         # claim_prefix("dialogue_") 认领（不再进 leftovers），若不显式放回本域就会
-        # 从设置页里彻底消失。它们同属「文案风格」，紧跟概率门折叠框之后成组展示。
+        # 从设置页里彻底消失。
+        # 顶层顺序：「文案风格与模板」（全局风格控件）在前，「事件气泡触发概率」
+        # 折叠框**排在其末尾**——概率门按**事件类别**抽稀气泡，与文案风格/模板无关，
+        # 所以让风格控件先出现，概率门收在它后面。
+        insert_at = 0
         ungated_dialogue_rows = phrase_rows_by_gate.get("", [])
         if ungated_dialogue_rows:
             automation_layout.insertWidget(
-                1, SettingsSection("文案风格与模板", ungated_dialogue_rows, automation)
+                insert_at,
+                SettingsSection("文案风格与模板", ungated_dialogue_rows, automation),
             )
+            insert_at += 1
+        automation_layout.insertWidget(insert_at, gates_box)
 
         # Preserve any newly added row until it receives an explicit domain decision.
         leftovers = [

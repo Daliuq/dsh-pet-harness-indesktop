@@ -289,7 +289,7 @@ def test_automation_domain_name_stays_stable(qapp, tmp_path):
     """automation 域顶层导航保持「自动化与联动」；域内非 Agent 组保留。
 
     ticket 03（撤销改名）：旧设置回归测试锁定侧边栏文案，域名不改为
-    「Agent 联动」——迁移只作用于域内组名（Agent 联动文案风格）。
+    「Agent 联动」——迁移只作用于域内组名（文案风格与模板 / 事件气泡触发概率）。
     """
     from pet.settings_widgets import SETTINGS_DOMAIN_NAV
 

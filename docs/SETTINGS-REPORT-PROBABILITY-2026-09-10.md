@@ -12,13 +12,13 @@
 | 字段 | 内容 |
 |---|---|
 | setting_id | `agent_link.report_gates.<gate>`（8 个门，见 §2 门表） |
-| domain_id / group_id | `agent_link` / 设置页「自动化与联动 → Agent 联动文案风格 · 事件汇报概率门」 |
+| domain_id / group_id | `agent_link` / 设置页「自动化与联动 → 事件气泡触发概率」 |
 | title | 汇报概率（每类事件的通过概率） |
 | description | 这一类气泡的通过概率。0.00 = 该类完全不汇报（静音），1.00 = 每次都汇报，中间值按概率抽稀。概率只作用于「出气泡」这一步，卡住 / 行为重复 / 循环等检测本身不受影响；右键菜单只提供 0/1 两端快捷入口。 |
 | search_aliases | 汇报概率、事件汇报、概率门、抽稀、静音、report_gates、提醒频率 |
 | default | 见 §2 门表（7 类 1.00，过程汇报 0.60） |
 | capability_requirement / platform_availability | 无（纯配置项，不依赖音频/托盘/IPC，全平台一致） |
-| disclosure_level | 一级：折叠框「事件汇报概率门」**默认展开**，8 个分类子分组与滑块直接可见 |
+| disclosure_level | 一级：折叠框「事件气泡触发概率」**默认展开**，8 个分类子分组与滑块直接可见；该折叠框排在「文案风格与模板」分区**末尾** |
 | dependency | 逻辑依赖 `agent_link` 的对应 Agent 联动开关；概率门额外作用于出气泡那一步，与三重节流（同 agent 10s / 全局 8s / 同工具 60s）叠加 |
 | preview_target | 无独立预览（概率不产生可视化产物）；改动即时生效，无需重启 |
 | commit_policy | 保存即落盘（与其他 agent_link 数值项一致） |

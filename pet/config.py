@@ -203,8 +203,8 @@ def _default_agent_link_data() -> dict:
         # 自定义联动 Agent（协议见 docs/AGENT_LINK_PROTOCOL.md §4）：只读监听
         # 用户指定的事件文件，不写外部配置、无需授权弹窗，默认空
         "custom_agents": [],
-        # 事件汇报概率门（默认值见 pet/report_gates.py）：设置页把它们收进
-        # 「自动化与联动 → Agent 联动文案风格」下的可折叠框，按事件聚合类别逐类调。
+        # 事件气泡触发概率（默认值见 pet/report_gates.py）：设置页把它们收进
+        # 「自动化与联动 → 事件气泡触发概率」下的可折叠框，按事件聚合类别逐类调。
         # 值是**通过概率** 0.00–1.00（0 = 该类完全不汇报，1 = 全部汇报），没有布尔开关。
         "report_gates": dict(REPORT_GATE_DEFAULTS),
         # 卡住检测（默认开）：DSH 联动开启时，根据工具成败/超时/错误

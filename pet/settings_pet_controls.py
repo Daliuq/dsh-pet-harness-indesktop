@@ -433,7 +433,7 @@ def build_pet_controls(host) -> None:
     host.agent_sound_cooldown_spin.setSuffix(" 秒")
     host.agent_sound_cooldown_spin.setValue(float(agent_link_cfg.get("sound_cooldown_seconds", 2.0)))
 
-    # 事件汇报概率门（0.00–1.00 滑块，无开关）：按事件聚合类别逐类调通过概率。
+    # 事件气泡触发概率（0.00–1.00 滑块，无开关）：按事件聚合类别逐类调通过概率。
     # 0.00 = 该类完全不汇报（等同关闭），1.00 = 全部汇报。滑块是唯一控制项，
     # 右键菜单只给 0/1 两端快捷入口；键名即门名（见 pet/report_gates.py）。
     gates_cfg = agent_link_cfg.get("report_gates")

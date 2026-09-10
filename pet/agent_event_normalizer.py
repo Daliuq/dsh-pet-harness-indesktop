@@ -11,9 +11,13 @@ class SemanticEvent:
     session_id: str
     step: int | str | None = None
     data: dict[str, Any] = field(default_factory=dict)
+    # 上游事件名（归一化后的规范名）。语义事件的消费端按它判定事件语义：
+    # RateLimitTracker 用它识别 llm/retry 的限流计数与复位时机。原始写法仍保留在
+    # AgentEvent.event（协议层）上，这里给的是语义层统一后的规范名。
+    event: str = ""
 
 @dataclass(frozen=True)
-class LifecycleEvent(SemanticEvent): event: str = ""
+class LifecycleEvent(SemanticEvent): pass
 @dataclass(frozen=True)
 class ToolCallEvent(SemanticEvent):
     tool: str = ""
@@ -70,6 +74,11 @@ _LIFECYCLE = {"agent/status", "AgentStatus", "session/created", "session/dispose
 _EXPLORATION = {"read", "grep", "glob", "search", "web_search", "web_search_begin", "exec_command_begin"}
 _ACTION = {"edit", "write", "patch", "shell", "pwsh", "bash", "pytest", "npm test", "playwright", "run"}
 
+# 上游可能用非语义名书写同一事件：DSH 状态记录写 "AgentStatus"，而消费端复位词表
+# （rate_limit_tracker._resets）按 "agent/status" 判定。归一化点负责统一成规范名，
+# 使产物字段 event 与消费端词表严格一致（原始写法仍留在协议层 AgentEvent.event）。
+_EVENT_ALIASES = {"agentstatus": "agent/status"}
+
 def _data(ev: AgentEvent) -> dict[str, Any]:
     return ev.data
 
@@ -78,9 +87,10 @@ def normalize_event(record: AgentEvent | dict, *, source_hint: str = "", agent_n
     data = _data(ev)
     typ = ev.event
     lower = typ.lower()
-    common = dict(source=ev.source, agent_name=ev.agent_name, session_id=ev.session_id, step=ev.step, data=data)
+    common = dict(source=ev.source, agent_name=ev.agent_name, session_id=ev.session_id, step=ev.step, data=data,
+                  event=_EVENT_ALIASES.get(lower, lower))
     if typ in _LIFECYCLE or lower in _LIFECYCLE:
-        return LifecycleEvent(**common, event=typ)
+        return LifecycleEvent(**common)
     if lower in {"assistant/message", "assistant/chunk", "agent_reasoning", "agent_reasoning_raw_content", "reasoning"}:
         return ReasoningEvent(**common, summary=str(data.get("summary") or data.get("text") or data.get("content") or "")[:300], delta=lower.endswith("chunk") or "delta" in data)
     if lower in {"tool/call", "command/run", "tool-workflow/run-start", "exec_command_begin", "mcp_tool_call_begin"}:

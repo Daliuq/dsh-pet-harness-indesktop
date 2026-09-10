@@ -1,0 +1,96 @@
+# -*- coding: utf-8 -*-
+"""语义事件字段契约：归一化产物必须携带真实上游事件名。
+
+回归背景（2026-09-10 真实链路取证）：`SemanticEvent` 基类没有 `event` 字段
+（只有 `LifecycleEvent` 定义了它），而 `RateLimitTracker.consume`/`_resets`
+依赖 `event.event` 判定「llm/retry 限流计数」与「哪些事件复位计数」。
+结果是真实链路上除 turn/* 之外的每个语义事件都抛 AttributeError——
+异常在 Qt 槽里被吞掉只打印不中断，导致 `_429_retry_counts` 静默恒为空：
+rate_limit 记录未带 consecutiveRetryCount 时兜底计数恒为 0，语义上「连续
+限流次数」退化成「桌宠收到几次」。线上 125 条真实记录触发 77 次该异常。
+
+修复口径：归一化点（normalize_event）把上游事件名写进基类字段 `event`
+（并归一化 AgentStatus → agent/status），消费端即可按真实语义判定。
+"""
+from __future__ import annotations
+
+from pet.agent_event_normalizer import normalize_event
+from pet.rate_limit_tracker import RateLimitTracker
+
+
+def _norm(event: str, **data):
+    ev = normalize_event({"event": event, "agent": "dsh", "sessionId": "s-1", **data})
+    assert ev is not None, f"{event} 必须被归一化"
+    return ev
+
+
+def test_semantic_events_carry_upstream_event_name():
+    """每个语义事件都带真实上游事件名（基类字段，不再是某个子类独有）。"""
+    assert _norm("tool/call", tool="pwsh").event == "tool/call"
+    assert _norm("tool/result", tool="pwsh", ok=False).event == "tool/result"
+    assert _norm("tool/result", tool="pwsh", ok=True).event == "tool/result"
+    assert _norm("llm/retry", retry=1).event == "llm/retry"
+    assert _norm("execution/failed", failureType="tool_failed").event == "execution/failed"
+    assert _norm("assistant/message").event == "assistant/message"
+    assert _norm("turn/start").event == "turn/start"
+
+
+def test_agent_status_record_normalizes_to_canonical_name():
+    """DSH 状态记录写的是 'AgentStatus'，语义名必须是 'agent/status'（复位词表用它）。"""
+    assert _norm("AgentStatus", state="idle").event == "agent/status"
+
+
+def test_consume_counts_consecutive_rate_limit_retries():
+    """连续限流重试必须累加，并带上 session 与计数（429 兜底计数的唯一来源）。"""
+    tracker = RateLimitTracker()
+    for i in (1, 2, 3):
+        out = tracker.consume(_norm("llm/retry", retry=i, errorCode="RATE_LIMIT",
+                                    errorMessage="429 too many requests"))
+        assert out is not None, "限流重试必须产出一份 streak"
+        assert out["consecutiveRetryCount"] == i
+        assert out["sessionId"] == "s-1"
+    assert tracker.count("dsh", "s-1") == 3
+
+
+def test_consume_does_not_count_non_rate_limit_retry():
+    tracker = RateLimitTracker()
+    out = tracker.consume(_norm("llm/retry", retry=1, errorCode="server_error",
+                                errorMessage="upstream boom"))
+    assert out is None
+    assert tracker.count("dsh", "s-1") == 0
+
+
+def test_consume_resets_streak_on_recovery_events():
+    """恢复/交互类事件必须复位连续限流计数（否则 429 提示会一直叠加）。"""
+    tracker = RateLimitTracker()
+    resetting = (
+        ("tool/call", {"tool": "pwsh"}),
+        ("turn/start", {}),
+        ("assistant/message", {}),
+        ("AgentStatus", {"state": "idle"}),
+        ("tool/result", {"tool": "pwsh", "ok": True}),
+        ("turn/end", {}),
+    )
+    for event_name, extra in resetting:
+        tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT",
+                              errorMessage="429 too many requests"))
+        assert tracker.count("dsh", "s-1") == 1, f"{event_name} 之前应已计数"
+        tracker.consume(_norm(event_name, **extra))
+        assert tracker.count("dsh", "s-1") == 0, f"{event_name} 必须复位连续限流计数"
+
+
+def test_non_rate_limit_error_also_resets():
+    tracker = RateLimitTracker()
+    tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT", errorMessage="429"))
+    assert tracker.count("dsh", "s-1") == 1
+    tracker.consume(_norm("error", errorCode="EACCES", errorMessage="permission denied"))
+    assert tracker.count("dsh", "s-1") == 0
+
+
+def test_rate_limit_error_itself_does_not_reset():
+    """限流错误的 error 事件不得复位自己（否则计数会被自己清零）。"""
+    tracker = RateLimitTracker()
+    tracker.consume(_norm("llm/retry", retry=1, errorCode="RATE_LIMIT", errorMessage="429"))
+    assert tracker.count("dsh", "s-1") == 1
+    tracker.consume(_norm("agent/request-error", errorCode="RATE_LIMIT", errorMessage="429 too many requests"))
+    assert tracker.count("dsh", "s-1") == 1

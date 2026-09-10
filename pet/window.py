@@ -939,8 +939,9 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         self._collision_local_bounds = None
         self.move(self.x(), old_bottom - self._h + 1)
         self._rebuild_frame()
-        if self._speech_bubble.isVisible():
-            self._speech_bubble.reflow(
+        bubble = getattr(self, "_speech_bubble", None)
+        if bubble is not None and bubble.isVisible():
+            bubble.reflow(
                 self.visible_content_rect(), pet_scale=self.scale
             )
         self.update()
@@ -1185,7 +1186,9 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         pp = getattr(self, 'predictive_prewarm', None)
         if pp is not None:
             pp.clear()
-        self._speech_bubble.hide()
+        bubble = getattr(self, "_speech_bubble", None)
+        if bubble is not None:
+            bubble.hide()
 
     def _resume_activity(self) -> None:
         """显示时恢复动画与所需定时器（状态与隐藏前一致）。"""
@@ -1208,10 +1211,13 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self.lib.resume_warm()
         # 窗口隐藏期间审批气泡被 _pause_activity 关掉；恢复显示时若审批仍挂着则重新挂上
         if self._sticky_bubble_active and self._sticky_text:
-            self._speech_bubble.show_text(
-                self._sticky_text, self.visible_content_rect(), 0,
-                pet_scale=self.scale, subtitle=self._sticky_subtitle, sticky=True,
-            )
+            bubble = getattr(self, "_speech_bubble", None)
+            if bubble is not None:
+                bubble.show_text(
+                    self._sticky_text, self.visible_content_rect(), 0,
+                    pet_scale=self.scale, subtitle=self._sticky_subtitle, sticky=True,
+                    buttons=self._sticky_buttons,
+                )
 
     def attach_collision_session(self, session) -> None:
         """绑定 AppShell 持有的 IPC facade，GUI 不接触 socket。"""
@@ -1578,6 +1584,12 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         filter_switch = getattr(self, '_effects_filter_switch', None)
         if callable(filter_switch):
             name = filter_switch(name)
+        if name not in self.lib.names():
+            # DLC/同路径换角色守卫：目标动画名不在当前素材库（写死名直传路径
+            # 的兜底，如余额档位/唱歌动画）。判失败返回，绝不让 lib.movie(name)
+            # 的 KeyError 崩进 GUI 线程；池化消费路径本就预过滤，不受影响。
+            logger.warning("动画 %r 不在当前角色素材库，跳过本次切换", name)
+            return False
         prev_anim = self.anim
         prev_movie = self.movie
         prev_click_hold = self._click_hold
@@ -2492,12 +2504,15 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             if name in self.idles or name in self.turns:
                 self._play_animation_gap_step()
             else:
-                # gap 期间只允许待机/转向自然续播；其他结束回调不能
-                # 绕过剩余计时直接推进动作链。
+                # 异常状态（gap 期间播了非待机/转向动画）：兜底推进动画链，
+                # 避免 return 后动画链停摆到 gap 超时（PR57 曾只 warning
+                # 导致最长 animation_gap_seconds 的停帧；恢复 main 兜底语义，
+                # 见 PR57 遗留 N6）。
                 logger.warning(
                     "animation ended during gap with non-gap clip: name=%r anim=%r",
                     name, self.anim,
                 )
+                self._pick_next()
             return
         if self.animation_gap_seconds > 0 and (name in self.acts or name in self.moves):
             self._start_animation_gap()
@@ -2522,13 +2537,12 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self._switch(self._pick(pool, exclude=self.anim))
 
     def _on_animation_gap_timeout(self) -> None:
-        logger.info(
-            "animation gap timeout: anim=%r gap_active=%s timer_active=%s",
-            self.anim, self._animation_gap_active,
-            self._animation_gap_timer.isActive(),
-        )
+        # 超时只结束 gap 状态：正在播的 gap step（待机/转向）让其自然播完，
+        # 由 _on_anim_ended 在 gap_active=False 后走 _pick_next 续链——不打断
+        # 正在播的动画（与全链"不打断正在播动画"一致，避免硬切跳变）。
+        # （PR57 曾在此直接 _pick_next()，会打断正在播的待机步；消融对比
+        #  后恢复 main 语义，见 PR57 遗留 N6。）
         self._animation_gap_active = False
-        self._pick_next()
 
     def _pick_next(self) -> None:
         """动画链：30% 待机 / 10% 转向 / 40% 动作 / 20% 移动（空间不够回退动作）。
@@ -3671,8 +3685,14 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
         return window_alerts.on_speech_bubble_hidden(self, *args, **kwargs)
 
     def hide_speech_bubble(self) -> None:
-        """公开转发：隐藏当前气泡（等价 _speech_bubble.hide()）。"""
-        self._speech_bubble.hide()
+        """公开转发：隐藏当前气泡（等价 _speech_bubble.hide()）。
+
+        窗口关闭后 _speech_bubble 置 None（closeEvent），托盘菜单 aboutToShow
+        等在旧窗销毁过渡期仍可能调用——加 None 守卫防迟到触碰（N7）。
+        """
+        bubble = getattr(self, "_speech_bubble", None)
+        if bubble is not None:
+            bubble.hide()
 
     def refresh_pet_settings(self) -> None:
         collision_enabled = bool(self.cfg.get('collision_enabled', True))
@@ -3756,9 +3776,11 @@ class PetWindow(QWidget, WindowFeatureGateMixin):
             self._music_sing_active = False
             self._music_sing_timer.stop()
         self._self_talk_enabled = bool(self.cfg.get('self_talk_enabled', False))
-        self._speech_bubble.set_style(
-            str(self.cfg.get('self_talk_bubble_style', DEFAULT_SELF_TALK_BUBBLE_STYLE))
-        )
+        bubble = getattr(self, "_speech_bubble", None)
+        if bubble is not None:
+            bubble.set_style(
+                str(self.cfg.get('self_talk_bubble_style', DEFAULT_SELF_TALK_BUBBLE_STYLE))
+            )
         self._self_talk_texts = self._read_self_talk_texts(self.cfg.get('self_talk_texts'))
         self._self_talk_duration_seconds = max(
             1.0,

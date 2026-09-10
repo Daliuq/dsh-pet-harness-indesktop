@@ -35,10 +35,25 @@ jobs:
       # GIF 变体（gif-chat / gif）不再发布：包体约 800 MB×2、上传与下载
       # 成本过高，v4.0.0 起停供。确有需要的用户请按 README「打包发布」
       # 一节自行构建（先运行 scripts/convert_to_gif.py 生成素材）。
-      - name: Run test suite
+      # 命令与 PR 门禁（pr-test.yml）保持同一套：时序 flake 家族从主套件里
+      # 隔离成独立步骤——webm 生命周期族的 reader/ffmpeg teardown 竞态在 macOS
+      # CI 上偶发段错误（exit 139，栈在 reader 线程 + imageio LogCatcher），
+      # 段错误会杀掉整个 pytest 进程、拖垮主套件的结果报告。隔离不掩盖失败：
+      # 每一族照常判红，只额外给一次重跑机会（与门禁一致）。
+      - name: Pytest (main suite)
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q
+        run: python -m pytest -q --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py
+
+      - name: Pytest (webm lifecycle family, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_webm_reader_lifecycle.py tests/test_webm_clip_lifecycle.py tests/test_webm_first_frame_lock.py || python -m pytest -q tests/test_webm_reader_lifecycle.py tests/test_webm_clip_lifecycle.py tests/test_webm_first_frame_lock.py
+
+      - name: Pytest (low-priority warm family, isolated + one retry)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_low_priority_warm_interaction_yield.py || python -m pytest -q tests/test_low_priority_warm_interaction_yield.py
 
       # 构建入口与本地完全一致：scripts/build_macos.sh（PyInstaller 打包 +
       # 中文编码自检 + ad-hoc 签名都在脚本内完成），CI 不内联

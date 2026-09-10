@@ -338,6 +338,44 @@ def test_pet_scale_change_reflows_visible_bubble_after_rebuilding_mask():
     assert events[3] == ("reflow", QRect(25, 35, 160, 210), 1.0)
 
 
+def test_change_scale_with_destroyed_bubble_is_noop():
+    """N7：closeEvent 置 _speech_bubble=None 后，迟到的 change_scale 不得 AttributeError。"""
+    from PySide6.QtCore import QRect
+
+    from pet.window import PetWindow
+
+    class FakePet:
+        scale = 1.0
+        _h = 100
+        _speech_bubble = None
+
+        def geometry(self):
+            return QRect(0, 0, 100, self._h)
+
+        def x(self):
+            return 0
+
+        def _apply_scale(self):
+            self._h = 200
+
+        def move(self, x, y):
+            pass
+
+        def _rebuild_frame(self):
+            pass
+
+        def visible_content_rect(self):
+            return QRect(0, 0, 100, 200)
+
+        def update(self):
+            pass
+
+        def _save_position(self):
+            pass
+
+    PetWindow.change_scale(FakePet(), 1.5)
+
+
 def test_self_talk_images_and_duration_are_normalized_and_scheduled_after_hide(tmp_path, monkeypatch):
     from PIL import Image
 
@@ -1421,7 +1459,8 @@ def test_modern_settings_panel_uses_sidebar_and_includes_ai_settings(tmp_path, m
     expression_row = dialog.findChild(settings_mod.SettingRow, "settingRow_dialogue_mode")
     assert expression_row is not None
     assert expression_row.findChild(settings_mod.QLabel, "settingLabel").text() == "表达风格"
-    assert "自言自语、候选内容和主动气泡" in expression_row.findChild(settings_mod.QLabel, "settingHint").text()
+    assert "Agent 联动相关提示气泡" in expression_row.findChild(settings_mod.QLabel, "settingHint").text()
+    assert "自言自语" in expression_row.findChild(settings_mod.QLabel, "settingHint").text()  # 明确说明不受本项影响
     # 表达风格（dialogue_*）已按 spec（agent-dialogue-per-agent）全量迁入 automation 域
     # 「文案风格与模板」组；互动域不再持有 dialogue 行（见 test_express_style_rows_move_to_agent_domain）。
     assert page_index(expression_row) == sidebar_index("自动化与联动")

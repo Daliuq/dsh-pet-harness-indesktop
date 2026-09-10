@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox
 
 from .click_sound import play_sound, resolve_builtin_sound
@@ -1728,6 +1728,9 @@ class AgentLinkManager(QObject):
     install_finished = Signal(str, bool, str, int)  # (agent_key, ok, message, install_token)
     # DSH 回写结果（后台线程 emit，队列投递回主线程）：(ok, detail)
     _respond_result = Signal(bool, str)
+    # 探索 Watchdog 控制结果（后台线程 emit，队列投递回主线程）：
+    # (session_key, operation, ok, detail)
+    _exploration_control_result = Signal(str, str, bool, str)
 
     # 联动气泡展示名
     AGENT_NAMES = {"dsh": "DSH", "claude": "Claude Code", "cursor": "Cursor", "opencode": "OpenCode"}
@@ -1761,6 +1764,9 @@ class AgentLinkManager(QObject):
         self._shutdown = False
         self._respond_threads: set[threading.Thread] = set()
         self._respond_threads_lock = threading.Lock()
+        # 后台回写/控制 worker 的取消信号：shutdown 时置位，让 30s 阻塞轮询的
+        # 控制 worker 立刻退出，保证 join 在预算内完成、worker 不比 manager 活得久。
+        self._worker_cancel = threading.Event()
         _LIVE_AGENT_LINK_MANAGERS.add(self)
         self._install_token = 0
         self._install_pending: dict[str, int] = {}
@@ -1875,6 +1881,11 @@ class AgentLinkManager(QObject):
         self.monitors["dsh"].model_access.connect(self._on_model_access)
         self.monitors["dsh"].llm_error.connect(self._on_llm_error)
         self.monitors["dsh"].user_action.connect(self._on_user_action)
+        # 检测器提醒跨模块节流（N2）：stuck / pattern / exploration watchdog 三个
+        # 检测器各有独立 cooldown，但同一 busy 周期可能先后各自弹窗造成连环换弹。
+        # 按 agent/session 记最近一次**任一**检测器弹窗时刻与档位，窗口内同档
+        # 或更低档的提醒只播动画、不再弹窗（更高档升级放行）。_clock 与其它计时同域。
+        self._detector_alert_at: dict[str, tuple[float, int]] = {}
         # 模型访问失败提醒缓存：session_key → { "count": int, "_ts": float, "_first_ts": float, "_dismissed": bool }
         self._model_access_cache: dict[str, dict] = {}
         self._model_access_timers: dict[str, QTimer] = {}   # session_key → 自动收起定时器
@@ -1884,6 +1895,10 @@ class AgentLinkManager(QObject):
         self._llm_error_cache: dict[str, dict] = {}
         self._llm_error_timers: dict[str, QTimer] = {}
         self._respond_result.connect(self._on_respond_result)
+        # 探索 Watchdog 控制请求的「在飞会话」集合：同一会话的重复点击只发一次。
+        # 线程登记复用 _respond_threads（shutdown 统一 join），不另建线程池。
+        self._exploration_control_inflight: set[str] = set()
+        self._exploration_control_result.connect(self._on_exploration_control_result)
         self.install_finished.connect(self._on_install_finished)
         # 联动动作链：一次性动作播完后若仍有 Agent 在忙，由 window 回调取下一个动作
         if hasattr(self.win, "set_link_next_provider"):
@@ -2124,6 +2139,7 @@ class AgentLinkManager(QObject):
     def shutdown(self) -> None:
         """窗口销毁/角色切换时停止所有 monitor worker，且作废安装回调。"""
         self._shutdown = True
+        self._worker_cancel.set()
         self._install_pending.clear()
         self._install_token += 1
         for mon in self.monitors.values():
@@ -2145,6 +2161,29 @@ class AgentLinkManager(QObject):
                 break
             if worker is not threading.current_thread() and worker.is_alive():
                 worker.join(remaining)
+        # 停掉 manager 自带的全部单发定时器（完成确认/429 收起/LLM 错误收起）：
+        # 下方会把 Python 持有的 manager 过继给 QApplication，对象将存活到进程
+        # 退出——若不停表，滞留定时器会在后续无关时刻触发槽函数。
+        for timer_dict in (self._done_pending, self._429_timers, self._llm_error_timers):
+            for timer in timer_dict.values():
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+            timer_dict.clear()
+        # parent=None（测试桩/多窗代理）时 C++ 对象是 Python 持有的：wrapper 经
+        # 信号连接/闭包成环，只能等循环 GC——而 GC 可能在任意线程（含 monitor
+        # worker 线程）触发，跨线程删除带 QTimer 子对象/信号连接的 QObject 会
+        # 腐化 Qt 事件队列（CI Windows 在 conftest processEvents access
+        # violation、macOS bus error 的根因）。过继给 QApplication（主线程、
+        # 与进程同寿）后，C++ 侧不再随 wrapper 的 GC 删除，wrapper 何时何线程
+        # 回收都只是空壳析构。真窗口场景由父链销毁在先，RuntimeError 兜底跳过。
+        try:
+            app = QCoreApplication.instance()
+            if self.parent() is None and app is not None and self.thread() is app.thread():
+                self.setParent(app)
+        except RuntimeError:
+            pass
 
     @classmethod
     def _shutdown_live_for_tests(cls) -> None:
@@ -3080,7 +3119,10 @@ class AgentLinkManager(QObject):
         except Exception as exc:  # noqa: BLE001 —— 后台线程绝不允许把异常带进 Qt 事件循环
             ok, detail = False, str(exc)
         try:
-            self._respond_result.emit(ok, detail)
+            # shutdown 后不再投递结果：结果气泡已无意义，且此时 manager 可能
+            # 已进入事件循环销毁流程。
+            if not self._shutdown:
+                self._respond_result.emit(ok, detail)
         except Exception:
             pass
         finally:
@@ -3208,7 +3250,11 @@ class AgentLinkManager(QObject):
             # 兼容旧路径：审批等一直挂着的气泡优先
             return
         busy_until = getattr(self.win, "_bubble_busy_until", 0.0)
-        if time.time() < busy_until:
+        # window.hold_bubble 以 time.monotonic() 写入 _bubble_busy_until，这里必须
+        # 用同一时钟域比较——曾误用 time.time()（epoch 秒），在真实桌宠上恒判
+        # "未被占用"，让位/重试门禁失效（普通气泡顶掉识屏占位、重要气泡不排队
+        # 重试直接覆盖）。同步修正于 PR57 合并后审计（F1）。
+        if time.monotonic() < busy_until:
             if not important or _retried >= 4:
                 return
             QTimer.singleShot(2500, self,
@@ -3222,6 +3268,30 @@ class AgentLinkManager(QObject):
     # ------------------------------------------------------------------
     _STUCK_WORRIED_KEYWORDS = ("焦急", "着急", "气急败坏", "抓狂", "拍打", "敲桌", "烦恼", "抓狂")
     _STUCK_REMINDER_MS = 20000   # 建议介入提醒持续 20s（非 sticky，避免与审批/问题常驻气泡冲突）
+    # N2：跨检测器弹窗节流窗口——同 agent/session 30s 内任一检测器弹过窗，
+    # 其余检测器本次只播动画不弹窗（避免 stuck/pattern/watchdog 连环换弹）。
+    _DETECTOR_ALERT_COOLDOWN_S = 30.0
+
+    def _detector_alert_gate(self, scope_key: str, *, level: int = 1) -> bool:
+        """跨检测器弹窗节流：返回 True 表示本次允许弹窗（并记录触发时刻/档位）。
+
+        - 同 scope 窗口内已弹过同档或更高档提醒：本次抑制（避免连环换弹）；
+        - 真正更高档（level 更大）的升级放行并刷新记录，让"情况恶化"的更强提醒
+          能覆盖低档提醒；
+        - 不同 scope（不同 agent/session）互不影响；
+        - 设置窗口打开期间 show_alert 会直接丢弃普通提醒（N2-a）：此时不记账也
+          不放行，避免被丢掉的提醒白占节流槽。
+        """
+        if getattr(self.win, "_bubble_suppressed", False):
+            return False
+        now = self._clock()
+        last = self._detector_alert_at.get(scope_key)
+        if last is not None:
+            last_at, last_level = last
+            if now - last_at < self._DETECTOR_ALERT_COOLDOWN_S and level <= last_level:
+                return False
+        self._detector_alert_at[scope_key] = (now, level)
+        return True
 
     def _pick_stuck_anim(self) -> str | None:
         """从当前角色动作池里按语义挑选「焦急」动画；缺素材静默跳过。"""
@@ -3243,6 +3313,11 @@ class AgentLinkManager(QObject):
             self.win.request_link_anim(anim)
         if severity < 2:
             return  # 档位 1：只播动画，不弹气泡
+        # N2 跨检测器节流：档位 2 属控制级（level=2），比普通 watchdog 提醒高、
+        # 可覆盖低档；但同 scope 已弹过同档提醒（pattern control / 上一次档位 2）
+        # 时由 gate 抑制，避免连环换弹。
+        if not self._detector_alert_gate(agent_key, level=2):
+            return
         # 档位 2：持续提醒（可自定义文案；{name} 占位 = Agent 显示名）
         from .stuck_detector import stuck_reminder_text
         name = self.AGENT_NAMES.get(agent_key, agent_key)
@@ -3313,6 +3388,10 @@ class AgentLinkManager(QObject):
             )
         key = "pattern.control" if verdict in ("STOP", "ASK_USER", "REPLAN") else "pattern.warning"
         text = self._dialogue(key, text, name=name, reasons=reason)
+        # N2 跨检测器节流：pattern control 属控制级（level=2），可覆盖普通
+        # watchdog 提醒；同档重复则被 gate 抑制。
+        if not self._detector_alert_gate(agent_key, level=2):
+            return
         agent_cfg = self.cfg.get("agent_link", {})
         # 事件汇报概率门（检测类）：动画照旧，只有气泡受门控制。
         if not self._report_allowed(agent_cfg, key):
@@ -3326,12 +3405,37 @@ class AgentLinkManager(QObject):
     # Agent Exploration Loop Watchdog
     # ------------------------------------------------------------------
     _EXPLORATION_REMINDER_MS = 18000
+    # 控制级提醒常驻（sticky，duration 对 sticky 无效）：用户必须点按钮才结束。
+    _EXPLORATION_CONTROL_PRIORITY = 2
+    # dsh_control.request 最长阻塞 30s；只能在后台线程调用。
+    _EXPLORATION_CONTROL_TIMEOUT_S = 30.0
+    _EXPLORATION_CONTROL_RESULT_MS = 8000
+
+    @staticmethod
+    def _exploration_control_alert_id(session_key: str) -> str:
+        return f"exploration-control:{session_key}"
+
+    @staticmethod
+    def _exploration_control_result_alert_id(session_key: str) -> str:
+        return f"exploration-control-result:{session_key}"
 
     def _on_exploration_warning(self, session_key: str, payload: dict) -> None:
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
-        reasons = self._format_exploration_reasons((payload or {}).get("reasons", []), (payload or {}).get("steps", []))
+        payload = payload if isinstance(payload, dict) else {}
+        is_control = str(payload.get("level") or "warning").strip().lower() == "control"
+        # N2 跨检测器节流：warning 是非升级普通提醒（level=1）；control 属控制级
+        # （level=2），可覆盖 30s 窗口内的普通提醒，同档重复仍被抑制（防连环换弹）。
+        # scope 归一到 agent_key：payload 携带 state 记录的 agent_key，
+        # 缺失时用 session_key 前缀近似（dsh 联动同一会话即同一 agent）。
+        scope_key = str(payload.get("agent_key") or "") or f"session:{session_key}"
+        if not self._detector_alert_gate(scope_key, level=2 if is_control else 1):
+            return
+        reasons = self._format_exploration_reasons(payload.get("reasons", []), payload.get("steps", []))
         name = self._exploration_name(payload, session_key)
+        if is_control:
+            self._show_exploration_control(session_key, payload, name, reasons)
+            return
         text = self._dialogue(
             "watchdog.warning", f"{name} 近期存在重复探索行为：{reasons}，暂不打断运行。",
             name=name, reasons=reasons,
@@ -3350,6 +3454,191 @@ class AgentLinkManager(QObject):
                                           "targets": payload.get("targets", [])})
         elif hasattr(self.win, "show_bubble"):
             self.win.show_bubble(text, duration_ms=self._EXPLORATION_REMINDER_MS)
+
+    def _show_exploration_control(self, session_key: str, payload: dict, name: str, reasons: str) -> None:
+        """控制级告警：常驻气泡 + 可操作按钮（自动优化 / 终止 / 忽略）。"""
+        text = self._dialogue(
+            "watchdog.control",
+            f"{name} 疑似陷入无效探索循环：{reasons}。可以让我自动优化方向，或终止本次运行。",
+            name=name, reasons=reasons,
+        )
+        alert_id = self._exploration_control_alert_id(session_key)
+        # 记进 lifecycle 表：会话结束时连同控制气泡一起收起，避免留下死按钮。
+        self._exploration_alerts[session_key] = alert_id
+        buttons = self._exploration_control_buttons(session_key, payload, alert_id)
+        metadata = {"sessionId": session_key, "riskScore": payload.get("risk", 0),
+                    "riskReasons": payload.get("reasons", []),
+                    "targetCount": payload.get("targetCount", 0),
+                    "targets": payload.get("targets", []),
+                    "goal": payload.get("goal", "")}
+        if hasattr(self.win, "show_alert"):
+            self._show_alert_compat(text, duration_ms=0, sticky=True, buttons=buttons,
+                                    alert_id=alert_id, priority=self._EXPLORATION_CONTROL_PRIORITY,
+                                    alert_type="control", metadata=metadata)
+            return
+        if hasattr(self.win, "show_bubble"):
+            try:
+                self.win.show_bubble(text, sticky=True, buttons=buttons)
+            except TypeError:
+                # 旧桩/旧窗口不支持按钮：退化为限时提醒，绝不因签名差异崩溃。
+                self.win.show_bubble(text, duration_ms=self._EXPLORATION_REMINDER_MS)
+
+    def _exploration_control_buttons(self, session_key: str, payload: dict,
+                                    alert_id: str) -> list[tuple[str, object]]:
+        """控制气泡按钮：replan=自动优化、interrupt=终止、忽略=关闭气泡。"""
+        context = dict(payload or {})
+        return [
+            ("自动优化", lambda sk=session_key, p=context: self._request_exploration_control("replan", sk, p)),
+            ("终止", lambda sk=session_key, p=context: self._request_exploration_control("interrupt", sk, p)),
+            ("忽略", lambda aid=alert_id: self._dismiss_exploration_control(aid)),
+        ]
+
+    def _dismiss_exploration_control(self, alert_id: str) -> None:
+        if hasattr(self.win, "resolve_alert"):
+            self.win.resolve_alert(alert_id)
+        elif hasattr(self.win, "hide_bubble"):
+            self.win.hide_bubble()
+
+    def _request_exploration_control(self, operation: str, session_key: str, payload: dict) -> None:
+        """控制按钮回调（GUI 线程）：收起气泡 + 起后台线程请求桥接，绝不阻塞。"""
+        self._dismiss_exploration_control(self._exploration_control_alert_id(session_key))
+        payload = payload if isinstance(payload, dict) else {}
+        session_id = str(payload.get("session_id") or session_key or "")
+        if not session_id or session_id.startswith("turn:"):
+            self._show_exploration_control_result(session_key, operation, False, "missing-session-id")
+            return
+        with self._respond_threads_lock:
+            if session_id in self._exploration_control_inflight:
+                return
+            self._exploration_control_inflight.add(session_id)
+        try:
+            worker = threading.Thread(
+                target=self._exploration_control_worker,
+                args=(session_key, operation, session_id, dict(payload)),
+                daemon=True,
+            )
+            with self._respond_threads_lock:
+                self._respond_threads.add(worker)
+            worker.start()
+        except Exception:
+            with self._respond_threads_lock:
+                self._exploration_control_inflight.discard(session_id)
+            log.exception("探索控制线程启动失败")
+            self._show_exploration_control_result(session_key, operation, False, "thread-start-failed")
+
+    def _exploration_control_worker(self, session_key: str, operation: str,
+                                    session_id: str, payload: dict) -> None:
+        """后台线程：调用 dsh_control.request（最长阻塞 30s），结果经信号回主线程。"""
+        from . import dsh_control
+        try:
+            ok, detail = dsh_control.request(
+                operation, session_id,
+                goal=str(payload.get("goal") or ""),
+                context=self._exploration_control_context(payload),
+                timeout=self._EXPLORATION_CONTROL_TIMEOUT_S,
+                alert_id=self._exploration_control_alert_id(session_key),
+                cancel=self._worker_cancel,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 后台线程不得把异常带进 Qt 事件循环
+            ok, detail = False, f"control-request-error:{exc}"
+        try:
+            # shutdown 后不再投递结果（manager 可能已进入事件循环销毁流程）。
+            if not self._shutdown:
+                self._exploration_control_result.emit(
+                    session_key, operation, bool(ok), str(detail))
+        except Exception:
+            pass
+        finally:
+            with self._respond_threads_lock:
+                self._exploration_control_inflight.discard(session_id)
+                self._respond_threads.discard(threading.current_thread())
+
+    @staticmethod
+    def _exploration_control_context(payload: dict) -> str:
+        """给桥接诊断器的最小上下文：风险理由 + 近期目标 + 最近步骤行为。"""
+        parts = []
+        reasons = payload.get("reasons") or []
+        if reasons:
+            parts.append("风险理由：" + "；".join(str(item) for item in reasons[:6]))
+        targets = payload.get("targets") or []
+        if targets:
+            parts.append("近期目标：" + "、".join(str(item) for item in targets[:8]))
+        recent = []
+        for step in (payload.get("steps") or [])[-3:]:
+            if isinstance(step, dict):
+                behaviors = "、".join(str(item) for item in (step.get("behaviors") or [])[:6])
+                if behaviors:
+                    recent.append(behaviors)
+        if recent:
+            parts.append("最近步骤行为：" + " / ".join(recent))
+        return "\n".join(parts)[:12000]
+
+    def _on_exploration_control_result(self, session_key: str, operation: str,
+                                       ok: bool, detail: str) -> None:
+        """后台线程信号回主线程：把控制成功/失败结果弹成气泡。"""
+        self._show_exploration_control_result(session_key, operation, ok, detail)
+
+    def _show_exploration_control_result(self, session_key: str, operation: str,
+                                         ok: bool, detail: str) -> None:
+        if not hasattr(self.win, "isVisible") or not self.win.isVisible():
+            return
+        name = self._exploration_names.get(session_key) or self._exploration_name({}, session_key)
+        outcome = self._format_exploration_control_result(operation, ok, detail)
+        text = self._dialogue(
+            "watchdog.control.result", f"{name}：{outcome}", name=name, detail=outcome)
+        alert_id = self._exploration_control_result_alert_id(session_key)
+        if hasattr(self.win, "show_alert"):
+            # alert_type=control-result 在设置窗抑制期间也存活（状态类回执不丢）。
+            self._show_alert_compat(text, duration_ms=self._EXPLORATION_CONTROL_RESULT_MS,
+                                    sticky=False, alert_id=alert_id,
+                                    priority=self._EXPLORATION_CONTROL_PRIORITY,
+                                    alert_type="control-result",
+                                    metadata={"sessionId": session_key})
+        elif hasattr(self.win, "show_bubble"):
+            self.win.show_bubble(text, duration_ms=self._EXPLORATION_CONTROL_RESULT_MS)
+
+    @staticmethod
+    def _format_exploration_control_result(operation: str, ok: bool, detail: str) -> str:
+        """控制回执文案：成功按相位区分，失败按 timeout / not-found / rejected 区分。
+
+        子代理归一：当 bridge 把控制归一到根会话（wasSubagent + appliedToRoot）
+        时，中断即「已终止会话（已作用于主会话并停止其子代理）」；若父级不可解析、
+        只停了子代理（wasSubagent 且非 appliedToRoot），如实说明「主代理仍在运行，
+        可能重新派发」，避免用户误以为整个会话已停。
+        """
+        action = "自动优化" if operation == "replan" else "终止"
+        if ok:
+            parsed: dict = {}
+            try:
+                parsed = json.loads(detail or "{}")
+                if not isinstance(parsed, dict):
+                    parsed = {}
+            except (TypeError, ValueError):
+                parsed = {}
+            phase = str(parsed.get("phase") or "")
+            was_subagent = bool(parsed.get("wasSubagent"))
+            applied_to_root = bool(parsed.get("appliedToRoot"))
+            if phase == "already-idle":
+                return "已经是空闲状态，不需要终止"
+            if operation == "replan":
+                if was_subagent and applied_to_root:
+                    return "已按新方向重新规划（作用于主会话）"
+                return "已按新方向重新规划"
+            if was_subagent:
+                if applied_to_root:
+                    return "已终止会话（已作用于主会话并停止其子代理）"
+                return "已终止子代理（主代理仍在运行，可能重新派发）"
+            return "已终止本次运行"
+        reason = str(detail or "")
+        if reason in {"bridge-control-timeout", "cancel-timeout"}:
+            return f"{action}超时：桥接 30 秒内没有响应"
+        if reason == "session-not-found":
+            return "会话不存在或已经结束，无法执行"
+        if reason == "missing-session-id":
+            return "缺少会话标识，无法执行"
+        if reason in {"", "bridge-control-rejected"}:
+            return "桥接拒绝了本次控制请求"
+        return f"{action}失败：{reason}"
 
 
     def _on_exploration_lifecycle(self, agent_key: str, record: dict) -> None:
@@ -3843,17 +4132,32 @@ class AgentLinkManager(QObject):
             return
         payload = payload if isinstance(payload, dict) else {}
         name = self.AGENT_NAMES.get(agent_key, agent_key)
-        # 若该 session 有活跃的模型访问失败提醒且本次失败确实是模型访问失败，才不再重复弹
-        # 通用失败横幅（避免双重通知）。
+
         session_key = str(payload.get("sessionId") or agent_key)
         active_model_access = self._model_access_cache.get(session_key)
+
         error_code = str(payload.get("errorCode") or "").strip().upper()
-        error_message = str(payload.get("errorMessage") or "")
-        MODEL_ACCESS_ERROR_CODES = {"429", "RATE_LIMIT", "TOO_MANY_REQUESTS", "RESOURCE_EXHAUSTED"}
-        is_model_access_failure = error_code in MODEL_ACCESS_ERROR_CODES or "429" in error_message or "rate limit" in error_message.lower()
-        if active_model_access and not active_model_access.get("_dismissed") and \
-                self._clock() - active_model_access.get("_ts", 0) < self._MODEL_ACCESS_COOLDOWN_S and is_model_access_failure:
+        error_message = str(payload.get("errorMessage") or payload.get("errorText") or "").lower()
+        retry_exhausted = bool(payload.get("retryExhausted"))
+        source = str(payload.get("source") or "").strip()
+
+        MODEL_ACCESS_ERROR_CODES = {
+            "429",
+            "RATE_LIMIT",
+            "TOO_MANY_REQUESTS",
+            "RESOURCE_EXHAUSTED",
+        }
+
+        is_model_access_failure = (
+                error_code in MODEL_ACCESS_ERROR_CODES
+                or "429" in error_message
+                or "rate limit" in error_message
+                or (retry_exhausted and source != "tool" and not error_code)
+        )
+
+        if active_model_access and not active_model_access.get("_dismissed") and is_model_access_failure:
             return
+
         # 失败动画（若角色素材有）；没有就保持当前动作，仅弹气泡
         anim = self._pick_fail_anim()
         if anim and hasattr(self.win, "request_link_anim"):

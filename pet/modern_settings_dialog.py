@@ -151,8 +151,8 @@ DIALOGUE_LABELS = {
     "approval.command": "审批命令", "approval.tool": "审批工具",
     "approval.generic": "审批提示", "question.empty": "等待选择",
     "question.one": "单个用户问题", "question.many": "多个用户问题",
-    "watchdog.warning": "循环检测警告", "rate_limit.one": "单次限流",
-    "rate_limit.many": "连续限流", "llm_error.api": "AI 服务错误",
+    "watchdog.warning": "循环检测警告", "rate_limit.one": "模型访问失败（单次）",
+    "rate_limit.many": "模型访问失败（连续）", "llm_error.api": "AI 服务错误",
     "done.success": "任务完成",
     "done.attention": "任务暂停待确认", "failure.retry": "重试后失败",
     "failure.tool": "工具执行失败", "failure.generic": "执行失败",
@@ -169,10 +169,11 @@ DIALOGUE_PARAMS = {
     "step": "步骤序号",
     "toolName": "审批原始工具名", "argsKey": "工具参数摘要键",
     "sessionName": "会话显示名", "projectName": "项目名",
-    "errorCode": "错误码", "errorMessage": "错误信息原文",
-    "consecutiveRetryCount": "连续限流次数", "retry": "重试序号",
+    "errorCode": "错误码（llm_error 为上游真实码，如 bad_response_status_code）", "errorMessage": "错误信息原文",
+    "errorKind": "错误分类（api=AI API 请求失败）",
+    "consecutiveRetryCount": "连续模型访问失败次数", "retry": "重试序号",
     "retries": "已重试次数", "retryExhausted": "是否重试耗尽",
-    "source": "失败来源",
+    "failureType": "失败类型",
 }
 
 # 与 persona_template.PARAMETERS 保持同一真相源：调用点注入什么，这里就宣称什么。
@@ -464,9 +465,16 @@ class ModernSettingsDialog(QDialog):
             SettingRow("agent_sound_cooldown", "冷却时间", "防止短时间内频繁触发音效；0 表示无时间冷却（仍单次去重）。", self.agent_sound_cooldown_spin),
         ]
         behavior_layout.addWidget(SettingsSection("Agent 联动 · 提示音效", agent_sound_rows, behavior_content))
+        behavior_layout.addWidget(SettingsSection("Agent 联动 · 汇报频率", [
+            SettingRow(
+                "report_probability", "过程汇报概率",
+                "Agent 干活中的过程汇报（「正在读文件/跑命令/改代码…」）是提醒量最大的一类，按此概率抽稀。0% 等于关闭过程汇报，100% 全部汇报；开始干活、完成、审批/提问、硬失败、模型访问失败等提醒不受影响，始终汇报。",
+                self.report_probability_spin,
+            ),
+        ], behavior_content))
         labels = DIALOGUE_LABELS
         behavior_layout.addWidget(SettingsSection("表达风格", [
-            SettingRow("dialogue_mode", "表达风格", "控制桌宠自言自语、候选内容和主动气泡的说话方式；同时覆盖 Agent 状态、审批、提问、错误、限流等所有气泡。内置「默认模式」与「鲸鱼娘女仆模式」不可编辑；选择「自定义台词」后，可粘贴下方 JSON 一键导入全部弹窗文案。", self.dialogue_mode_select),
+            SettingRow("dialogue_mode", "表达风格", "控制桌宠自言自语、候选内容和主动气泡的说话方式；同时覆盖 Agent 状态、审批、提问、错误、模型访问失败等所有气泡。内置「默认模式」与「鲸鱼娘女仆模式」不可编辑；选择「自定义台词」后，可粘贴下方 JSON 一键导入全部弹窗文案。", self.dialogue_mode_select),
             SettingRow("dialogue_scope", "专属文案对象(仅在自定义模式生效)", "下方逐事件编辑针对的对象：默认（全局文案）或某 Agent 的专属文案。留空的事件自动沿用全局（或默认模式）文案。", self.dialogue_scope_select, stacked=True),
         ], behavior_content))
         behavior_layout.addWidget(SettingsCard([
@@ -1644,6 +1652,7 @@ class ModernSettingsDialog(QDialog):
         agent_cfg["sound_error_path"] = self.agent_sound_error_picker.text().strip() or "builtin:agent-error"
         agent_cfg["sound_volume"] = float(self.agent_sound_volume_spin.value()) / 100.0
         agent_cfg["sound_cooldown_seconds"] = float(self.agent_sound_cooldown_spin.value())
+        agent_cfg["report_probability"] = int(self.report_probability_spin.value())
 
         self.config.set("agent_link", agent_cfg)
         self.config.set("todo_reminder_enabled", self.todo_reminder_check.isChecked())

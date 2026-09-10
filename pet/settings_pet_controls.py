@@ -431,6 +431,14 @@ def build_pet_controls(host) -> None:
     host.agent_sound_cooldown_spin.setSuffix(" 秒")
     host.agent_sound_cooldown_spin.setValue(float(agent_link_cfg.get("sound_cooldown_seconds", 2.0)))
 
+    # 过程汇报概率（0-100%）：过程汇报是提醒量最大的一类，按概率抽稀。
+    # 0 = 过程汇报静音（等同关闭），100 = 全报。
+    host.report_probability_spin = BrowserSpinBox(host)
+    host.report_probability_spin.setRange(0, 100)
+    host.report_probability_spin.setSingleStep(5)
+    host.report_probability_spin.setSuffix(" %")
+    host.report_probability_spin.setValue(int(agent_link_cfg.get("report_probability", 60)))
+
     host.agent_sound_check.toggled.connect(host._update_agent_sound_controls)
     host.agent_sound_check.toggled.connect(host._apply_agent_sound_enabled_now)
     host.agent_sound_start_check.toggled.connect(lambda: host._update_agent_sound_subcontrols())

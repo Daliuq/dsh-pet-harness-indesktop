@@ -38,6 +38,38 @@ from pet.config import _clean_agent_link_data, _clean_custom_agents
 from pet.speech_bubble import SECTION_HEADER_LABEL, SECTION_HINT_LABEL
 
 
+# 测试开关基线：本文件验证「机制」，不隐式依赖产品默认值。
+# 产品默认值已按用户决策改为「1 常开、2 加概率、其他常开」，其中过程汇报
+# （notify_activity）还带 60% 抽样——用例若隐式继承默认值，同一断言会时而
+# 弹气泡、时而静默（不确定性来自随机抽样，不是被测行为）。这里把 Config 读到的
+# agent_link 开关复位为「全关、概率 0」，让机制可确定地测；专门校验产品默认值
+# 本身的用例是 TestAgentLinkManager::test_default_all_disabled，它不套本基线。
+_AGENT_SWITCH_BASELINE = {
+    "notify_state": False,
+    "notify_activity": False,
+    "report_probability": 0,
+    "stuck_detect": False,
+    "pattern_detect": False,
+}
+
+
+@pytest.fixture(autouse=True)
+def _agent_switch_baseline(monkeypatch, request):
+    """把 agent_link 默认开关复位为基线（产品默认值见 tests/test_report_probability.py）。"""
+    if request.node.name == "test_default_all_disabled":
+        yield
+        return
+    from pet import config as config_module
+
+    real_defaults = config_module._default_agent_link_data
+    monkeypatch.setattr(
+        config_module,
+        "_default_agent_link_data",
+        lambda: {**real_defaults(), **_AGENT_SWITCH_BASELINE},
+    )
+    yield
+
+
 class TestMainlineAgentLinkHardening:
     def test_monitor_polling_uses_worker_and_stops(self, tmp_path):
         """监视器轮询不占 GUI 线程，stop 后 worker 必须退出。"""
@@ -259,11 +291,12 @@ class TestAgentLinkManager:
             "cursor": False,
             "opencode": False,
             "custom_agents": [],
-            "notify_state": False,
+            "notify_state": True,
             "notify_done": True,
-            "notify_activity": False,
+            "notify_activity": True,
+            "report_probability": 60,
             "notify_exec_failed": True,
-            "stuck_detect": False,
+            "stuck_detect": True,
             "stuck_worried_threshold": 3,
             "stuck_intervene_threshold": 5,
             "stuck_window_seconds": 90,
@@ -276,7 +309,7 @@ class TestAgentLinkManager:
             "exploration_watchdog_early_grace_minutes": 5,
             "exploration_watchdog_long_run_minutes": 10,
             "exploration_watchdog_long_think_seconds": 120,
-            "pattern_detect": False,
+            "pattern_detect": True,
             "pattern_w6_control": 3,
             "pattern_w10_warn": 3,
             "pattern_w10_control": 4,
@@ -1394,14 +1427,17 @@ class TestAgentLinkChainingAndActivity:
     def test_activity_reporting(self, tmp_path):
         """3. 过程汇报：cfg agent_link.notify_activity=True 时 mgr._on_agent_activity('dsh','bash') → 气泡含「正在跑命令」；
         10 秒内第二次任何工具不弹；同工具 60 秒内不重复（clock 前进 15s 再发 bash 仍不弹；换成 read 则弹「正在读文件」）；
-        全局限流 8s（另一 agent 在 8s 内也不弹）。notify_activity 默认 False 时不弹。未知工具（如 'frobnicate'）弹安全兜底文案。"""
-        # notify_activity 默认 False 时不弹
+        全局限流 8s（另一 agent 在 8s 内也不弹）。notify_activity 关闭时不弹（本文件基线默认关闭，
+        见文件头 _AGENT_SWITCH_BASELINE；产品默认已改为常开+概率抽稀）。未知工具（如 'frobnicate'）弹安全兜底文案。"""
+        # 未开启 notify_activity 时不弹
         mgr_off, win_off, bubbles_off, clock_off = self._make_mgr(tmp_path)
         mgr_off._on_agent_activity("dsh", "bash")
         assert bubbles_off == []
 
-        # notify_activity = True
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path, agent_link_cfg={"notify_activity": True})
+        # notify_activity = True（概率固定 100%，避免抽样导致断言不确定）
+        mgr, win, bubbles, clock = self._make_mgr(
+            tmp_path, agent_link_cfg={"notify_activity": True, "report_probability": 100}
+        )
 
         # 未知工具弹安全兜底文案，不泄露原始参数
         mgr._on_agent_activity("dsh", "frobnicate")
@@ -1450,7 +1486,7 @@ class TestAgentLinkChainingAndActivity:
         tool/label/command/argsKey/callId/step + 会话字段显式传给模板；
         条件字段缺失时占位符自动隐藏（不原样露出 {target} 等死占位符）。"""
         mgr, win, bubbles, clock = self._make_mgr(
-            tmp_path, agent_link_cfg={"notify_activity": True}
+            tmp_path, agent_link_cfg={"notify_activity": True, "report_probability": 100}
         )
         # 模拟监视器 _poll 的同轮顺序：先 raw_record（工具记录），再 activity 信号
         # 字段以桥接真实写出的 tool/call 为准（tool/argsKey/command/callId/step）。
@@ -2807,14 +2843,14 @@ class TestExecutionFailed:
 
     def test_retry_exhausted_shows_reminder(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
-        mgr._on_execution_failed("dsh", {"source": "model_request", "retryExhausted": True, "retries": 4})
+        mgr._on_execution_failed("dsh", {"failureType": "model_retry_exhausted", "retryExhausted": True, "retries": 4})
         assert mgr.win.alerts, "应入队失败提醒"
         assert "重试" in mgr.win.alerts[-1]["text"]  # failure.retry 预设（多次重试后仍未成功）
         assert mgr.win.alerts[-1]["sticky"] is False, "失败提醒是限时气泡（非 sticky）"
 
     def test_tool_failure_shows_reminder(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
-        mgr._on_execution_failed("dsh", {"source": "tool", "retryExhausted": False})
+        mgr._on_execution_failed("dsh", {"failureType": "tool_failed", "retryExhausted": False})
         assert mgr.win.alerts
         assert "工具执行失败" in mgr.win.alerts[-1]["text"]  # failure.tool 预设首句
 
@@ -2834,7 +2870,7 @@ class TestExecutionFailed:
     def test_notify_exec_failed_disabled(self, tmp_path):
         """notify_exec_failed=False 时不提醒。"""
         mgr = self._make_mgr(tmp_path, notify_exec_failed=False)
-        mgr._on_execution_failed("dsh", {"source": "model_request", "retryExhausted": True})
+        mgr._on_execution_failed("dsh", {"failureType": "model_retry_exhausted", "retryExhausted": True})
         assert mgr.win.shown == []
 
 
@@ -2881,8 +2917,8 @@ class TestRateLimitAlert:
         assert mgr.win.alerts, "应弹出 429 提醒"
         alert = mgr.win.alerts[-1]
         assert alert["alert_id"] == "429-rate-limit:sess-1", "alert_id 必须带 sessionId 隔离"
-        # 可见文案走 legacy rate_limit.one 预设（不含 429 字样）；429 语义由 alert_id/alert_type 承载
-        assert "限流" in alert["text"]
+        # 可见文案走 legacy rate_limit.one 预设（模型访问失败语义）；429 由 alert_id/alert_type 承载
+        assert "模型访问失败" in alert["text"]
         assert alert["priority"] == mgr._429_PRIORITY and alert["priority"] == 1
 
     def test_consecutive_429_merged_same_session(self, tmp_path):
@@ -2890,7 +2926,7 @@ class TestRateLimitAlert:
         mgr._on_rate_limit("dsh", {"sessionId": "sess-2"})
         mgr._on_rate_limit("dsh", {"sessionId": "sess-2"})  # 8s 冷却窗口内 → 合并
         assert mgr._429_cache["sess-2"]["count"] == 2
-        assert "限流" in mgr.win.alerts[-1]["text"] and "2 次" in mgr.win.alerts[-1]["text"]
+        assert "模型访问失败" in mgr.win.alerts[-1]["text"] and "2 次" in mgr.win.alerts[-1]["text"]
         assert mgr.win.alerts[-2]["alert_id"] == mgr.win.alerts[-1]["alert_id"], "同 session 复用同一 alert_id"
 
     def test_multi_session_isolated(self, tmp_path):
@@ -2909,14 +2945,25 @@ class TestRateLimitAlert:
         assert "429-rate-limit:sess-3" in mgr.win.resolved, "关闭对应 alert"
 
     def test_execution_failed_suppressed_while_429_active(self, tmp_path):
-        """存在活跃 429 时，不再弹通用失败横幅，避免双重通知。"""
+        """存在活跃 429 时，仅真正的模型访问失败（errorCode 属 429 类码）不再弹通用横幅；
+        模型重试耗尽（retryExhausted）是另一条语义，照常提醒。"""
         mgr = self._make_mgr(tmp_path)
-        # 先触发 429，冷却窗口内再出现 execution/failed
+        # 先触发 429，冷却窗口内再出现真·限流失败（errorCode=RATE_LIMIT）→ 抑制
         mgr._on_rate_limit("dsh", {"sessionId": "sess-4"})
         before = len(mgr.win.alerts)
-        mgr._on_execution_failed("dsh", {"sessionId": "sess-4", "source": "model_request",
+        mgr._on_execution_failed("dsh", {"sessionId": "sess-4", "failureType": "model_retry_exhausted",
+                                         "retryExhausted": True, "errorCode": "RATE_LIMIT"})
+        assert len(mgr.win.alerts) == before, "活跃 429 + 真限流失败 → 抑制通用失败横幅"
+
+    def test_retry_exhausted_not_suppressed_as_429(self, tmp_path):
+        """模型重试耗尽失败（无 429 errorCode）不是限流：429 活跃也不抑制，照常弹 failure.retry。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_rate_limit("dsh", {"sessionId": "sess-5"})
+        before = len(mgr.win.alerts)
+        mgr._on_execution_failed("dsh", {"sessionId": "sess-5", "failureType": "model_retry_exhausted",
                                          "retryExhausted": True})
-        assert len(mgr.win.alerts) == before, "429 活跃时抑制通用失败横幅"
+        assert len(mgr.win.alerts) == before + 1, "重试耗尽失败不应被当作 429 抑制"
+        assert "重试" in mgr.win.alerts[-1]["text"]  # failure.retry 文案
 
 
 class TestSessionNameTruthfulness:

@@ -55,6 +55,17 @@ log = logging.getLogger("dsh-pet-standalone")
 _LIVE_AGENT_LINK_MANAGERS: weakref.WeakSet = weakref.WeakSet()
 _LIVE_AGENT_MONITORS: weakref.WeakSet = weakref.WeakSet()
 
+# DSH 桥接事件名（_poll 按名字直通处理的；语义层/状态机未建模也计入），
+# 供「未知事件 → 提醒更新/重装 bridge」识别：事件名在语义层（normalize_event）、
+# 状态机（normalize_event_state）与本名单全部不命中才算未知。
+# 新增 _poll 的 event 直通分支必须同步本名单，否则该事件会被误判为桥接未知事件。
+_RAW_BRIDGE_KNOWN_EVENTS: frozenset[str] = frozenset({
+    "approval/request", "approval/requested", "approval/decided", "approval/resolved",
+    "question/requested", "question/resolved",
+    "cordis/request-run", "cordis/request-run-resolved",
+    "execution/failed", "model_access", "llm_error", "user_action",
+})
+
 
 def _which(name: str) -> str | None:
     """Node runtime lookup with the historical ``shutil.which`` seam retained."""
@@ -780,6 +791,9 @@ class BaseAgentMonitor(QObject):
     llm_error = Signal(str, object)
     # 用户介入信号（user_action 事件）：用户 DSH 审批/回答 → 桌宠应关闭对应弹窗
     user_action = Signal(str, object)
+    # 未知桥接事件（DSH 桥接写出的、Pet 全部识别路径都不认识的事件名）：
+    # (agent_key, record) —— Manager 侧据此提醒用户更新/重装 bridge。
+    unknown_bridge_event = Signal(str, object)
 
     def __init__(self, agent_key: str, config_dir: Path, parent=None) -> None:
         super().__init__(parent)
@@ -1025,6 +1039,7 @@ class BaseAgentMonitor(QObject):
                     if normalized is not None:
                         self.normalized_event.emit(normalized)
                 except Exception:
+                    normalized = None  # 解析失败视为语义层未识别，防止上一行残留值污染
                     log.debug("统一 AgentEvent 解析失败", exc_info=True)
                 # 原始记录转发（兼容旧消费者）
                 self._emit(self.raw_record, (self.agent_key, data))
@@ -1074,6 +1089,20 @@ class BaseAgentMonitor(QObject):
                 # 用户介入信号：user_action（审批决定/回答）→ 关闭对应弹窗
                 if ev == "user_action":
                     self._emit(self.user_action, (self.agent_key, data))
+                # 未知桥接事件：DSH 桥接写出的、Pet 全部识别路径（语义层/状态机/
+                # 直通名单）都不认识的事件名 → 大概率 bridge 与桌宠版本不匹配，
+                # 呈递给 Manager 弹「更新/重装 bridge」提醒。claude/cursor 的
+                # transcript 噪声不算（只查 DSH 监视器）；session/meta 等按
+                # type 字段直通的也不在此列。
+                if (
+                    self.agent_key == "dsh"
+                    and bool(ev)
+                    and normalized is None
+                    and not normalize_event_state(ev, "")
+                    and ev not in _RAW_BRIDGE_KNOWN_EVENTS
+                    and meta_type not in ("session/meta", "debug/session-shape")
+                ):
+                    self._emit(self.unknown_bridge_event, (self.agent_key, data))
                 normalized = normalize_event_state(ev, st)
                 if not normalized:
                     continue  # 不认识的事件类型：忽略，不误报为 working
@@ -1753,6 +1782,7 @@ class AgentLinkManager(QObject):
     _BUSY_STATES = ("working", "thinking")
     _DONE_CONFIRM_MS = 800   # busy→idle 稳定确认窗口（过滤 working→idle→working 抖动）
     _DONE_COOLDOWN_S = 5.0   # 同 Agent 完成气泡最小间隔（最后一道保险）
+    _UNKNOWN_BRIDGE_REMIND_COOLDOWN_S = 600.0  # 未知桥接事件提醒：同 agent 10 分钟内最多一次
 
     def __init__(self, window: Any, config: Any, *, min_interval: float = 2.0,
                  clock: Callable[[], float] = time.time,
@@ -1782,6 +1812,7 @@ class AgentLinkManager(QObject):
         self._last_raw: dict[str, str] = {}
         self._done_pending: dict[str, QTimer] = {}   # agent → 稳定确认定时器
         self._done_cooldown: dict[str, float] = {}   # agent → 上次完成气泡时刻
+        self._unknown_bridge_reminded_at: dict[str, float] = {}  # agent → 上次未知桥接事件提醒时刻
         self._saw_alert: set[str] = set()            # busy 周期内出现过 attention/error 的 Agent
         self._saw_error: set[str] = set()            # busy 周期内真正出现过 error 的 Agent
         self._sound_last_at: dict[str, float] = {}
@@ -1881,6 +1912,7 @@ class AgentLinkManager(QObject):
         self.monitors["dsh"].model_access.connect(self._on_model_access)
         self.monitors["dsh"].llm_error.connect(self._on_llm_error)
         self.monitors["dsh"].user_action.connect(self._on_user_action)
+        self.monitors["dsh"].unknown_bridge_event.connect(self._on_unknown_bridge_event)
         # 检测器提醒跨模块节流（N2）：stuck / pattern / exploration watchdog 三个
         # 检测器各有独立 cooldown，但同一 busy 周期可能先后各自弹窗造成连环换弹。
         # 按 agent/session 记最近一次**任一**检测器弹窗时刻与档位，窗口内同档
@@ -3992,6 +4024,34 @@ class AgentLinkManager(QObject):
             call_id = str(record.get("callId") or "")
             rpc_id = str(record.get("rpcId") or "")
             self._close_interaction_by_id("question", rpc_id, call_id, session_key)
+
+    def _on_unknown_bridge_event(self, agent_key: str, record: dict) -> None:
+        """DSH 桥接写出的未知事件 → 提醒用户更新/重装 bridge。
+
+        事件名不在 Pet 任何识别路径（语义层 / 状态机 / _poll 直通名单）里，
+        大概率是 bridge 与桌宠版本不匹配写出的新事件。受 bridge 概率门控制
+        （用户可在设置里关掉）；同一 agent 在冷却窗口内只提醒一次——未知
+        事件可能成串到达，逐条弹窗会刷屏。
+        """
+        if not isinstance(record, dict):
+            return
+        if not self._report_allowed(self.cfg.get("agent_link", {}), "bridge.unknown"):
+            return
+        now = self._clock()
+        last = self._unknown_bridge_reminded_at.get(agent_key)
+        if last is not None and now - last < self._UNKNOWN_BRIDGE_REMIND_COOLDOWN_S:
+            return
+        self._unknown_bridge_reminded_at[agent_key] = now
+        name = self.agent_names.get(agent_key, agent_key)
+        event = str(record.get("event") or "").strip()
+        text = self._dialogue(
+            "bridge.unknown",
+            f"检测到未知的桥接事件（{event}），当前桌宠不认识它——"
+            "可能是 bridge 版本过旧，请更新或重装 bridge 插件",
+            name=name,
+            event=event,
+        )
+        self.win.show_bubble(text, duration_ms=6000)
 
     def _close_interaction_by_id(self, kind: str, rpc_id: str, id_: str, session_key: str) -> None:
         """按 kind + identity + session 精确关闭交互弹窗。"""

@@ -94,7 +94,7 @@ def test_all_advertised_fields_reach_presentation_layer():
     assert set(VARIABLES) == {
         "name", "command", "label", "body", "count", "reasons", "detail", "text",
         "tool", "toolName", "argsKey", "callId", "step",
-        "sessionName", "projectName",
+        "sessionName", "projectName", "event",
         "errorCode", "errorMessage", "errorKind", "consecutiveRetryCount", "retry",
         "retries", "retryExhausted", "failureType",
     }

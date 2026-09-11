@@ -169,6 +169,7 @@ DIALOGUE_PARAMS = {
     "name": "Agent 名称", "command": "命令文本", "label": "标签（工具标签/会话标签随事件而定）",
     "body": "问题内容", "count": "数量", "reasons": "判断原因",
     "detail": "错误详情", "text": "显示文本",
+    "event": "未知事件名（bridge.unknown）",
     "tool": "原始工具名", "callId": "工具调用 ID",
     "step": "步骤序号",
     "toolName": "审批原始工具名", "argsKey": "工具参数摘要键",

@@ -3500,3 +3500,95 @@ class TestDetectorAlertThrottle:
         mgr._throttle_now[0] += 1.0
         mgr._on_exploration_warning("sess-1", {"agent_key": "dsh", "reasons": ["search"], "steps": []})
         assert len(mgr.win.alerts) == 1, "被丢弃的提醒不该占用节流槽"
+
+
+# ============================================================================
+class TestUnknownBridgeEventReminder:
+    """未知桥接事件 → 提醒用户更新/重装 bridge。
+
+    识别：DSH 监视器里，事件名在「语义层 / 状态机 / _poll 直通名单」全部
+    不认识才算未知（claude/cursor 的 transcript 噪声不算）。提醒受 bridge
+    概率门控制，同一 agent 在冷却窗口内只弹一次（未知事件成串时不刷屏）。
+    """
+
+    def _make_mgr(self, tmp_path, gates=None):
+        app = QApplication.instance() or QApplication([])
+        bubbles = []
+
+        class DummyWin:
+            def isVisible(self):
+                return True
+
+            def show_bubble(self, text, duration_ms=3000):
+                bubbles.append(text)
+
+        cfg = Config(base=tmp_path)
+        if gates is not None:
+            data = cfg.data
+            data["agent_link"] = {**data.get("agent_link", {}), "report_gates": _agent_gates(**gates)}
+            cfg.save()
+        clock = [1000.0]
+        mgr = AgentLinkManager(DummyWin(), cfg, min_interval=2.0, clock=lambda: clock[0])
+        return mgr, bubbles, clock
+
+    def test_monitor_emits_only_unknown_dsh_events(self, tmp_path):
+        """监视器只对「全识别路径都不认识」的 DSH 事件发 unknown_bridge_event。"""
+        app = QApplication.instance() or QApplication([])
+        mon = BaseAgentMonitor("dsh", tmp_path)
+        unknown = []
+        mon.unknown_bridge_event.connect(lambda k, d: unknown.append((k, d)))
+        events_file = mon.events_file
+        events_file.parent.mkdir(parents=True, exist_ok=True)
+        events_file.touch()
+        mon._poll()  # 初始化 tailer（首轮不重放）
+        with open(events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "brand/sparkle", "ts": 1}) + "\n")             # 未知
+            f.write(json.dumps({"event": "execution/failed", "ts": 2}) + "\n")          # 语义层已知
+            f.write(json.dumps({"event": "agent/status", "state": "working", "ts": 3}) + "\n")  # 状态机已知
+            f.write(json.dumps({"event": "model_access", "errorCode": "429", "ts": 4}) + "\n")   # 直通名单已知
+            f.write(json.dumps({"event": "cordis/request-run", "ts": 5}) + "\n")        # 直通名单已知
+        mon._poll()
+        assert [(k, d.get("event")) for k, d in unknown] == [("dsh", "brand/sparkle")]
+        mon.stop()
+
+    def test_non_dsh_monitor_never_emits_unknown(self, tmp_path):
+        """claude/cursor 等 transcript 噪声不算桥接未知事件（只查 DSH 监视器）。"""
+        app = QApplication.instance() or QApplication([])
+        mon = BaseAgentMonitor("cursor", tmp_path)
+        unknown = []
+        mon.unknown_bridge_event.connect(lambda k, d: unknown.append((k, d)))
+        events_file = mon.events_file
+        events_file.parent.mkdir(parents=True, exist_ok=True)
+        events_file.touch()
+        mon._poll()
+        with open(events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "brand/sparkle", "ts": 1}) + "\n")
+        mon._poll()
+        assert unknown == []
+        mon.stop()
+
+    def test_wiring_manager_bubbles_reminder(self, tmp_path):
+        """Monitor → Manager 全链路：bridge 门开时收到未知事件即弹更新/重装提醒。"""
+        mgr, bubbles, _ = self._make_mgr(tmp_path, gates={"bridge": 1.0})
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        assert len(bubbles) == 1
+        assert "更新" in bubbles[0] or "重装" in bubbles[0], bubbles[0]
+        mgr.shutdown()
+
+    def test_gate_closed_keeps_quiet(self, tmp_path):
+        """bridge 门为 0 时未知事件提醒静音（可被用户统一关掉）。"""
+        mgr, bubbles, _ = self._make_mgr(tmp_path, gates={"bridge": 0.0})
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        assert bubbles == []
+        mgr.shutdown()
+
+    def test_cooldown_reminds_once_per_window(self, tmp_path):
+        """同一 agent 冷却窗口内只提醒一次；窗口过后再次提醒。"""
+        mgr, bubbles, clock = self._make_mgr(tmp_path, gates={"bridge": 1.0})
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        assert len(bubbles) == 1, "冷却窗口内重复未知事件不得刷屏"
+        clock[0] += 601.0
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        assert len(bubbles) == 2, "冷却窗口过后应再次提醒"
+        mgr.shutdown()

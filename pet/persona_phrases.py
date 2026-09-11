@@ -316,7 +316,7 @@ def phrase_keys() -> tuple[str, ...]:
 PUBLIC_DIALOGUE_EVENTS: frozenset[str] = frozenset({
     "balance.loading", "balance.result",
     "bridge.install.pending", "bridge.install.success", "bridge.install.failed",
-    "bridge.uninstall.failed",
+    "bridge.uninstall.failed", "bridge.unknown",
 })
 
 

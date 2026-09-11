@@ -43,7 +43,7 @@
 | `argsKey` | 工具参数摘要键（activity.*；上游记录提供时可用） |
 | `callId` | 工具调用 ID（activity.*；上游记录提供时可用） |
 | `step` | turn 内步骤序号（activity.*；上游记录提供时可用） |
-| `sessionName` | 会话显示名（来自会话元数据 projectName/label/agentName；仅解析出真实名称时才注入，无元数据时占位符自动隐藏，不会回退成 sessionId） |
+| `sessionName` | 会话名（当前会话自身的标题/名字，来自会话元数据 sessionName；仅解析出真实名称时才注入，独立于 projectName——绝不拼组合串，无元数据时占位符自动隐藏，不会回退成 sessionId） |
 | `projectName` | 会话所属项目名（含 sessionId 的弹窗均可用；上游记录提供时可用） |
 | `errorCode` | 错误码（model_access.*、failure.*；上游记录提供时可用） |
 | `errorMessage` | 错误信息原文（model_access.*、failure.*；上游记录提供时可用） |

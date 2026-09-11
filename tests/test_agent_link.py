@@ -3171,8 +3171,12 @@ class TestSessionNameTruthfulness:
         sid = "session-0123456789"
         mgr._on_session_meta("dsh", {"sessionId": sid, "projectName": "深海项目", "sessionName": "排障对话"})
         cond = mgr._session_conditional({"sessionId": sid})
-        assert cond["sessionName"] == "深海项目 · 排障对话"
-        assert mgr._session_display_name_or_empty(sid) == "深海项目 · 排障对话"
+        # sessionName 只取会话名自身，绝不拼 projectName（两字段语义独立）
+        assert cond["sessionName"] == "排障对话"
+        assert cond["projectName"] == "深海项目", "projectName 是独立字段"
+        assert mgr._session_name_or_empty(sid) == "排障对话"
+        # 组合展示串仍只属于展示 API（气泡前缀/探索气泡），不冒充会话名字段
+        assert mgr.get_session_display_name(sid) == "深海项目 · 排障对话"
 
     def test_model_access_alert_does_not_inject_session_name_without_meta(self, tmp_path):
         mgr = self._make(tmp_path, win=self._AlertWin())

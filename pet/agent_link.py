@@ -2456,7 +2456,10 @@ class AgentLinkManager(QObject):
     def _session_conditional(self, record: dict) -> dict[str, str]:
         """从记录提取条件会话字段（缺失/为空不注入，渲染端自动隐藏占位符）。
 
-        返回 sessionName（会话显示名）/ projectName（项目名）/ label（会话标签）。
+        返回 sessionName（会话名）/ projectName（项目名）/ label（会话标签），
+        三者语义独立：sessionName 只取会话自己的名字，绝不拼进 projectName
+        （否则 {sessionName} 与 {projectName} 两字段语义重复）。sessionId 存在
+        且记录缺字段时，从会话元数据缓存补齐（只补真实字段，不编造展示串）。
         注意 label 同名双义：activity.*/approval.tool 的 label 是工具标签，
         由调用点显式传入——那些调用点不要用本方法返回值覆盖 label。
         """
@@ -2468,9 +2471,15 @@ class AgentLinkManager(QObject):
                 vals[field] = value
         session_id = str(record.get("sessionId") or "").strip()
         if session_id:
-            session_name = self._session_display_name_or_empty(session_id)
-            if session_name and session_name.strip():
-                vals["sessionName"] = session_name.strip()
+            if "sessionName" not in vals:
+                session_name = self._session_name_or_empty(session_id)
+                if session_name:
+                    vals["sessionName"] = session_name
+            if "projectName" not in vals:
+                meta = self._session_meta_cache.get(session_id) or {}
+                project_name = str(meta.get("projectName") or "").strip()
+                if project_name:
+                    vals["projectName"] = project_name
         return vals
 
     def _thinking_text(self, agent_key: str) -> str:
@@ -3834,7 +3843,7 @@ class AgentLinkManager(QObject):
             value = entry.get(field)
             if value not in (None, ""):
                 conditional[field] = value
-        session_name = self._session_display_name_or_empty(session_key)
+        session_name = self._session_name_or_empty(session_key)
         if session_name and session_name.strip():
             conditional["sessionName"] = session_name.strip()
         text = self._dialogue(key, fallback, count=count, **conditional)
@@ -4075,7 +4084,11 @@ class AgentLinkManager(QObject):
                 return
 
     def get_session_display_name(self, session_id: str) -> str:
-        """解析会话的人类可读显示名。
+        """解析会话的人类可读展示名（「projectName · sessionName」组合串）。
+
+        仅用于气泡前缀、探索气泡等**展示**场景；台词模板里的 ``{sessionName}``
+        字段必须走 ``_session_name_or_empty()``（只取会话名），不要用本方法返回值
+        注入，避免 {sessionName} 与 {projectName} 语义重复。
 
         降级链：cache 中的 projectName+sessionName → cache.agentName → 截短 sessionId → 完整 sessionId。
         控制请求（interrupt/replan）仍严格使用 sessionId，此处仅用于展示。
@@ -4096,19 +4109,17 @@ class AgentLinkManager(QObject):
         short_id = session_id[:8] if len(session_id) > 8 else session_id
         return f"DSH · {short_id}"
 
-    def _session_display_name_or_empty(self, session_id: str) -> str:
-        """供台词注入的真实会话显示名。
+    def _session_name_or_empty(self, session_id: str) -> str:
+        """台词注入用会话名：只取会话自己的名字（session/meta 的 sessionName）。
 
-        get_session_display_name() 在没有任何会话元数据时会回退成 id 截短占位
-        （"DSH · <sessionId[:8]>"）——那是兜底展示名，不是「会话显示名」。台词
-        模板的 {sessionName} 只该拿到真实可读名称：落到占位时返回空串，由条件
-        渲染（autohide）隐藏占位符，绝不把 sessionId 冒充会话名露出来。
+        ``get_session_display_name()`` 返回的「projectName · sessionName」组合串
+        是给气泡前缀/探索气泡用的人类可读展示名；台词模板的 ``{sessionName}``
+        字段语义 = 会话名自身，``{projectName}`` 是独立字段——绝不用组合串冒充
+        会话名（否则两字段语义重复，用户在模板里无法单独引用）。无真实会话名时
+        返回空串，由条件渲染（autohide）隐藏占位符，也不把 sessionId 截短占位冒充。
         """
-        display = self.get_session_display_name(session_id)
-        short = session_id[:8] if len(session_id) > 8 else session_id
-        if display == f"DSH · {short}":
-            return ""
-        return display
+        meta = self._session_meta_cache.get(session_id) or {}
+        return str(meta.get("sessionName") or "").strip()
 
     def _exploration_name(self, payload: dict, session_key: str) -> str:
         """返回探索气泡中显示的会话名称，优先使用元数据缓存。"""

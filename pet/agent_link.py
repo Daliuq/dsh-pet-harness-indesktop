@@ -898,12 +898,12 @@ class BaseAgentMonitor(QObject):
                 return
             mon._destroy_guard_ran = True
         try:
-            conn = getattr(mon, "_destroyed_conn", None)
-            if conn is not None:
-                try:
-                    mon.destroyed.disconnect(conn)
-                except RuntimeError:
-                    pass
+            # 本函数只从 destroyed 信号回调进入（见 __init__/start 的连接），此时
+            # C++ 对象正处于析构中途，再对本信号 disconnect 会触发 PySide6 的
+            # "Failed to disconnect" 告警，并在解释器退出时的 GC 场景下诱发原生
+            # 访问违规（Windows 0xC0000005）。连接由 Qt 在对象析构时自动清理；
+            # 这里只需作废引用以断开 Python 引用环（lambda 捕获 self）。
+            if getattr(mon, "_destroyed_conn", None) is not None:
                 mon._destroyed_conn = None
             mon._worker_stop.set()
             mon._emit_gen = -1
@@ -2178,10 +2178,22 @@ class AgentLinkManager(QObject):
         # violation、macOS bus error 的根因）。过继给 QApplication（主线程、
         # 与进程同寿）后，C++ 侧不再随 wrapper 的 GC 删除，wrapper 何时何线程
         # 回收都只是空壳析构。真窗口场景由父链销毁在先，RuntimeError 兜底跳过。
+        AgentLinkManager._adopt_to_app_for_gc(self)
+
+    @staticmethod
+    def _adopt_to_app_for_gc(obj: "AgentLinkManager") -> None:
+        """把 parent=None（测试桩/多窗代理）的 C++ 对象过继给 QApplication。
+
+        仅接管 Python 侧生命周期，不改变业务状态：过继后 wrapper 在任何线程
+        被循环 GC 回收时，C++ 侧都只是空壳析构，不会跨线程删除带 QTimer
+        子对象/信号连接的 QObject（CI Windows interpreter 退出 access
+        violation、macOS bus error 的根因，见 shutdown 注释）。真窗口场景由
+        父链销毁在先，RuntimeError 兜底跳过。
+        """
         try:
             app = QCoreApplication.instance()
-            if self.parent() is None and app is not None and self.thread() is app.thread():
-                self.setParent(app)
+            if obj.parent() is None and app is not None and obj.thread() is app.thread():
+                obj.setParent(app)
         except RuntimeError:
             pass
 

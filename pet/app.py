@@ -59,6 +59,15 @@ from .persona_phrases import PhrasePicker
 
 _persona_pickers = weakref.WeakKeyDictionary()
 
+# 存活 AppShell 注册表（测试收口用，与 collision_ipc._live_sessions /
+# agent_link._LIVE_AGENT_LINK_MANAGERS 同一纪律）。多窗共享子系统与待办服务
+# 持有无主 QTimer（`QTimer()` + timeout.connect），其连接从 Qt C++ 侧强引用
+# 住整个 shell 对象图，Python 的 gc.collect() 回收不掉；解释器退出时的 GC
+# 才最终化这些 Qt 对象 → 原生访问违规（Windows 0xC0000005，崩溃点落在
+# "Garbage-collecting / <no Python frame>"）。WeakSet 只弱引用 shell 本身，
+# 测试收口时逐对象停表并释放反向引用。
+_LIVE_SHELLS: "weakref.WeakSet" = weakref.WeakSet()
+
 
 class _BackgroundResult(QObject):
     done = Signal(bool, object)
@@ -975,6 +984,7 @@ class AppShell:
             from .multi_window_shared import SharedSubsystems
 
             self._shared = SharedSubsystems(self)
+        _LIVE_SHELLS.add(self)
 
     @property
     def enable_chat(self) -> bool:
@@ -1195,6 +1205,45 @@ class AppShell:
             self._decode_hub.stop_all()
         except Exception:
             logging.exception("退出时关闭共享解码 hub 失败")
+
+    @classmethod
+    def _shutdown_live_for_tests(cls) -> None:
+        """收口测试直接创建、未走 aboutToQuit 的 AppShell（对齐 agent_link 同族防线）。
+
+        只做 Qt 生命周期释放，不改业务状态：
+        - 停待办提醒服务定时器（其 ``_app`` 反向强引用 shell，且无主 QTimer 的
+          timeout 连接从 Qt C++ 侧强引用住整个对象图，Python gc 回收不掉）；
+        - 共享子系统经 ``SharedSubsystems._shutdown_live_for_tests`` 收口；
+        - 断开 shell → app 的 aboutToQuit 连接并释放反向引用。
+
+        不做 ``_on_about_to_quit`` 的退出语义（保存位置/永久关闭写盘 worker）：
+        那是「全部退出」，测试收口不得触发。
+        """
+        for shell in tuple(_LIVE_SHELLS):
+            try:
+                service = getattr(shell, "todo_service", None)
+                if service is not None:
+                    try:
+                        service.stop()
+                    except Exception:
+                        logging.debug("测试收口待办服务失败", exc_info=True)
+                    shell.todo_service = None
+                if getattr(shell, "_shared", None) is not None:
+                    shell._shared.stop_all()
+                if getattr(shell, "instance", None) is not None:
+                    win = getattr(shell.instance, "win", None)
+                    lib = getattr(win, "lib", None)
+                    if lib is not None:
+                        lib.pause_warm()
+                if getattr(shell, "_on_about_to_quit_connected", False):
+                    try:
+                        shell.app.aboutToQuit.disconnect(shell._on_about_to_quit)
+                    except (RuntimeError, TypeError):
+                        pass
+                    shell._on_about_to_quit_connected = False
+                shell._instances = []
+            except Exception:
+                logging.debug("测试收口 AppShell 失败", exc_info=True)
 
     def _on_shared_fullscreen(self, hit: bool) -> None:
         """批5.2a：共享全屏 watcher 广播 → 扇出到各窗的 _on_fullscreen_changed。

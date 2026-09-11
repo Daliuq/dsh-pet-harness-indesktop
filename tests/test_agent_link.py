@@ -1255,7 +1255,7 @@ class TestAgentLinkBubbles:
         tool-calls→""）仍存在，恢复端到端守卫。"""
         import json as j
 
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 1.0})
         mgr._on_agent_state("dsh", "working")
 
         # 子代理长跑期间：tool-calls 维持现状，确认窗口不排程
@@ -3091,26 +3091,26 @@ class TestModelAccessAlert:
         assert "重试" in mgr.win.alerts[-1]["text"]  # failure.retry 文案
 
     def test_execution_failed_suppressed_beyond_cooldown_while_429_alive(self, tmp_path):
-        """F2 回归：429 提醒展示 15s > 合并冷却 8s，turn/end 的 execution/failed 常
-        在 8~15s 窗口到达——只要 429 提醒仍未 dismiss，通用失败横幅必须继续抑制
+        """F2 回归：模型访问失败提醒展示 15s > 合并冷却 8s，turn/end 的 execution/failed 常
+        在 8~15s 窗口到达——只要提醒仍未 dismiss，通用失败横幅必须继续抑制
         （旧实现按 8s cooldown 判断会绕过抑制造成双弹）。dismiss 后新失败正常提醒。"""
         mgr = self._make_mgr(tmp_path)
         now = [1000.0]
         mgr._clock = lambda: now[0]
-        mgr._on_rate_limit("dsh", {"sessionId": "sess-f2",
-                                   "errorCode": "RATE_LIMIT", "consecutiveRetryCount": 1})
+        mgr._on_model_access("dsh", {"sessionId": "sess-f2",
+                                     "errorCode": "RATE_LIMIT", "consecutiveRetryCount": 1})
         assert len(mgr.win.alerts) == 1
         now[0] += 10.0  # 超出 8s cooldown，仍在 15s 展示寿命内
-        mgr._on_execution_failed("dsh", {"sessionId": "sess-f2", "source": "model_request",
+        mgr._on_execution_failed("dsh", {"sessionId": "sess-f2", "failureType": "model_retry_exhausted",
                                          "retryExhausted": True, "retries": 5,
                                          "errorCode": "RATE_LIMIT"})
-        assert len(mgr.win.alerts) == 1, "429 提醒存活期间不得二次弹通用失败横幅"
-        # 收起 429 后：新的（非限流）失败应正常提醒
-        mgr._dismiss_429_alert("sess-f2")
-        mgr._on_execution_failed("dsh", {"sessionId": "sess-f2", "source": "tool",
+        assert len(mgr.win.alerts) == 1, "模型访问失败提醒存活期间不得二次弹通用失败横幅"
+        # 收起提醒后：新的（非限流）失败应正常提醒
+        mgr._dismiss_model_access_alert("sess-f2")
+        mgr._on_execution_failed("dsh", {"sessionId": "sess-f2", "failureType": "tool_failed",
                                          "retryExhausted": False, "retries": 0,
                                          "errorCode": ""})
-        assert len(mgr.win.alerts) == 2, "429 已收起后工具失败应正常提醒"
+        assert len(mgr.win.alerts) == 2, "提醒已收起后工具失败应正常提醒"
 
 
 class TestSessionNameTruthfulness:
@@ -3189,6 +3189,11 @@ class TestInstallFinishedGuard:
 
     def _make_manager(self, tmp_path, bubbles, monkeypatch, release):
         cfg = Config(base=tmp_path)
+        # 本类取证安装代次守卫：bridge 类概率门开 1.0，避免文件头 autouse 基线
+        # （全 0.0）把「门抽稀掉的气泡」冒充「守卫正确丢弃了迟到回调」。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(bridge=1.0)
+        cfg.set("agent_link", ag)
 
         class Win:
             def show_bubble(self, text, duration_ms=3000):
@@ -3289,6 +3294,10 @@ class TestInstallFinishedGuard:
         app = QApplication.instance() or QApplication([])
         bubbles = []
         cfg = Config(base=tmp_path)
+        # 同上：bridge 类概率门开 1.0，保证气泡断言取证的是守卫而非概率门。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(bridge=1.0)
+        cfg.set("agent_link", ag)
 
         class Win:
             def show_bubble(self, text, duration_ms=3000):
@@ -3407,6 +3416,11 @@ class TestDetectorAlertThrottle:
                 self.alerts.append({"text": str(text), "bubble": True})
 
         cfg = Config(base=tmp_path)
+        # 本类取证 N2 跨检测器节流：stuck/pattern/watchdog 三条检测类概率门开 1.0，
+        # 避免文件头 autouse 基线（全 0.0）把「没弹窗」冒充「被节流」。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(stuck=1.0, pattern=1.0, watchdog=1.0)
+        cfg.set("agent_link", ag)
         mgr = AgentLinkManager(FakeWin(), cfg)
         mgr._clock = lambda: mgr._throttle_now[0]
         mgr._throttle_now = [1000.0]

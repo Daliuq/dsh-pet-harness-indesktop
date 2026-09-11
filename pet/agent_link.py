@@ -2161,10 +2161,10 @@ class AgentLinkManager(QObject):
                 break
             if worker is not threading.current_thread() and worker.is_alive():
                 worker.join(remaining)
-        # 停掉 manager 自带的全部单发定时器（完成确认/429 收起/LLM 错误收起）：
+        # 停掉 manager 自带的全部单发定时器（完成确认/模型访问失败收起/LLM 错误收起）：
         # 下方会把 Python 持有的 manager 过继给 QApplication，对象将存活到进程
         # 退出——若不停表，滞留定时器会在后续无关时刻触发槽函数。
-        for timer_dict in (self._done_pending, self._429_timers, self._llm_error_timers):
+        for timer_dict in (self._done_pending, self._model_access_timers, self._llm_error_timers):
             for timer in timer_dict.values():
                 try:
                     timer.stop()
@@ -4138,8 +4138,6 @@ class AgentLinkManager(QObject):
 
         error_code = str(payload.get("errorCode") or "").strip().upper()
         error_message = str(payload.get("errorMessage") or payload.get("errorText") or "").lower()
-        retry_exhausted = bool(payload.get("retryExhausted"))
-        source = str(payload.get("source") or "").strip()
 
         MODEL_ACCESS_ERROR_CODES = {
             "429",
@@ -4152,7 +4150,6 @@ class AgentLinkManager(QObject):
                 error_code in MODEL_ACCESS_ERROR_CODES
                 or "429" in error_message
                 or "rate limit" in error_message
-                or (retry_exhausted and source != "tool" and not error_code)
         )
 
         if active_model_access and not active_model_access.get("_dismissed") and is_model_access_failure:

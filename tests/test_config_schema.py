@@ -50,7 +50,7 @@ RELOAD_WHITELIST_SNAPSHOT = frozenset({
     "idle_low_fps_enabled", "idle_low_fps_threshold", "lock_position",
     "dialogue_mode", "dialogue_phrases",
     "animation_prewarm_enabled",
-    "dialogue_last_scope",
+    "dialogue_mode", "dialogue_phrases", "dialogue_last_scope",
     "menu_easter_egg", "media_prewarm", "first_frame_cache_max_mb", "predict_prewarm_lead_ms", "ffmpeg_recycle_minutes",
     "modern_chat_background", "modern_chat_background_fill",
     "modern_chat_background_opacity", "modern_chat_card_opacity", "mouse_through",

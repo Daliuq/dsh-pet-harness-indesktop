@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import weakref
 
 from PySide6.QtCore import QObject, Signal
 
@@ -31,6 +32,12 @@ from .agent_link import AgentLinkManager
 from .proactive import ProactiveScreenWatcher
 
 log = logging.getLogger("dsh-pet-standalone")
+
+# 存活共享子系统注册表（测试收口用，与 agent_link._LIVE_* 同纪律）。共享
+# proactive 的 QTimer / bridge 在多窗代理下 parent 为 None，其 timeout/frame
+# 连接从 Qt C++ 侧强引用住 shell 对象图，Python gc 回收不掉，解释器退出 GC
+# 才最终化 → 原生访问违规。WeakSet 只弱引用子系统本身。
+_LIVE_SHARED_SUBSYSTEMS: "weakref.WeakSet[SharedSubsystems]" = weakref.WeakSet()
 
 
 class MultiWindowProxy:
@@ -57,9 +64,98 @@ class MultiWindowProxy:
 
     # ---- 呈现扇出（只发给可见窗）----
     def show_bubble(self, text: str, duration_ms: int = 4500) -> None:
+        # 联动气泡只发首个可见窗（与 show_alert 同策）：多窗同弹一条过程汇报
+        # 既吵又重复，单窗展示即可；隐藏窗不弹的语义保持不变。
         for w in self._visible_windows():
             if hasattr(w, "show_bubble"):
                 w.show_bubble(text, duration_ms=duration_ms)
+                return
+
+    # ---- 提醒扇出（交互式提醒：审批/问题/控制级 Watchdog）----
+    def show_alert(self, text: str, *, subtitle: str = "", duration_ms: int = 0,
+                   buttons: list | None = None, sticky: bool = True,
+                   alert_id: str = "", priority: int = 3,
+                   alert_type: str = "watchdog", metadata: dict | None = None) -> None:
+        """把交互式提醒入队到**首个可见窗**（多窗只弹一处，避免每只桌宠重复轰炸）。
+
+        ``agent_link`` 会先 ``hasattr(win, "show_alert")`` 决定是否走队列提醒；本方法
+        确保共享 manager 的 ``win`` 是 proxy 时仍走交互式提醒（审批/控制按钮不丢失）。
+        首个可见窗缺失 ``show_alert`` 时回退 ``show_bubble``（绝不因签名差异崩溃）。
+        收起仍由 ``resolve_alert`` 全窗扇出兜底。
+        """
+        for w in self._visible_windows():
+            method = getattr(w, "show_alert", None)
+            if callable(method):
+                method(text, subtitle=subtitle, duration_ms=duration_ms,
+                       buttons=buttons, sticky=sticky, alert_id=alert_id,
+                       priority=priority, alert_type=alert_type, metadata=metadata)
+                return
+        # 可见窗都不支持 show_alert：退化到首个可见窗的 show_bubble
+        for w in self._visible_windows():
+            if hasattr(w, "show_bubble"):
+                try:
+                    w.show_bubble(text, sticky=sticky, buttons=buttons,
+                                  duration_ms=duration_ms if not sticky else 0)
+                except TypeError:
+                    w.show_bubble(text, duration_ms=max(duration_ms, 4500))
+                return
+
+    def resolve_alert(self, alert_id: str) -> None:
+        """按 alert_id 在所有窗收起该提醒（含隐藏窗）：任意窗点按钮即全局收起。
+
+        ``agent_link`` 的按钮回调/审批回写都经 ``self.win.resolve_alert`` 关闭气泡；
+        扇出到全部窗，保证一个窗上点按钮/忽略后，其它窗上的同款气泡一并收起。
+        """
+        if not alert_id:
+            return
+        for w in self._windows():
+            method = getattr(w, "resolve_alert", None)
+            if callable(method):
+                method(alert_id)
+            elif hasattr(w, "hide_bubble"):
+                w.hide_bubble()
+
+    def clear_alerts(self) -> None:
+        """清空所有窗的提醒队列并关闭当前提醒（DSH 离线/重启收口）。"""
+        for w in self._windows():
+            method = getattr(w, "clear_alerts", None)
+            if callable(method):
+                method()
+
+    def hide_bubble(self) -> None:
+        """主动收起所有窗当前气泡（审批结束/离线兜底）。"""
+        for w in self._windows():
+            method = getattr(w, "hide_bubble", None)
+            if callable(method):
+                method()
+
+    @property
+    def _bubble_suppressed(self) -> bool:
+        # 设置窗抑制的聚合视图：任一窗打开设置窗即视为全局抑制。共享 manager 的
+        # N2-a 节流门禁 ``getattr(self.win, "_bubble_suppressed", False)`` 据此读到
+        # True，避免单窗设置期间共享管理器继续弹提醒/白占节流槽。
+        return any(getattr(w, "_bubble_suppressed", False) for w in self._windows())
+
+    @property
+    def _sticky_bubble_active(self) -> bool:
+        # 任一窗仍有常驻粘滞气泡（审批/控制提醒）时记为 True，供
+        # ``dismiss_all_interactions`` 的提前返回判定使用（避免漏清理）。
+        return any(getattr(w, "_sticky_bubble_active", False) for w in self._windows())
+
+    @property
+    def _alert_current(self):
+        # 任一见窗当前正在展示提醒时返回该提醒，否则 None（_show_link_bubble 据此
+        # 让联动气泡让路，避免在提醒/审批展示期间被普通联动气泡覆盖）。
+        for w in self._windows():
+            cur = getattr(w, "_alert_current", None)
+            if cur is not None:
+                return cur
+        return None
+
+    @property
+    def _alert_queue(self) -> bool:
+        # 聚合视图：任一窗提醒队列非空即视为激活（_show_link_bubble 据此让路）。
+        return any(getattr(w, "_alert_queue", None) for w in self._windows())
 
     def request_link_anim(self, name: str) -> None:
         for w in self._visible_windows():
@@ -173,8 +269,14 @@ class SharedAgentLinkManager(AgentLinkManager):
         pass
 
     def shutdown(self) -> None:
-        # 单窗关闭/切换角色不动共享监视器；全部退出由 stop_all() 收口
-        pass
+        # 单窗关闭/切换角色不动共享监视器；全部退出由 stop_all() 收口。
+        # 但基类的「过继给 QApplication」GC 安全收口必须继承：多窗代理 parent
+        # 为 None 时 C++ 对象为 Python 持有，wrapper 经信号连接/闭包成环只能等
+        # 循环 GC，跨线程析构带 QTimer/信号连接的 QObject 会腐化 Qt 事件队列
+        # （interpreter 退出 access violation，见 AgentLinkManager 注释）。
+        # 这里只接管生命周期、不关停监视器——嘲笑/直连测试退出时（conftest
+        # _shutdown_live_for_tests 每测收口路径）同样要走该收口。
+        AgentLinkManager._adopt_to_app_for_gc(self)
 
     def stop_all(self) -> None:
         """进程级收口：幂等，只真正关停监视器一次。"""
@@ -230,7 +332,6 @@ class SharedFullscreenWatcher(QObject):
         self._thread: threading.Thread | None = None
         self._fs_last = False
         self._fs_polls = 0
-
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -322,11 +423,57 @@ class SharedSubsystems:
         self.fs = SharedFullscreenWatcher(shell)
         self.fs.fullscreen_changed.connect(shell._on_shared_fullscreen)
         self.fs.cursor_visibility_changed.connect(shell._on_shared_cursor)
+        _LIVE_SHARED_SUBSYSTEMS.add(self)
 
     def start(self) -> None:
         self.fs.start()
 
     def stop_all(self) -> None:
+        """进程级收口：停共享定时器/探测线程 + 释放 Qt 生命周期引用。
+
+        生产路径由 ``AppShell._on_about_to_quit`` 在「全部退出」时调用；测试
+        （conftest ``_close_qt_top_level_widgets`` → ``_shutdown_live_for_tests``）
+        亦经本方法收口。除停表外还必须把 parent 为 None 的 Qt 对象过继给
+        QApplication：否则 Qt C++ 侧连接强引用住整个对象图，Python gc 回收
+        不掉，解释器退出 GC 才最终化 → 原生访问违规（见 _LIVE_SHARED_SUBSYSTEMS
+        注释）。
+        """
         self.proactive.stop_all()
         self.agent_link.stop_all()
         self.fs.stop()
+        _release_qt_lifetimes(self)
+
+    @classmethod
+    def _shutdown_live_for_tests(cls) -> None:
+        """收口未由测试显式 stop 的共享子系统（对齐 agent_link 同族防线）。"""
+        for subs in tuple(_LIVE_SHARED_SUBSYSTEMS):
+            try:
+                subs.stop_all()
+            except Exception:
+                log.debug("测试收口共享子系统失败", exc_info=True)
+
+
+def _release_qt_lifetimes(subs: "SharedSubsystems") -> None:
+    """把共享子系统里 parent 为 None 的 Qt 对象过继给 QApplication。
+
+    仅接管 Python/C++ 生命周期，不改变业务状态（与
+    ``AgentLinkManager._adopt_to_app_for_gc`` 同治）。多窗代理下这些对象的
+    parent 是伪装成窗口的 ``MultiWindowProxy``（无 ``winId``），构造时退化为
+    None；其 ``timeout`` / ``frame_ready`` 连接从 Qt C++ 侧强引用住 shell
+    对象图，Python gc 回收不掉。过继给与进程同寿的 QApplication 后，wrapper
+    在任何线程被回收都只是空壳析构，不会跨线程删除带 QTimer/信号连接的
+    QObject（interpreter 退出 access violation 根因）。
+    """
+    try:
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance()
+        if app is None:
+            return
+        for obj in (subs.proactive._bridge, subs.proactive._timer, subs.fs):
+            try:
+                if obj.parent() is None and obj.thread() is app.thread():
+                    obj.setParent(app)
+            except RuntimeError:
+                pass
+    except Exception:
+        log.debug("共享子系统 Qt 生命周期过继失败", exc_info=True)

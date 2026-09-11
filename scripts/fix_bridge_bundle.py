@@ -25,28 +25,59 @@ import sys
 REQUIRED_SMOKE = "verify_import.mjs"
 
 
+def find_dist_bridge(app_dir: str) -> "str | None":
+    """定位产物里的 bridge 目录。
+
+    PyInstaller 的产物布局随平台不同：Windows/Linux 的 onedir 把数据放在
+    ``<app>/_internal/``，macOS 的 ``.app`` 放在 ``Contents/Resources/``
+    （部分版本在 ``Contents/Frameworks/``）。早期实现硬编码 ``_internal/``，
+    导致 macOS 构建在「dist bridge missing」处失败。
+    """
+    candidates = (
+        os.path.join(app_dir, "_internal", "integrations", "dsh-pet-bridge"),
+        os.path.join(app_dir, "Contents", "Resources", "integrations", "dsh-pet-bridge"),
+        os.path.join(app_dir, "Contents", "Frameworks", "integrations", "dsh-pet-bridge"),
+        os.path.join(app_dir, "integrations", "dsh-pet-bridge"),
+    )
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    # 兜底：按目录名搜索，兼容未来 PyInstaller 的布局变化
+    for root, _dirs, _files in os.walk(app_dir):
+        if (os.path.basename(root) == "dsh-pet-bridge"
+                and os.path.basename(os.path.dirname(root)) == "integrations"):
+            return root
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--app-dir", required=True,
-                    help="onedir 输出目录（应包含 _internal/integrations/dsh-pet-bridge）")
+                    help="onedir/.app 输出目录（内含 integrations/dsh-pet-bridge）")
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src_bridge = os.path.join(root, "integrations", "dsh-pet-bridge")
-    dst_bridge = os.path.join(args.app_dir, "_internal", "integrations", "dsh-pet-bridge")
-
-    if not os.path.isdir(dst_bridge):
-        print(f"[bridge] dist bridge missing: {dst_bridge}", file=sys.stderr)
-        return 1
 
     src_nm = os.path.join(src_bridge, "node_modules")
-    dst_nm = os.path.join(dst_bridge, "node_modules")
 
     if not os.path.isdir(src_nm):
-        print(f"[bridge] source node_modules missing: {src_nm} - "
-              f"run `pnpm install --frozen-lockfile` in integrations/dsh-pet-bridge first",
-              file=sys.stderr)
+        # 构建环境没有本地 node_modules（CI 首次 checkout / tag 构建）：
+        # 此时没有任何 pnpm junction 需要展开，bundle 里也不会带上 node_modules，
+        # 与 build_onedir.ps1「无 node_modules 时只做声明+lockfile 校验，
+        # 由运行时 install_bridge 用 pnpm 落盘」的既有设计一致——构建继续，
+        # 不能因为「没有可修复的东西」而失败。该判断先于布局探查，避免 CI
+        # 在无 node_modules 时仍被平台布局差异拖挂。
+        print("[bridge] source node_modules absent - skip bundle repair "
+              "(declaration check only; install_bridge resolves via pnpm at runtime)")
+        return 0
+
+    dst_bridge = find_dist_bridge(args.app_dir)
+    if dst_bridge is None:
+        print(f"[bridge] dist bridge missing under: {args.app_dir}", file=sys.stderr)
         return 1
+
+    dst_nm = os.path.join(dst_bridge, "node_modules")
 
     # 删除 PyInstaller 复制出的（可能损坏的）node_modules：它可能是普通目录、
     # junction 或指向源路径的符号链接。

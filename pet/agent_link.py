@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import shutil  # compatibility namespace for existing integrations/tests
 import subprocess
@@ -33,15 +34,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 from PySide6.QtWidgets import QMessageBox
 
 from .click_sound import play_sound, resolve_builtin_sound
+from .report_gates import should_report, should_report_event
 from .agent_event_protocol import parse_agent_event
 from .agent_event_normalizer import normalize_event
 from .agent_event_runtime import AgentEventRuntime
-from .rate_limit_tracker import RateLimitTracker
+from .model_access_tracker import ModelAccessTracker
 from .node_runtime import augmented_path as _augmented_path
+from .node_runtime import global_node_modules_roots
 
 from .persona_phrases import PhrasePicker
 from .persona_template import CONDITIONAL_PARAMETERS
@@ -51,6 +54,17 @@ log = logging.getLogger("dsh-pet-standalone")
 
 _LIVE_AGENT_LINK_MANAGERS: weakref.WeakSet = weakref.WeakSet()
 _LIVE_AGENT_MONITORS: weakref.WeakSet = weakref.WeakSet()
+
+# DSH 桥接事件名（_poll 按名字直通处理的；语义层/状态机未建模也计入），
+# 供「未知事件 → 提醒更新/重装 bridge」识别：事件名在语义层（normalize_event）、
+# 状态机（normalize_event_state）与本名单全部不命中才算未知。
+# 新增 _poll 的 event 直通分支必须同步本名单，否则该事件会被误判为桥接未知事件。
+_RAW_BRIDGE_KNOWN_EVENTS: frozenset[str] = frozenset({
+    "approval/request", "approval/requested", "approval/decided", "approval/resolved",
+    "question/requested", "question/resolved",
+    "cordis/request-run", "cordis/request-run-resolved",
+    "execution/failed", "model_access", "llm_error", "user_action",
+})
 
 
 def _which(name: str) -> str | None:
@@ -71,6 +85,9 @@ def _which(name: str) -> str | None:
 #   node <pnpm CLI> add|remove <pkg>   —— 数组传参，不经任何 cmd 中转；
 # 并自行维护 profile 的 dsh.profile.bundles 层（等价于 dsh plugin add 的
 # reconcile 产物）。安装产物与 dsh 版本无关，EAC 桌面端 / 原生 CLI 均可加载。
+#
+# pnpm 入口的定位见 _find_pnpm_cli：npm 全局安装、nvm / nvm-windows 版本目录、
+# pnpm ≤10 的 pnpm.cjs、包装脚本、独立 pnpm.exe 都要认（issue：桌宠找不到 pnpm）。
 
 DSH_PLUGIN_NAME = "@dsh-pet/bridge"
 DSH_PROFILE_HOME = Path(os.environ.get("DSH_HOME", str(Path.home() / ".dsh")))
@@ -96,40 +113,236 @@ def _real_profiles() -> list[Path]:
     )
 
 
+# pnpm / npm 的 JS 入口在包内的相对路径：不同版本/安装方式各不相同
+# （pnpm 10 及以前是 bin/pnpm.cjs，pnpm 11 起是 bin/pnpm.mjs）。
+_JS_CLI_NAMES: dict[str, tuple[str, ...]] = {
+    "pnpm": ("pnpm.mjs", "pnpm.cjs", "pnpm.js"),
+    "npm": ("npm-cli.js", "npm-cli.cjs", "npm-cli.mjs"),
+}
+_JS_CLI_SUFFIXES = {".js", ".cjs", ".mjs"}
+# 包管理器生成的包装脚本（Windows 的 .cmd/.ps1、POSIX 的无扩展名 shell 脚本）
+_SHIM_NAMES: dict[str, tuple[str, ...]] = {
+    "pnpm": ("pnpm.cmd", "pnpm.exe", "pnpm.bat", "pnpm.ps1", "pnpm"),
+    "npm": ("npm.cmd", "npm.exe", "npm.bat", "npm.ps1", "npm"),
+}
+_PNPM_MISSING_HINT = (
+    "需要 pnpm，自动安装失败。可手动运行 npm install -g pnpm，"
+    "或用环境变量 DSH_PNPM_BIN 指定 pnpm 的可执行文件 / JS 入口路径"
+)
+
+
+def _is_js_cli(path: Path) -> bool:
+    return path.suffix.lower() in _JS_CLI_SUFFIXES
+
+
+def _is_direct_cli(path: Path) -> bool:
+    """能脱离 node 直接执行的入口（独立 pnpm.exe、.cmd/.ps1、POSIX shell 脚本）。"""
+    suffix = path.suffix.lower()
+    return not suffix or suffix in {".exe", ".cmd", ".bat", ".ps1"}
+
+
+def _dedupe_paths(paths) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _js_cli_candidates(root: Path, package: str) -> list[Path]:
+    """某个根目录下 JS 入口的所有已知落点。
+
+    root 可能是 node 安装根（`.../v18.20.5`、`.../v18.20.5/bin`、nodejs 安装目录），
+    也可能是全局 `node_modules` 根——两种都要覆盖，POSIX（nvm/lib/node_modules）
+    与 Windows（nvm-windows/AppData）布局才都不会漏。
+    """
+    names = _JS_CLI_NAMES.get(package, ())
+    subdirs = (
+        ("node_modules", package, "bin"),
+        ("lib", "node_modules", package, "bin"),
+        ("node_modules", package, "dist"),
+        ("lib", "node_modules", package, "dist"),
+        (package, "bin"),
+        (package, "dist"),
+    )
+    return [root.joinpath(*sub, name) for sub in subdirs for name in names]
+
+
+def _shim_target(shim: Path, package: str) -> Path | None:
+    """从包装脚本正文里抠出真正的 JS 入口。
+
+    npm/pnpm 生成的 `.cmd`/`.ps1`/shell 包装都写着真实入口的相对路径
+    （`"%dp0%\\node_modules\\pnpm\\bin\\pnpm.mjs"`、`$basedir/../lib/...`），
+    按固定布局硬猜会漏（issue：nvm 用户只能改源码）。
+    """
+    try:
+        text = shim.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    pattern = re.compile(
+        r"""["']([^"'\r\n]*[/\\]%s(?:-cli)?\.(?:mjs|cjs|js))["']""" % re.escape(package)
+    )
+    for raw in pattern.findall(text):
+        token = raw.strip()
+        relative = False
+        for prefix in ("%~dp0", "%dp0%", "$basedir", "${basedir}"):
+            if token.lower().startswith(prefix.lower()):
+                token = token[len(prefix):].lstrip("\\/")
+                relative = True
+                break
+        if not token:
+            continue
+        candidate = Path(token)
+        if relative or not candidate.is_absolute():
+            candidate = shim.parent / candidate
+        try:
+            candidate = candidate.resolve()
+        except OSError:
+            pass
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_cli_hint(hint: Path, package: str) -> Path | None:
+    """把 DSH_PNPM_BIN 之类的提示解析成可用入口（文件 / 目录 / 包装脚本）。"""
+    if hint.is_dir():
+        for name in _SHIM_NAMES.get(package, ()):
+            candidate = hint / name
+            if candidate.is_file():
+                target = _shim_target(candidate, package)
+                if target:
+                    return target
+                if _is_js_cli(candidate) or _is_direct_cli(candidate):
+                    return candidate
+        for candidate in _js_cli_candidates(hint, package):
+            if candidate.is_file():
+                return candidate
+        for name in _JS_CLI_NAMES.get(package, ()):
+            candidate = hint / name
+            if candidate.is_file():
+                return candidate
+        return None
+    if not hint.is_file():
+        return None
+    if _is_js_cli(hint):
+        return hint
+    target = _shim_target(hint, package)
+    if target:
+        return target
+    return hint if _is_direct_cli(hint) else None
+
+
+def _package_roots() -> list[Path]:
+    """pnpm / npm / dsh 全局包可能落脚的根目录（版本管理器 + 包管理器）。"""
+    roots: list[Path] = []
+    for name in ("pnpm", "npm", "node"):
+        found = _which(name)
+        if not found:
+            continue
+        path = Path(found)
+        roots.extend([path, path.parent, path.parent.parent])
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        roots.extend([resolved, resolved.parent, resolved.parent.parent])
+    roots.extend(global_node_modules_roots())
+    for var in ("PNPM_HOME", "NVM_SYMLINK", "NVM_HOME", "NVM_DIR", "VOLTA_HOME"):
+        value = (os.environ.get(var) or "").strip()
+        if not value:
+            continue
+        root = Path(value)
+        roots.extend([root, root / "bin"])
+        if var in {"NVM_HOME", "NVM_DIR"}:
+            try:
+                roots.extend(sorted(p for p in root.glob("v*") if p.is_dir()))
+            except OSError:
+                pass
+    return _dedupe_paths(roots)
+
+
 def _find_pnpm_cli() -> str | None:
-    """定位 pnpm 的 JS CLI 入口，不触发安装。"""
-    env = os.environ.get("DSH_PNPM_BIN")
-    if env and Path(env).is_file():
-        return env
-    pnpm = _which("pnpm")
-    if pnpm:
-        resolved = Path(pnpm).resolve()
-        if resolved.is_file() and resolved.suffix.lower() in {".js", ".cjs", ".mjs"}:
+    """定位 pnpm 的 JS CLI 入口，不触发安装。
+
+    覆盖真实世界里互相打架的多种安装方式（issue：只会一种布局就全漏）：
+    1. `DSH_PNPM_BIN` 显式指定（文件 / 目录 / 包装脚本）；
+    2. PATH 上的 pnpm（包装脚本解析出真实 JS 入口；POSIX 软链解析到 .cjs）；
+    3. 各版本管理器 / 包管理器根目录下的 `node_modules|lib/node_modules/pnpm/bin/pnpm.{mjs,cjs,js}`；
+    4. 独立安装的 `pnpm.exe`（无需 node，直接执行）。
+    """
+    hint = (os.environ.get("DSH_PNPM_BIN") or "").strip()
+    if hint:
+        found = _resolve_cli_hint(Path(hint).expanduser(), "pnpm")
+        if found is not None:
+            return str(found)
+
+    roots: list[Path] = []
+    direct_fallbacks: list[Path] = []
+    for name in _SHIM_NAMES["pnpm"]:
+        shim = _which(name)
+        if not shim:
+            continue
+        path = Path(shim)
+        if _is_js_cli(path) and path.is_file():
+            return str(path)
+        target = _shim_target(path, "pnpm")
+        if target:
+            return str(target)
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved != path and _is_js_cli(resolved) and resolved.is_file():
             return str(resolved)
-        for base in (Path(pnpm).parent, resolved.parent):
-            cand = base / "node_modules" / "pnpm" / "bin" / "pnpm.mjs"
-            if cand.is_file():
-                return str(cand)
-    npm = _which("npm")
-    if npm:
-        cand = Path(npm).parent / "node_modules" / "pnpm" / "bin" / "pnpm.mjs"
-        if cand.is_file():
-            return str(cand)
+        if path.is_file():
+            if path.suffix.lower() == ".exe":
+                return str(path)  # 独立安装的 pnpm.exe：自带运行时，不该再拼 node
+            # .cmd/.bat 包装：优先找出它背后真正的 JS 入口（cmd 中转会把含空格
+            # 的参数拆碎），只在实在找不到时兜底直接调它。
+            direct_fallbacks.append(path)
+        roots.extend([path.parent, path.parent.parent, resolved.parent, resolved.parent.parent])
+    roots.extend(_package_roots())
+
+    for root in _dedupe_paths(roots):
+        for candidate in _js_cli_candidates(root, "pnpm"):
+            if candidate.is_file():
+                return str(candidate)
+    if direct_fallbacks:
+        return str(direct_fallbacks[0])
+    for root in _dedupe_paths(roots):
+        for name in _SHIM_NAMES["pnpm"]:
+            candidate = root / name
+            if candidate.is_file() and _is_direct_cli(candidate):
+                return str(candidate)
     return None
 
 
 def _npm_cli() -> str | None:
     """定位 npm 的 JS CLI 入口（由 node 直调，绕开 .cmd 的空格引号坑）。"""
+    roots: list[Path] = []
     npm = _which("npm")
-    if not npm:
-        return None
-    resolved = Path(npm).resolve()
-    if resolved.name == "npm-cli.js" and resolved.is_file():
-        return str(resolved)
-    for base in (Path(npm).parent, resolved.parent):
-        cand = base / "node_modules" / "npm" / "bin" / "npm-cli.js"
-        if cand.is_file():
-            return str(cand)
+    if npm:
+        path = Path(npm)
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved.name in _JS_CLI_NAMES["npm"] and resolved.is_file():
+            return str(resolved)
+        target = _shim_target(path, "npm")
+        if target:
+            return str(target)
+        roots.extend([path.parent, path.parent.parent, resolved.parent])
+    roots.extend(_package_roots())
+    for root in _dedupe_paths(roots):
+        for candidate in _js_cli_candidates(root, "npm"):
+            if candidate.is_file():
+                return str(candidate)
     return None
 
 
@@ -147,6 +360,7 @@ def _pnpm_cli() -> str | None:
             [node, npm_cli, "install", "-g", "pnpm"],
             capture_output=True, text=True, timeout=300, shell=False,
             env={**os.environ, "PATH": _augmented_path()},
+            **_HIDDEN_KWARGS,
         )
     except Exception:
         return None
@@ -155,17 +369,40 @@ def _pnpm_cli() -> str | None:
     return _find_pnpm_cli()
 
 
+def _pnpm_command() -> list[str] | None:
+    """pnpm 的可执行命令前缀（JS 入口经 node 直调；独立可执行直接跑）。
+
+    Windows 上 `.cmd/.bat` 必须经 cmd 启动（与 harness_launcher._wrap_cmd 同款
+    实测结论）；`.exe`（pnpm 独立安装）自带运行时，不能再拼 node。
+    """
+    cli = _pnpm_cli()
+    if not cli:
+        return None
+    path = Path(cli)
+    if _is_js_cli(path):
+        node = _which("node")
+        return [node, str(path)] if node else None
+    suffix = path.suffix.lower()
+    if suffix in {".cmd", ".bat"}:
+        return ["cmd.exe", "/c", str(path)]
+    if suffix == ".ps1":
+        return [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(path),
+        ]
+    return [str(path)]
+
+
 def _run_pnpm(profile_dir: Path, *args: str) -> tuple[int, str]:
     """node 直调 pnpm CLI（数组传参，无 cmd 中转），返回 (返回码, 合并输出)。"""
-    node = _which("node")
-    cli = _pnpm_cli()
-    if not node:
-        return 127, "找不到 node，请先安装 Node.js"
-    if not cli:
-        return 127, "需要 pnpm，自动安装失败，请手动运行: npm install -g pnpm"
+    command = _pnpm_command()
+    if command is None:
+        if _which("node") is None:
+            return 127, "找不到 node，请先安装 Node.js"
+        return 127, _PNPM_MISSING_HINT
     try:
         proc = subprocess.run(
-            [node, cli, *args], capture_output=True, text=True,
+            [*command, *args], capture_output=True, text=True,
             timeout=300, shell=False, cwd=str(profile_dir),
             env={**os.environ, "PATH": _augmented_path()},
             **_HIDDEN_KWARGS,
@@ -547,12 +784,16 @@ class BaseAgentMonitor(QObject):
     execution_failed = Signal(str, object)   # (agent_key, payload)
     # 会话元数据更新（session/meta 事件）：(agent_key, record)
     session_meta = Signal(str, object)
-    # 限流提醒（rate_limit 事件，errorCode=429）：(agent_key, record)
-    rate_limit = Signal(str, object)
-    # LLM API 错误（llm_error 事件，errorCode=PI_AI_ERROR / bad_response_status_code）：(agent_key, record)
+    # 模型访问失败提醒（model_access 事件，errorCode 为服务端限流码）：(agent_key, record)
+    model_access = Signal(str, object)
+    # LLM API 错误（llm_error 事件，errorCode=真实码如 bad_response_status_code，
+    # errorKind=api）：(agent_key, record)
     llm_error = Signal(str, object)
     # 用户介入信号（user_action 事件）：用户 DSH 审批/回答 → 桌宠应关闭对应弹窗
     user_action = Signal(str, object)
+    # 未知桥接事件（DSH 桥接写出的、Pet 全部识别路径都不认识的事件名）：
+    # (agent_key, record) —— Manager 侧据此提醒用户更新/重装 bridge。
+    unknown_bridge_event = Signal(str, object)
 
     def __init__(self, agent_key: str, config_dir: Path, parent=None) -> None:
         super().__init__(parent)
@@ -671,12 +912,12 @@ class BaseAgentMonitor(QObject):
                 return
             mon._destroy_guard_ran = True
         try:
-            conn = getattr(mon, "_destroyed_conn", None)
-            if conn is not None:
-                try:
-                    mon.destroyed.disconnect(conn)
-                except RuntimeError:
-                    pass
+            # 本函数只从 destroyed 信号回调进入（见 __init__/start 的连接），此时
+            # C++ 对象正处于析构中途，再对本信号 disconnect 会触发 PySide6 的
+            # "Failed to disconnect" 告警，并在解释器退出时的 GC 场景下诱发原生
+            # 访问违规（Windows 0xC0000005）。连接由 Qt 在对象析构时自动清理；
+            # 这里只需作废引用以断开 Python 引用环（lambda 捕获 self）。
+            if getattr(mon, "_destroyed_conn", None) is not None:
                 mon._destroyed_conn = None
             mon._worker_stop.set()
             mon._emit_gen = -1
@@ -798,6 +1039,7 @@ class BaseAgentMonitor(QObject):
                     if normalized is not None:
                         self.normalized_event.emit(normalized)
                 except Exception:
+                    normalized = None  # 解析失败视为语义层未识别，防止上一行残留值污染
                     log.debug("统一 AgentEvent 解析失败", exc_info=True)
                 # 原始记录转发（兼容旧消费者）
                 self._emit(self.raw_record, (self.agent_key, data))
@@ -838,15 +1080,29 @@ class BaseAgentMonitor(QObject):
                 # 调试输出：debug/session-shape（仅首次，之后可通过配置关闭）
                 if meta_type == "debug/session-shape":
                     log.info("[dsh-pet-bridge] session shape: %s", json.dumps(data, ensure_ascii=False)[:500])
-                # 限流事件：rate_limit（errorCode=429）→ 信号转发给 Manager 显示提醒
-                if ev == "rate_limit":
-                    self._emit(self.rate_limit, (self.agent_key, data))
-                # LLM API 错误事件：llm_error（errorCode=PI_AI_ERROR）→ 信号转发给 Manager
+                # 模型访问失败事件：model_access（服务端限流/过载码）→ 信号转发给 Manager 显示提醒
+                if ev == "model_access":
+                    self._emit(self.model_access, (self.agent_key, data))
+                # LLM API 错误事件：llm_error（errorCode=真实上游码，errorKind=api）→ 信号转发给 Manager
                 if ev == "llm_error":
                     self._emit(self.llm_error, (self.agent_key, data))
                 # 用户介入信号：user_action（审批决定/回答）→ 关闭对应弹窗
                 if ev == "user_action":
                     self._emit(self.user_action, (self.agent_key, data))
+                # 未知桥接事件：DSH 桥接写出的、Pet 全部识别路径（语义层/状态机/
+                # 直通名单）都不认识的事件名 → 大概率 bridge 与桌宠版本不匹配，
+                # 呈递给 Manager 弹「更新/重装 bridge」提醒。claude/cursor 的
+                # transcript 噪声不算（只查 DSH 监视器）；session/meta 等按
+                # type 字段直通的也不在此列。
+                if (
+                    self.agent_key == "dsh"
+                    and bool(ev)
+                    and normalized is None
+                    and not normalize_event_state(ev, "")
+                    and ev not in _RAW_BRIDGE_KNOWN_EVENTS
+                    and meta_type not in ("session/meta", "debug/session-shape")
+                ):
+                    self._emit(self.unknown_bridge_event, (self.agent_key, data))
                 normalized = normalize_event_state(ev, st)
                 if not normalized:
                     continue  # 不认识的事件类型：忽略，不误报为 working
@@ -967,10 +1223,10 @@ class DshMonitor(BaseAgentMonitor):
         plugin = cls.bundled_plugin_dir()
         if plugin is None:
             return False, "找不到内置桥接插件（integrations/dsh-pet-bridge）"
-        if _which("node") is None:
+        if _which("node") is None and _pnpm_command() is None:
             return False, "找不到 node，请先安装 Node.js（需包含 npm）"
-        if _pnpm_cli() is None:
-            return False, "需要 pnpm，自动安装失败，请手动运行: npm install -g pnpm"
+        if _pnpm_command() is None:
+            return False, _PNPM_MISSING_HINT
 
         profiles = _real_profiles()
         if not profiles:
@@ -1028,7 +1284,7 @@ class DshMonitor(BaseAgentMonitor):
 
         幂等：未安装的 profile 直接视为成功；不再依赖 dsh CLI（同 install_bridge）。
         """
-        if _which("node") is None or _pnpm_cli() is None:
+        if _pnpm_command() is None:
             return True  # 没有运行环境视为无残留
         ok = True
         for profile in _real_profiles():
@@ -1467,6 +1723,21 @@ def other_instances_use_agent(config, agent_key: str) -> bool:
 
 
 # ----------------------------------------------------------------------
+# 汇报抽稀
+# ----------------------------------------------------------------------
+
+def should_report_activity(probability: float, roll: float) -> bool:
+    """事件汇报概率门判决：``roll`` ∈ [0, 1) 小于通过概率则放行。
+
+    量纲已随概率门统一为 0.0–1.0（旧版是 0-100 百分比）：0 永不汇报、1 全报；
+    边界取「小于」，故 0.6 时 roll=0.6 不汇报。只用于**出气泡的汇报路径**：
+    原始记录（raw_record → 卡住检测 / 行为识别 / 探索看门狗 / 对话记忆）
+    不经过这里。
+    """
+    return should_report(probability, roll)
+
+
+# ----------------------------------------------------------------------
 # Agent 联动总调度管理器
 # ----------------------------------------------------------------------
 
@@ -1486,6 +1757,9 @@ class AgentLinkManager(QObject):
     install_finished = Signal(str, bool, str, int)  # (agent_key, ok, message, install_token)
     # DSH 回写结果（后台线程 emit，队列投递回主线程）：(ok, detail)
     _respond_result = Signal(bool, str)
+    # 探索 Watchdog 控制结果（后台线程 emit，队列投递回主线程）：
+    # (session_key, operation, ok, detail)
+    _exploration_control_result = Signal(str, str, bool, str)
 
     # 联动气泡展示名
     AGENT_NAMES = {"dsh": "DSH", "claude": "Claude Code", "cursor": "Cursor", "opencode": "OpenCode"}
@@ -1508,9 +1782,11 @@ class AgentLinkManager(QObject):
     _BUSY_STATES = ("working", "thinking")
     _DONE_CONFIRM_MS = 800   # busy→idle 稳定确认窗口（过滤 working→idle→working 抖动）
     _DONE_COOLDOWN_S = 5.0   # 同 Agent 完成气泡最小间隔（最后一道保险）
+    _UNKNOWN_BRIDGE_REMIND_COOLDOWN_S = 600.0  # 未知桥接事件提醒：同 agent 10 分钟内最多一次
 
     def __init__(self, window: Any, config: Any, *, min_interval: float = 2.0,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 rng: Callable[[], float] = random.random) -> None:
         super().__init__(window if hasattr(window, "winId") else None)
         self.win = window
         self.cfg = config
@@ -1518,6 +1794,9 @@ class AgentLinkManager(QObject):
         self._shutdown = False
         self._respond_threads: set[threading.Thread] = set()
         self._respond_threads_lock = threading.Lock()
+        # 后台回写/控制 worker 的取消信号：shutdown 时置位，让 30s 阻塞轮询的
+        # 控制 worker 立刻退出，保证 join 在预算内完成、worker 不比 manager 活得久。
+        self._worker_cancel = threading.Event()
         _LIVE_AGENT_LINK_MANAGERS.add(self)
         self._install_token = 0
         self._install_pending: dict[str, int] = {}
@@ -1525,12 +1804,15 @@ class AgentLinkManager(QObject):
         # （Cursor 等 transcript 密集写入时防止动画"抽搐"）
         self._min_interval = float(min_interval)
         self._clock = clock
+        # 汇报抽稀随机源（可注入：测试用确定序列，避免 60% 抽样导致用例不确定）
+        self._rng = rng
         self._last_applied: dict[str, tuple[str, float]] = {}
         # 原始状态流（不受去抖/节流影响）：用于 busy→idle 完成检测。
         # 不能用 _last_applied 做完成判定——节流会丢掉紧跟其后的 idle，导致完成通知丢失。
         self._last_raw: dict[str, str] = {}
         self._done_pending: dict[str, QTimer] = {}   # agent → 稳定确认定时器
         self._done_cooldown: dict[str, float] = {}   # agent → 上次完成气泡时刻
+        self._unknown_bridge_reminded_at: dict[str, float] = {}  # agent → 上次未知桥接事件提醒时刻
         self._saw_alert: set[str] = set()            # busy 周期内出现过 attention/error 的 Agent
         self._saw_error: set[str] = set()            # busy 周期内真正出现过 error 的 Agent
         self._sound_last_at: dict[str, float] = {}
@@ -1549,7 +1831,7 @@ class AgentLinkManager(QObject):
         # 不再依赖「恰好是最后一条记录」的隐式上下文。
         self._last_tool_records: dict[str, dict[str, Any]] = {}
         self._event_runtime = AgentEventRuntime()
-        self._rate_limit_tracker = RateLimitTracker()
+        self._model_access_tracker = ModelAccessTracker()
         # 待处理阻塞型交互：interaction_id → {"agent_key", "kind": "approval"|"question",
         # "text": str, "tool"?: str, "questions"?: list, "rpc_id"?, "approval_id"?,
         # "session_id"?, "alert_id"}。审批 / 用户问题都是「阻塞 Agent 等待用户输入」的
@@ -1627,18 +1909,28 @@ class AgentLinkManager(QObject):
             mon.cordis_resolved.connect(self._on_cordis_resolved)
             mon.execution_failed.connect(self._on_execution_failed)
         self.monitors["dsh"].session_meta.connect(self._on_session_meta)
-        self.monitors["dsh"].rate_limit.connect(self._on_rate_limit)
+        self.monitors["dsh"].model_access.connect(self._on_model_access)
         self.monitors["dsh"].llm_error.connect(self._on_llm_error)
         self.monitors["dsh"].user_action.connect(self._on_user_action)
-        # 429 限流缓存：session_key → { "count": int, "_ts": float, "_first_ts": float, "_dismissed": bool }
-        self._429_cache: dict[str, dict] = {}
-        self._429_timers: dict[str, QTimer] = {}   # session_key → 自动收起定时器
-        self._429_retry_counts: dict[tuple[str, str], int] = {}
-        self._429_anonymous_seq = 0
+        self.monitors["dsh"].unknown_bridge_event.connect(self._on_unknown_bridge_event)
+        # 检测器提醒跨模块节流（N2）：stuck / pattern / exploration watchdog 三个
+        # 检测器各有独立 cooldown，但同一 busy 周期可能先后各自弹窗造成连环换弹。
+        # 按 agent/session 记最近一次**任一**检测器弹窗时刻与档位，窗口内同档
+        # 或更低档的提醒只播动画、不再弹窗（更高档升级放行）。_clock 与其它计时同域。
+        self._detector_alert_at: dict[str, tuple[float, int]] = {}
+        # 模型访问失败提醒缓存：session_key → { "count": int, "_ts": float, "_first_ts": float, "_dismissed": bool }
+        self._model_access_cache: dict[str, dict] = {}
+        self._model_access_timers: dict[str, QTimer] = {}   # session_key → 自动收起定时器
+        self._model_access_retry_counts: dict[tuple[str, str], int] = {}
+        self._model_access_anonymous_seq = 0
         # LLM API 错误缓存：session_key → { "_ts": float, "_dismissed": bool }
         self._llm_error_cache: dict[str, dict] = {}
         self._llm_error_timers: dict[str, QTimer] = {}
         self._respond_result.connect(self._on_respond_result)
+        # 探索 Watchdog 控制请求的「在飞会话」集合：同一会话的重复点击只发一次。
+        # 线程登记复用 _respond_threads（shutdown 统一 join），不另建线程池。
+        self._exploration_control_inflight: set[str] = set()
+        self._exploration_control_result.connect(self._on_exploration_control_result)
         self.install_finished.connect(self._on_install_finished)
         # 联动动作链：一次性动作播完后若仍有 Agent 在忙，由 window 回调取下一个动作
         if hasattr(self.win, "set_link_next_provider"):
@@ -1650,14 +1942,14 @@ class AgentLinkManager(QObject):
         """Consume semantic events for streak tracking and interaction cleanup."""
         from .agent_event_normalizer import InteractionResolvedEvent, RetryEvent
         if isinstance(event, RetryEvent):
-            streak = self._rate_limit_tracker.consume(event)
+            streak = self._model_access_tracker.consume(event)
             if streak:
-                self._429_retry_counts[(event.source, event.session_id)] = int(streak["consecutiveRetryCount"])
+                self._model_access_retry_counts[(event.source, event.session_id)] = int(streak["consecutiveRetryCount"])
             return
         # The tracker resets its streak on successful/lifecycle events.
         if getattr(event, "session_id", ""):
-            self._rate_limit_tracker.consume(event)
-            self._429_retry_counts.pop((event.source, event.session_id), None)
+            self._model_access_tracker.consume(event)
+            self._model_access_retry_counts.pop((event.source, event.session_id), None)
         if not isinstance(event, InteractionResolvedEvent):
             return
         candidates = []
@@ -1684,7 +1976,7 @@ class AgentLinkManager(QObject):
         否则"隐藏期间关配置"不会真正 stop，恢复显示时又会被 resume 拉起。"""
         agent_cfg = self.cfg.get("agent_link", {})
         if not agent_cfg.get("dsh", False):
-            self._clear_429_alerts()
+            self._clear_model_access_alerts()
         for key, monitor in self.monitors.items():
             should_run = bool(agent_cfg.get(key, False))
             if should_run and not monitor._running:
@@ -1755,12 +2047,14 @@ class AgentLinkManager(QObject):
             self.apply_config()
             if hasattr(self.win, "show_bubble"):
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
-                self.win.show_bubble(self._dialogue("bridge.install.success", "DSH 桥接插件已装好，联动开启～", name=name), duration_ms=4000)
+                if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.success"):
+                    self.win.show_bubble(self._dialogue("bridge.install.success", "DSH 桥接插件已装好，联动开启～", name=name), duration_ms=4000)
         else:
             log.warning("DSH 桥接插件安装失败: %s", msg)
             if hasattr(self.win, "show_bubble"):
                 name = self.AGENT_NAMES.get(agent_key, agent_key)
-                self.win.show_bubble(self._dialogue("bridge.install.failed", f"DSH 桥接插件安装失败：{msg}", name=name, detail=msg), duration_ms=6000)
+                if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.failed"):
+                    self.win.show_bubble(self._dialogue("bridge.install.failed", f"DSH 桥接插件安装失败：{msg}", name=name, detail=msg), duration_ms=6000)
 
     def _other_instances_enabled(self, agent_key: str) -> bool:
         """其他多开实例（含默认实例）是否也开着该 Agent 联动。
@@ -1812,7 +2106,8 @@ class AgentLinkManager(QObject):
                 self._install_pending["dsh"] = token
                 if hasattr(self.win, "show_bubble"):
                     name = self.AGENT_NAMES.get(agent_key, agent_key)
-                    self.win.show_bubble(self._dialogue("bridge.install.pending", "正在安装 DSH 桥接插件…", name=name), duration_ms=4000)
+                    if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.install.pending"):
+                        self.win.show_bubble(self._dialogue("bridge.install.pending", "正在安装 DSH 桥接插件…", name=name), duration_ms=4000)
                 import threading
                 threading.Thread(
                     target=self._install_dsh_worker, args=(token,), daemon=True,
@@ -1832,7 +2127,8 @@ class AgentLinkManager(QObject):
                     log.warning("Claude hooks 卸载未完全成功（配置已关闭，hooks 可能残留）")
                     if hasattr(self.win, "show_bubble"):
                         name = self.AGENT_NAMES.get(agent_key, agent_key)
-                        self.win.show_bubble(self._dialogue("bridge.uninstall.failed", "Claude hooks 卸载未完全成功，可手动检查 ~/.claude/settings.json", name=name), duration_ms=6000)
+                        if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.uninstall.failed"):
+                            self.win.show_bubble(self._dialogue("bridge.uninstall.failed", "Claude hooks 卸载未完全成功，可手动检查 ~/.claude/settings.json", name=name), duration_ms=6000)
             elif agent_key == "dsh":
                 if self._other_instances_enabled("dsh"):
                     log.info("其他实例仍在使用 DSH 联动，保留桥接插件")
@@ -1840,7 +2136,8 @@ class AgentLinkManager(QObject):
                     log.warning("DSH 桥接插件卸载未完全成功（配置已关闭，插件可能残留）")
                     if hasattr(self.win, "show_bubble"):
                         name = self.AGENT_NAMES.get(agent_key, agent_key)
-                        self.win.show_bubble(self._dialogue("bridge.uninstall.failed", "DSH 桥接插件卸载未完全成功", name=name), duration_ms=6000)
+                        if self._report_allowed(self.cfg.get("agent_link", {}), "bridge.uninstall.failed"):
+                            self.win.show_bubble(self._dialogue("bridge.uninstall.failed", "DSH 桥接插件卸载未完全成功", name=name), duration_ms=6000)
 
         ag_cfg = dict(self.cfg.get("agent_link", {}))
         ag_cfg[agent_key] = bool(enabled)
@@ -1874,6 +2171,7 @@ class AgentLinkManager(QObject):
     def shutdown(self) -> None:
         """窗口销毁/角色切换时停止所有 monitor worker，且作废安装回调。"""
         self._shutdown = True
+        self._worker_cancel.set()
         self._install_pending.clear()
         self._install_token += 1
         for mon in self.monitors.values():
@@ -1895,6 +2193,41 @@ class AgentLinkManager(QObject):
                 break
             if worker is not threading.current_thread() and worker.is_alive():
                 worker.join(remaining)
+        # 停掉 manager 自带的全部单发定时器（完成确认/模型访问失败收起/LLM 错误收起）：
+        # 下方会把 Python 持有的 manager 过继给 QApplication，对象将存活到进程
+        # 退出——若不停表，滞留定时器会在后续无关时刻触发槽函数。
+        for timer_dict in (self._done_pending, self._model_access_timers, self._llm_error_timers):
+            for timer in timer_dict.values():
+                try:
+                    timer.stop()
+                except RuntimeError:
+                    pass
+            timer_dict.clear()
+        # parent=None（测试桩/多窗代理）时 C++ 对象是 Python 持有的：wrapper 经
+        # 信号连接/闭包成环，只能等循环 GC——而 GC 可能在任意线程（含 monitor
+        # worker 线程）触发，跨线程删除带 QTimer 子对象/信号连接的 QObject 会
+        # 腐化 Qt 事件队列（CI Windows 在 conftest processEvents access
+        # violation、macOS bus error 的根因）。过继给 QApplication（主线程、
+        # 与进程同寿）后，C++ 侧不再随 wrapper 的 GC 删除，wrapper 何时何线程
+        # 回收都只是空壳析构。真窗口场景由父链销毁在先，RuntimeError 兜底跳过。
+        AgentLinkManager._adopt_to_app_for_gc(self)
+
+    @staticmethod
+    def _adopt_to_app_for_gc(obj: "AgentLinkManager") -> None:
+        """把 parent=None（测试桩/多窗代理）的 C++ 对象过继给 QApplication。
+
+        仅接管 Python 侧生命周期，不改变业务状态：过继后 wrapper 在任何线程
+        被循环 GC 回收时，C++ 侧都只是空壳析构，不会跨线程删除带 QTimer
+        子对象/信号连接的 QObject（CI Windows interpreter 退出 access
+        violation、macOS bus error 的根因，见 shutdown 注释）。真窗口场景由
+        父链销毁在先，RuntimeError 兜底跳过。
+        """
+        try:
+            app = QCoreApplication.instance()
+            if obj.parent() is None and app is not None and obj.thread() is app.thread():
+                obj.setParent(app)
+        except RuntimeError:
+            pass
 
     @classmethod
     def _shutdown_live_for_tests(cls) -> None:
@@ -2123,7 +2456,10 @@ class AgentLinkManager(QObject):
     def _session_conditional(self, record: dict) -> dict[str, str]:
         """从记录提取条件会话字段（缺失/为空不注入，渲染端自动隐藏占位符）。
 
-        返回 sessionName（会话显示名）/ projectName（项目名）/ label（会话标签）。
+        返回 sessionName（会话名）/ projectName（项目名）/ label（会话标签），
+        三者语义独立：sessionName 只取会话自己的名字，绝不拼进 projectName
+        （否则 {sessionName} 与 {projectName} 两字段语义重复）。sessionId 存在
+        且记录缺字段时，从会话元数据缓存补齐（只补真实字段，不编造展示串）。
         注意 label 同名双义：activity.*/approval.tool 的 label 是工具标签，
         由调用点显式传入——那些调用点不要用本方法返回值覆盖 label。
         """
@@ -2135,9 +2471,15 @@ class AgentLinkManager(QObject):
                 vals[field] = value
         session_id = str(record.get("sessionId") or "").strip()
         if session_id:
-            session_name = self._session_display_name_or_empty(session_id)
-            if session_name and session_name.strip():
-                vals["sessionName"] = session_name.strip()
+            if "sessionName" not in vals:
+                session_name = self._session_name_or_empty(session_id)
+                if session_name:
+                    vals["sessionName"] = session_name
+            if "projectName" not in vals:
+                meta = self._session_meta_cache.get(session_id) or {}
+                project_name = str(meta.get("projectName") or "").strip()
+                if project_name:
+                    vals["projectName"] = project_name
         return vals
 
     def _thinking_text(self, agent_key: str) -> str:
@@ -2179,11 +2521,23 @@ class AgentLinkManager(QObject):
             name=name,
         )
 
+    def _report_allowed(self, agent_cfg: dict, event_key: str) -> bool:
+        """事件汇报概率门：按事件聚合类别取该类通过概率并抽稀。
+
+        - 门值 ``0.0`` → 该类完全不汇报；``1.0`` → 全部汇报；
+        - 未知事件**不抽稀**（直接放行），新事件上线不会被静默丢弃；
+        - 只作用于**出气泡**这一步：检测器本身与 ``raw_record`` 链路不受影响。
+        """
+        gates = agent_cfg.get("report_gates", {})
+        if not isinstance(gates, dict):
+            gates = {}
+        return should_report_event(gates, event_key, self._rng())
+
     def _maybe_notify_start(self, agent_key: str, prev_raw: str | None, state: str = "working") -> None:
         """开始干活气泡：仅「非 busy → busy」时提示（thinking↔working 互跳不弹）。
         低优先级：气泡位被占时直接丢弃。thinking 状态用更有趣的文案。"""
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_state", False):
+        if not self._report_allowed(agent_cfg, "thinking" if state == "thinking" else "start"):
             return
         if prev_raw in self._BUSY_STATES:
             return
@@ -2205,8 +2559,6 @@ class AgentLinkManager(QObject):
         if callable(mark):
             mark()
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_activity", False):
-            return
         label = self.TOOL_LABELS.get(str(tool).strip().lower(), self._UNKNOWN_TOOL_LABEL)
         now = self._clock()
         last = self._last_activity.get(agent_key)
@@ -2216,6 +2568,12 @@ class AgentLinkManager(QObject):
             if now - last[1] < self._ACTIVITY_MIN_INTERVAL:
                 return
         if now - self._activity_global_last < self._ACTIVITY_GLOBAL_MIN:
+            return
+        # 事件汇报概率门（过程汇报默认 0.6）：只作用在出气泡这一步，且**不记账**——
+        # 抽稀丢弃不更新 _last_activity/_activity_global_last，否则概率会与三重
+        # 节流叠加、把过程汇报过度衰减。raw_record 链路不经过本函数，检测类
+        # 消费者（卡住/行为/探索/对话记忆）不受影响。
+        if not self._report_allowed(agent_cfg, "activity.default"):
             return
         self._last_activity[agent_key] = (label, now)
         self._activity_global_last = now
@@ -2265,7 +2623,7 @@ class AgentLinkManager(QObject):
         气泡文案优先展示被审批命令的完整内容（payload.command，来自 bridge
         的 arguments），让用户不用去 DSH 界面就能看到要批准什么。"""
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_approval", True):
+        if not self._report_allowed(agent_cfg, "approval.command"):
             return
         payload = payload if isinstance(payload, dict) else {}
         # 可关联身份门禁：无 rpcId/approvalId/requestId/callId 一律不弹窗。
@@ -2353,7 +2711,7 @@ class AgentLinkManager(QObject):
         只登记**具备可关联身份**的问题（rpcId 或 callId 任一非空），靠它与
         question/resolved 配对精确关闭；两者皆无的记录无法可靠关闭，直接忽略。"""
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_approval", True):  # 与审批同一开关
+        if not self._report_allowed(agent_cfg, "question.one"):  # 与审批同门（审批与提问类）
             return
         payload = payload if isinstance(payload, dict) else {}
         # 可关联身份门禁：rpcId（mux）或 callId（tool/call 兜底）任一非空才登记。
@@ -2592,7 +2950,7 @@ class AgentLinkManager(QObject):
 
     def dismiss_all_interactions(self) -> None:
         """清空全部待处理阻塞交互并关闭气泡（DSH 离线/重启时交互必然失效）。"""
-        self._clear_429_alerts()
+        self._clear_model_access_alerts()
         if not self._pending_interactions and not getattr(self.win, "_sticky_bubble_active", False):
             return
         self._pending_interactions.clear()
@@ -2801,7 +3159,7 @@ class AgentLinkManager(QObject):
             worker.start()
         except Exception:
             log.exception("DSH 回写线程启动失败")
-            self._show_link_bubble(self._dialogue("dsh.writeback.failed", "回写 DSH 失败，请到 DSH 界面处理"), important=True)
+            self._show_link_bubble(self._dialogue("dsh.writeback.failed", "agent 写回失败，请到 DSH 界面处理"), important=True)
 
     def _post_respond_worker(self, agent_key: str, msg: dict) -> None:
         """后台线程：找在线 DSH 端口并 POST /api/respond，结果经信号回主线程。"""
@@ -2814,7 +3172,10 @@ class AgentLinkManager(QObject):
         except Exception as exc:  # noqa: BLE001 —— 后台线程绝不允许把异常带进 Qt 事件循环
             ok, detail = False, str(exc)
         try:
-            self._respond_result.emit(ok, detail)
+            # shutdown 后不再投递结果：结果气泡已无意义，且此时 manager 可能
+            # 已进入事件循环销毁流程。
+            if not self._shutdown:
+                self._respond_result.emit(ok, detail)
         except Exception:
             pass
         finally:
@@ -2839,7 +3200,7 @@ class AgentLinkManager(QObject):
         log.warning("DSH 回写失败: %s", detail)
         try:
             if hasattr(self.win, "show_bubble") and self.win.isVisible():
-                self.win.show_bubble(self._dialogue("dsh.writeback.failed", "回写 DSH 失败，请到 DSH 界面处理"), duration_ms=4000)
+                self.win.show_bubble(self._dialogue("dsh.writeback.failed", "agent 写回失败，请到 DSH 界面处理"), duration_ms=4000)
         except Exception:
             pass
 
@@ -2875,7 +3236,7 @@ class AgentLinkManager(QObject):
         if agent_key not in self._saw_error:
             self._emit_sound("done", agent_key)
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_done", True):
+        if not self._report_allowed(agent_cfg, "done.success"):
             return
         now = self._clock()
         if now - self._done_cooldown.get(agent_key, 0.0) < self._DONE_COOLDOWN_S:
@@ -2942,7 +3303,11 @@ class AgentLinkManager(QObject):
             # 兼容旧路径：审批等一直挂着的气泡优先
             return
         busy_until = getattr(self.win, "_bubble_busy_until", 0.0)
-        if time.time() < busy_until:
+        # window.hold_bubble 以 time.monotonic() 写入 _bubble_busy_until，这里必须
+        # 用同一时钟域比较——曾误用 time.time()（epoch 秒），在真实桌宠上恒判
+        # "未被占用"，让位/重试门禁失效（普通气泡顶掉识屏占位、重要气泡不排队
+        # 重试直接覆盖）。同步修正于 PR57 合并后审计（F1）。
+        if time.monotonic() < busy_until:
             if not important or _retried >= 4:
                 return
             QTimer.singleShot(2500, self,
@@ -2956,6 +3321,30 @@ class AgentLinkManager(QObject):
     # ------------------------------------------------------------------
     _STUCK_WORRIED_KEYWORDS = ("焦急", "着急", "气急败坏", "抓狂", "拍打", "敲桌", "烦恼", "抓狂")
     _STUCK_REMINDER_MS = 20000   # 建议介入提醒持续 20s（非 sticky，避免与审批/问题常驻气泡冲突）
+    # N2：跨检测器弹窗节流窗口——同 agent/session 30s 内任一检测器弹过窗，
+    # 其余检测器本次只播动画不弹窗（避免 stuck/pattern/watchdog 连环换弹）。
+    _DETECTOR_ALERT_COOLDOWN_S = 30.0
+
+    def _detector_alert_gate(self, scope_key: str, *, level: int = 1) -> bool:
+        """跨检测器弹窗节流：返回 True 表示本次允许弹窗（并记录触发时刻/档位）。
+
+        - 同 scope 窗口内已弹过同档或更高档提醒：本次抑制（避免连环换弹）；
+        - 真正更高档（level 更大）的升级放行并刷新记录，让"情况恶化"的更强提醒
+          能覆盖低档提醒；
+        - 不同 scope（不同 agent/session）互不影响；
+        - 设置窗口打开期间 show_alert 会直接丢弃普通提醒（N2-a）：此时不记账也
+          不放行，避免被丢掉的提醒白占节流槽。
+        """
+        if getattr(self.win, "_bubble_suppressed", False):
+            return False
+        now = self._clock()
+        last = self._detector_alert_at.get(scope_key)
+        if last is not None:
+            last_at, last_level = last
+            if now - last_at < self._DETECTOR_ALERT_COOLDOWN_S and level <= last_level:
+                return False
+        self._detector_alert_at[scope_key] = (now, level)
+        return True
 
     def _pick_stuck_anim(self) -> str | None:
         """从当前角色动作池里按语义挑选「焦急」动画；缺素材静默跳过。"""
@@ -2977,12 +3366,20 @@ class AgentLinkManager(QObject):
             self.win.request_link_anim(anim)
         if severity < 2:
             return  # 档位 1：只播动画，不弹气泡
+        # N2 跨检测器节流：档位 2 属控制级（level=2），比普通 watchdog 提醒高、
+        # 可覆盖低档；但同 scope 已弹过同档提醒（pattern control / 上一次档位 2）
+        # 时由 gate 抑制，避免连环换弹。
+        if not self._detector_alert_gate(agent_key, level=2):
+            return
         # 档位 2：持续提醒（可自定义文案；{name} 占位 = Agent 显示名）
         from .stuck_detector import stuck_reminder_text
         name = self.AGENT_NAMES.get(agent_key, agent_key)
         agent_cfg = self.cfg.get("agent_link", {})
         custom = str((agent_cfg.get("stuck_reminder_text") or "") if isinstance(agent_cfg, dict) else "")
         text = stuck_reminder_text(name, custom)
+        # 事件汇报概率门（检测类）：档位 1 的动画不受影响，只有气泡受门控制。
+        if not self._report_allowed(agent_cfg, "stuck.reminder"):
+            return
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(self._dialogue("stuck.reminder", text, name=name), duration_ms=self._STUCK_REMINDER_MS, sticky=False)
         elif hasattr(self.win, "show_bubble"):
@@ -3044,6 +3441,14 @@ class AgentLinkManager(QObject):
             )
         key = "pattern.control" if verdict in ("STOP", "ASK_USER", "REPLAN") else "pattern.warning"
         text = self._dialogue(key, text, name=name, reasons=reason)
+        # N2 跨检测器节流：pattern control 属控制级（level=2），可覆盖普通
+        # watchdog 提醒；同档重复则被 gate 抑制。
+        if not self._detector_alert_gate(agent_key, level=2):
+            return
+        agent_cfg = self.cfg.get("agent_link", {})
+        # 事件汇报概率门（检测类）：动画照旧，只有气泡受门控制。
+        if not self._report_allowed(agent_cfg, key):
+            return
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(text, duration_ms=self._PATTERN_REMINDER_MS, sticky=False)
         elif hasattr(self.win, "show_bubble"):
@@ -3053,16 +3458,45 @@ class AgentLinkManager(QObject):
     # Agent Exploration Loop Watchdog
     # ------------------------------------------------------------------
     _EXPLORATION_REMINDER_MS = 18000
+    # 控制级提醒常驻（sticky，duration 对 sticky 无效）：用户必须点按钮才结束。
+    _EXPLORATION_CONTROL_PRIORITY = 2
+    # dsh_control.request 最长阻塞 30s；只能在后台线程调用。
+    _EXPLORATION_CONTROL_TIMEOUT_S = 30.0
+    _EXPLORATION_CONTROL_RESULT_MS = 8000
+
+    @staticmethod
+    def _exploration_control_alert_id(session_key: str) -> str:
+        return f"exploration-control:{session_key}"
+
+    @staticmethod
+    def _exploration_control_result_alert_id(session_key: str) -> str:
+        return f"exploration-control-result:{session_key}"
 
     def _on_exploration_warning(self, session_key: str, payload: dict) -> None:
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
-        reasons = self._format_exploration_reasons((payload or {}).get("reasons", []), (payload or {}).get("steps", []))
+        payload = payload if isinstance(payload, dict) else {}
+        is_control = str(payload.get("level") or "warning").strip().lower() == "control"
+        # N2 跨检测器节流：warning 是非升级普通提醒（level=1）；control 属控制级
+        # （level=2），可覆盖 30s 窗口内的普通提醒，同档重复仍被抑制（防连环换弹）。
+        # scope 归一到 agent_key：payload 携带 state 记录的 agent_key，
+        # 缺失时用 session_key 前缀近似（dsh 联动同一会话即同一 agent）。
+        scope_key = str(payload.get("agent_key") or "") or f"session:{session_key}"
+        if not self._detector_alert_gate(scope_key, level=2 if is_control else 1):
+            return
+        reasons = self._format_exploration_reasons(payload.get("reasons", []), payload.get("steps", []))
         name = self._exploration_name(payload, session_key)
+        if is_control:
+            self._show_exploration_control(session_key, payload, name, reasons)
+            return
         text = self._dialogue(
             "watchdog.warning", f"{name} 近期存在重复探索行为：{reasons}，暂不打断运行。",
             name=name, reasons=reasons,
         )
+        agent_cfg = self.cfg.get("agent_link", {})
+        # 事件汇报概率门（检测类）：循环检测提醒按门抽稀。
+        if not self._report_allowed(agent_cfg, "watchdog.warning"):
+            return
         if hasattr(self.win, "show_alert"):
             self._show_alert_compat(text, duration_ms=self._EXPLORATION_REMINDER_MS,
                                 sticky=False, alert_id=f"exploration-warning:{session_key}",
@@ -3073,6 +3507,191 @@ class AgentLinkManager(QObject):
                                           "targets": payload.get("targets", [])})
         elif hasattr(self.win, "show_bubble"):
             self.win.show_bubble(text, duration_ms=self._EXPLORATION_REMINDER_MS)
+
+    def _show_exploration_control(self, session_key: str, payload: dict, name: str, reasons: str) -> None:
+        """控制级告警：常驻气泡 + 可操作按钮（自动优化 / 终止 / 忽略）。"""
+        text = self._dialogue(
+            "watchdog.control",
+            f"{name} 疑似陷入无效探索循环：{reasons}。可以让我自动优化方向，或终止本次运行。",
+            name=name, reasons=reasons,
+        )
+        alert_id = self._exploration_control_alert_id(session_key)
+        # 记进 lifecycle 表：会话结束时连同控制气泡一起收起，避免留下死按钮。
+        self._exploration_alerts[session_key] = alert_id
+        buttons = self._exploration_control_buttons(session_key, payload, alert_id)
+        metadata = {"sessionId": session_key, "riskScore": payload.get("risk", 0),
+                    "riskReasons": payload.get("reasons", []),
+                    "targetCount": payload.get("targetCount", 0),
+                    "targets": payload.get("targets", []),
+                    "goal": payload.get("goal", "")}
+        if hasattr(self.win, "show_alert"):
+            self._show_alert_compat(text, duration_ms=0, sticky=True, buttons=buttons,
+                                    alert_id=alert_id, priority=self._EXPLORATION_CONTROL_PRIORITY,
+                                    alert_type="control", metadata=metadata)
+            return
+        if hasattr(self.win, "show_bubble"):
+            try:
+                self.win.show_bubble(text, sticky=True, buttons=buttons)
+            except TypeError:
+                # 旧桩/旧窗口不支持按钮：退化为限时提醒，绝不因签名差异崩溃。
+                self.win.show_bubble(text, duration_ms=self._EXPLORATION_REMINDER_MS)
+
+    def _exploration_control_buttons(self, session_key: str, payload: dict,
+                                    alert_id: str) -> list[tuple[str, object]]:
+        """控制气泡按钮：replan=自动优化、interrupt=终止、忽略=关闭气泡。"""
+        context = dict(payload or {})
+        return [
+            ("自动优化", lambda sk=session_key, p=context: self._request_exploration_control("replan", sk, p)),
+            ("终止", lambda sk=session_key, p=context: self._request_exploration_control("interrupt", sk, p)),
+            ("忽略", lambda aid=alert_id: self._dismiss_exploration_control(aid)),
+        ]
+
+    def _dismiss_exploration_control(self, alert_id: str) -> None:
+        if hasattr(self.win, "resolve_alert"):
+            self.win.resolve_alert(alert_id)
+        elif hasattr(self.win, "hide_bubble"):
+            self.win.hide_bubble()
+
+    def _request_exploration_control(self, operation: str, session_key: str, payload: dict) -> None:
+        """控制按钮回调（GUI 线程）：收起气泡 + 起后台线程请求桥接，绝不阻塞。"""
+        self._dismiss_exploration_control(self._exploration_control_alert_id(session_key))
+        payload = payload if isinstance(payload, dict) else {}
+        session_id = str(payload.get("session_id") or session_key or "")
+        if not session_id or session_id.startswith("turn:"):
+            self._show_exploration_control_result(session_key, operation, False, "missing-session-id")
+            return
+        with self._respond_threads_lock:
+            if session_id in self._exploration_control_inflight:
+                return
+            self._exploration_control_inflight.add(session_id)
+        try:
+            worker = threading.Thread(
+                target=self._exploration_control_worker,
+                args=(session_key, operation, session_id, dict(payload)),
+                daemon=True,
+            )
+            with self._respond_threads_lock:
+                self._respond_threads.add(worker)
+            worker.start()
+        except Exception:
+            with self._respond_threads_lock:
+                self._exploration_control_inflight.discard(session_id)
+            log.exception("探索控制线程启动失败")
+            self._show_exploration_control_result(session_key, operation, False, "thread-start-failed")
+
+    def _exploration_control_worker(self, session_key: str, operation: str,
+                                    session_id: str, payload: dict) -> None:
+        """后台线程：调用 dsh_control.request（最长阻塞 30s），结果经信号回主线程。"""
+        from . import dsh_control
+        try:
+            ok, detail = dsh_control.request(
+                operation, session_id,
+                goal=str(payload.get("goal") or ""),
+                context=self._exploration_control_context(payload),
+                timeout=self._EXPLORATION_CONTROL_TIMEOUT_S,
+                alert_id=self._exploration_control_alert_id(session_key),
+                cancel=self._worker_cancel,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 后台线程不得把异常带进 Qt 事件循环
+            ok, detail = False, f"control-request-error:{exc}"
+        try:
+            # shutdown 后不再投递结果（manager 可能已进入事件循环销毁流程）。
+            if not self._shutdown:
+                self._exploration_control_result.emit(
+                    session_key, operation, bool(ok), str(detail))
+        except Exception:
+            pass
+        finally:
+            with self._respond_threads_lock:
+                self._exploration_control_inflight.discard(session_id)
+                self._respond_threads.discard(threading.current_thread())
+
+    @staticmethod
+    def _exploration_control_context(payload: dict) -> str:
+        """给桥接诊断器的最小上下文：风险理由 + 近期目标 + 最近步骤行为。"""
+        parts = []
+        reasons = payload.get("reasons") or []
+        if reasons:
+            parts.append("风险理由：" + "；".join(str(item) for item in reasons[:6]))
+        targets = payload.get("targets") or []
+        if targets:
+            parts.append("近期目标：" + "、".join(str(item) for item in targets[:8]))
+        recent = []
+        for step in (payload.get("steps") or [])[-3:]:
+            if isinstance(step, dict):
+                behaviors = "、".join(str(item) for item in (step.get("behaviors") or [])[:6])
+                if behaviors:
+                    recent.append(behaviors)
+        if recent:
+            parts.append("最近步骤行为：" + " / ".join(recent))
+        return "\n".join(parts)[:12000]
+
+    def _on_exploration_control_result(self, session_key: str, operation: str,
+                                       ok: bool, detail: str) -> None:
+        """后台线程信号回主线程：把控制成功/失败结果弹成气泡。"""
+        self._show_exploration_control_result(session_key, operation, ok, detail)
+
+    def _show_exploration_control_result(self, session_key: str, operation: str,
+                                         ok: bool, detail: str) -> None:
+        if not hasattr(self.win, "isVisible") or not self.win.isVisible():
+            return
+        name = self._exploration_names.get(session_key) or self._exploration_name({}, session_key)
+        outcome = self._format_exploration_control_result(operation, ok, detail)
+        text = self._dialogue(
+            "watchdog.control.result", f"{name}：{outcome}", name=name, detail=outcome)
+        alert_id = self._exploration_control_result_alert_id(session_key)
+        if hasattr(self.win, "show_alert"):
+            # alert_type=control-result 在设置窗抑制期间也存活（状态类回执不丢）。
+            self._show_alert_compat(text, duration_ms=self._EXPLORATION_CONTROL_RESULT_MS,
+                                    sticky=False, alert_id=alert_id,
+                                    priority=self._EXPLORATION_CONTROL_PRIORITY,
+                                    alert_type="control-result",
+                                    metadata={"sessionId": session_key})
+        elif hasattr(self.win, "show_bubble"):
+            self.win.show_bubble(text, duration_ms=self._EXPLORATION_CONTROL_RESULT_MS)
+
+    @staticmethod
+    def _format_exploration_control_result(operation: str, ok: bool, detail: str) -> str:
+        """控制回执文案：成功按相位区分，失败按 timeout / not-found / rejected 区分。
+
+        子代理归一：当 bridge 把控制归一到根会话（wasSubagent + appliedToRoot）
+        时，中断即「已终止会话（已作用于主会话并停止其子代理）」；若父级不可解析、
+        只停了子代理（wasSubagent 且非 appliedToRoot），如实说明「主代理仍在运行，
+        可能重新派发」，避免用户误以为整个会话已停。
+        """
+        action = "自动优化" if operation == "replan" else "终止"
+        if ok:
+            parsed: dict = {}
+            try:
+                parsed = json.loads(detail or "{}")
+                if not isinstance(parsed, dict):
+                    parsed = {}
+            except (TypeError, ValueError):
+                parsed = {}
+            phase = str(parsed.get("phase") or "")
+            was_subagent = bool(parsed.get("wasSubagent"))
+            applied_to_root = bool(parsed.get("appliedToRoot"))
+            if phase == "already-idle":
+                return "已经是空闲状态，不需要终止"
+            if operation == "replan":
+                if was_subagent and applied_to_root:
+                    return "已按新方向重新规划（作用于主会话）"
+                return "已按新方向重新规划"
+            if was_subagent:
+                if applied_to_root:
+                    return "已终止会话（已作用于主会话并停止其子代理）"
+                return "已终止子代理（主代理仍在运行，可能重新派发）"
+            return "已终止本次运行"
+        reason = str(detail or "")
+        if reason in {"bridge-control-timeout", "cancel-timeout"}:
+            return f"{action}超时：桥接 30 秒内没有响应"
+        if reason == "session-not-found":
+            return "会话不存在或已经结束，无法执行"
+        if reason == "missing-session-id":
+            return "缺少会话标识，无法执行"
+        if reason in {"", "bridge-control-rejected"}:
+            return "桥接拒绝了本次控制请求"
+        return f"{action}失败：{reason}"
 
 
     def _on_exploration_lifecycle(self, agent_key: str, record: dict) -> None:
@@ -3143,49 +3762,54 @@ class AgentLinkManager(QObject):
         log.debug("session_meta cached: %s → %s", session_id[:12], self._session_meta_cache[session_id])
 
     # ------------------------------------------------------------------
-    # 429 限流提醒
+    # 模型访问失败提醒
     # ------------------------------------------------------------------
-    # alert_id 带 sessionId：多 session 并发 429 时互不顶替。
-    # show_alert 的 duration_ms 对 sticky 项无效，寿命由 _429_timer 自行管理。
-    _429_COOLDOWN_S = 8.0          # 同 session 8 秒内合并为一次
-    _429_DURATION_MS = 15000       # 基础展示 15 秒
-    _429_MAX_LIFETIME_MS = 30000   # 同一 session 从首次触发起最长保留 30 秒
-    _429_PRIORITY = 1              # 高于普通状态气泡和 Watchdog（3）；审批(0)可抢占
+    # alert_id 带 sessionId：多 session 并发模型访问失败时互不顶替。
+    # show_alert 的 duration_ms 对 sticky 项无效，寿命由 _model_access_timer 自行管理。
+    _MODEL_ACCESS_COOLDOWN_S = 8.0          # 同 session 8 秒内合并为一次
+    _MODEL_ACCESS_DURATION_MS = 15000       # 基础展示 15 秒
+    _MODEL_ACCESS_MAX_LIFETIME_MS = 30000   # 同一 session 从首次触发起最长保留 30 秒
+    _MODEL_ACCESS_PRIORITY = 1              # 高于普通状态气泡和 Watchdog（3）；审批(0)可抢占
 
     @staticmethod
-    def _429_alert_id(session_key: str) -> str:
-        return f"429-rate-limit:{session_key}"
+    def _model_access_alert_id(session_key: str) -> str:
+        return f"model-access:{session_key}"
 
-    def _on_rate_limit(self, agent_key: str, record: dict) -> None:
-        """处理 429 限流事件：合并同 session 短时间内连续报错，弹窗提醒。"""
+    def _on_model_access(self, agent_key: str, record: dict) -> None:
+        """处理模型访问失败事件：合并同 session 短时间内连续报错，弹窗提醒。"""
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
         if not isinstance(record, dict):
             return
+        # 汇报概率门放在**记账之前**：被抽稀掉的一次不应写入 _model_access_cache，
+        # 否则「关掉模型访问失败提醒」会连带压掉随后的通用失败横幅（缓存里的活跃
+        # 提醒会触发抑制分支），用户看到的是一类静音把另一类也吞了。
+        if not self._report_allowed(self.cfg.get("agent_link", {}), "model_access.one"):
+            return
         session_id = str(record.get("sessionId") or "")
         if not session_id:
-            self._429_anonymous_seq += 1
-            session_key = f"{agent_key}:anonymous:{self._429_anonymous_seq}"
+            self._model_access_anonymous_seq += 1
+            session_key = f"{agent_key}:anonymous:{self._model_access_anonymous_seq}"
         else:
             session_key = session_id
         now = self._clock()
-        cache = self._429_cache
+        cache = self._model_access_cache
         existing = cache.get(session_key)
         supplied_count = record.get("consecutiveRetryCount")
         if supplied_count is None and session_id:
-            supplied_count = self._429_retry_counts.get((agent_key, session_id), 0)
+            supplied_count = self._model_access_retry_counts.get((agent_key, session_id), 0)
         try:
             supplied_count = int(supplied_count) if supplied_count is not None else 0
         except (TypeError, ValueError):
             supplied_count = 0
-        if existing and now - existing.get("_ts", 0) < self._429_COOLDOWN_S:
+        if existing and now - existing.get("_ts", 0) < self._MODEL_ACCESS_COOLDOWN_S:
             # Prefer the bridge's actual streak; legacy payloads increment locally.
             existing_count = int(existing.get("count", 1) or 1)
             existing["count"] = max(existing_count, supplied_count) if supplied_count else existing_count + 1
             existing["_ts"] = now
             existing["_dismissed"] = False
-            self._remember_429_record_fields(existing, record)
-            self._show_429_alert(session_key, existing["count"])
+            self._remember_model_access_record_fields(existing, record)
+            self._show_model_access_alert(session_key, existing["count"])
             return
         entry = {
             "count": max(1, supplied_count),
@@ -3193,11 +3817,11 @@ class AgentLinkManager(QObject):
             "_first_ts": now,
             "_dismissed": False,
         }
-        self._remember_429_record_fields(entry, record)
+        self._remember_model_access_record_fields(entry, record)
         cache[session_key] = entry
-        self._show_429_alert(session_key, entry["count"])
+        self._show_model_access_alert(session_key, entry["count"])
 
-    def _remember_429_record_fields(self, entry: dict, record: dict) -> None:
+    def _remember_model_access_record_fields(self, entry: dict, record: dict) -> None:
         """把限流记录的条件字段缓存进条目，供弹窗模板条件注入（缺失自动隐藏）。"""
         record = record if isinstance(record, dict) else {}
         for field in ("errorCode", "errorMessage", "consecutiveRetryCount", "retry"):
@@ -3205,21 +3829,21 @@ class AgentLinkManager(QObject):
             if value not in (None, ""):
                 entry[field] = value
 
-    def _show_429_alert(self, session_key: str, count: int) -> None:
-        """展示 429 提醒弹窗，高优先级，带「知道了」按钮，15 秒自动收起。"""
+    def _show_model_access_alert(self, session_key: str, count: int) -> None:
+        """展示模型访问失败提醒弹窗，高优先级，带「知道了」按钮，15 秒自动收起。"""
         fallback = (
-            "DSH 请求受限（429），本次限流未完成；请稍后重试。"
+            "DSH 模型访问失败，本次请求未完成；请稍后重试。"
             if count <= 1 else
-            f"DSH 请求受限（429），已连续限流 {count} 次；请稍后重试。"
+            f"DSH 模型访问失败，已连续 {count} 次；请稍后重试。"
         )
-        key = "rate_limit.many" if count > 1 else "rate_limit.one"
-        entry = self._429_cache.get(session_key) or {}
+        key = "model_access.many" if count > 1 else "model_access.one"
+        entry = self._model_access_cache.get(session_key) or {}
         conditional: dict[str, Any] = {}
         for field in ("errorCode", "errorMessage", "consecutiveRetryCount", "retry"):
             value = entry.get(field)
             if value not in (None, ""):
                 conditional[field] = value
-        session_name = self._session_display_name_or_empty(session_key)
+        session_name = self._session_name_or_empty(session_key)
         if session_name and session_name.strip():
             conditional["sessionName"] = session_name.strip()
         text = self._dialogue(key, fallback, count=count, **conditional)
@@ -3227,48 +3851,48 @@ class AgentLinkManager(QObject):
         # different wording; only an unavailable/empty renderer falls back.
         if not str(text or '').strip():
             text = fallback
-        buttons = [("知道了", lambda sk=session_key: self._dismiss_429_alert(sk))]
+        buttons = [("知道了", lambda sk=session_key: self._dismiss_model_access_alert(sk))]
         if hasattr(self.win, "show_alert"):
             self.win.show_alert(
                 text,
                 duration_ms=0,             # sticky 项忽略 duration，寿命由 timer 管理
                 sticky=True,
                 buttons=buttons,
-                alert_id=self._429_alert_id(session_key),
-                priority=self._429_PRIORITY,
-                alert_type="rate_limit",
+                alert_id=self._model_access_alert_id(session_key),
+                priority=self._MODEL_ACCESS_PRIORITY,
+                alert_type="model_access",
                 metadata={"sessionId": session_key},
             )
         elif hasattr(self.win, "show_bubble"):
-            self.win.show_bubble(text, duration_ms=self._429_DURATION_MS)
+            self.win.show_bubble(text, duration_ms=self._MODEL_ACCESS_DURATION_MS)
         # 自动收起：默认 15s；如被合并刷新，则按「首次触发 + 30s」硬上限收敛。
-        self._schedule_429_dismiss(session_key)
+        self._schedule_model_access_dismiss(session_key)
 
-    def _schedule_429_dismiss(self, session_key: str) -> None:
-        """排定 429 提醒的自动收起时间。
+    def _schedule_model_access_dismiss(self, session_key: str) -> None:
+        """排定模型访问失败提醒的自动收起时间。
 
         优先按最近一次触发 + 15s；但不超过该 session 首次触发 + 30s 硬上限，
         避免合并刷新把弹窗无限续命。无 QTimer 环境（测试桩）时跳过。"""
         if not hasattr(self.win, "_bubble_busy_until"):
             return  # 测试桩无 QTimer 环境：跳过自动收起，由 dismiss 兜底
-        entry = self._429_cache.get(session_key)
+        entry = self._model_access_cache.get(session_key)
         if not entry:
             return
         now = self._clock()
-        cap_remaining = self._429_MAX_LIFETIME_MS / 1000.0 - (now - entry.get("_first_ts", now))
-        base_remaining = self._429_DURATION_MS / 1000.0 - (now - entry.get("_ts", now))
+        cap_remaining = self._MODEL_ACCESS_MAX_LIFETIME_MS / 1000.0 - (now - entry.get("_first_ts", now))
+        base_remaining = self._MODEL_ACCESS_DURATION_MS / 1000.0 - (now - entry.get("_ts", now))
         delay_s = max(0.2, min(base_remaining, cap_remaining))
-        self._cancel_429_timer(session_key)
+        self._cancel_model_access_timer(session_key)
         # win 可能是非 QObject 的测试桩：parent 传 None，定时器由本管理器持有生命周期
         parent = self.win if isinstance(self.win, QObject) else None
         timer = QTimer(parent)
         timer.setSingleShot(True)
-        timer.timeout.connect(lambda sk=session_key: self._dismiss_429_alert(sk))
-        self._429_timers[session_key] = timer
+        timer.timeout.connect(lambda sk=session_key: self._dismiss_model_access_alert(sk))
+        self._model_access_timers[session_key] = timer
         timer.start(int(delay_s * 1000))
 
-    def _cancel_429_timer(self, session_key: str) -> None:
-        timer = self._429_timers.pop(session_key, None)
+    def _cancel_model_access_timer(self, session_key: str) -> None:
+        timer = self._model_access_timers.pop(session_key, None)
         if timer is not None:
             try:
                 timer.stop()
@@ -3276,25 +3900,25 @@ class AgentLinkManager(QObject):
                 pass
             timer.deleteLater()
 
-    def _clear_429_alerts(self) -> None:
-        """清理全部 429 提醒、计数和定时器。"""
-        session_keys = set(self._429_cache) | set(self._429_timers)
-        self._429_cache.clear()
-        self._429_retry_counts.clear()
-        for session_key in list(self._429_timers):
-            self._cancel_429_timer(session_key)
+    def _clear_model_access_alerts(self) -> None:
+        """清理全部模型访问失败提醒、计数和定时器。"""
+        session_keys = set(self._model_access_cache) | set(self._model_access_timers)
+        self._model_access_cache.clear()
+        self._model_access_retry_counts.clear()
+        for session_key in list(self._model_access_timers):
+            self._cancel_model_access_timer(session_key)
         for session_key in session_keys:
             if hasattr(self.win, "resolve_alert"):
-                self.win.resolve_alert(self._429_alert_id(session_key))
+                self.win.resolve_alert(self._model_access_alert_id(session_key))
 
-    def _dismiss_429_alert(self, session_key: str) -> None:
+    def _dismiss_model_access_alert(self, session_key: str) -> None:
         """用户点击「知道了」或超时自动收起：清理缓存并关闭提醒。"""
-        cache = self._429_cache
+        cache = self._model_access_cache
         entry = cache.pop(session_key, None)
         if entry:
             entry["_dismissed"] = True
-        self._cancel_429_timer(session_key)
-        alert_id = self._429_alert_id(session_key)
+        self._cancel_model_access_timer(session_key)
+        alert_id = self._model_access_alert_id(session_key)
         if hasattr(self.win, "resolve_alert"):
             self.win.resolve_alert(alert_id)
 
@@ -3303,7 +3927,11 @@ class AgentLinkManager(QObject):
         return f"llm-error:{session_key}"
 
     def _on_llm_error(self, agent_key: str, record: dict) -> None:
-        """处理 LLM API 错误事件（errorCode=PI_AI_ERROR）：弹窗提醒。"""
+        """处理 LLM API 错误事件（llm_error，errorKind=api）：弹窗提醒。
+
+        errorCode 是上游真实错误码（如 bad_response_status_code），不再替换成
+        分类别名；errorKind 承载分类语义（api=AI 服务错误，非模型访问失败）。
+        """
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
         if not isinstance(record, dict):
@@ -3313,7 +3941,7 @@ class AgentLinkManager(QObject):
         cache = self._llm_error_cache
         # LLM API 错误不合并，每次错误都提醒（但用冷却时间防刷屏）
         existing = cache.get(session_key)
-        if existing and now - existing.get("_ts", 0) < self._429_COOLDOWN_S:
+        if existing and now - existing.get("_ts", 0) < self._MODEL_ACCESS_COOLDOWN_S:
             return  # 冷却期内忽略
         cache[session_key] = {
             "_ts": now,
@@ -3321,6 +3949,7 @@ class AgentLinkManager(QObject):
         }
         error_message = str(record.get("errorMessage") or "AI 服务不可用")
         error_code = str(record.get("errorCode") or "UNKNOWN")
+        error_kind = str(record.get("errorKind") or "api")
         fallback = f"AI 服务错误（{error_code}）：{error_message}"
         key = "llm_error.api"
         text = self._dialogue(key, fallback)
@@ -3332,12 +3961,12 @@ class AgentLinkManager(QObject):
                 sticky=True,
                 buttons=buttons,
                 alert_id=self._llm_error_alert_id(session_key),
-                priority=self._429_PRIORITY,
+                priority=self._MODEL_ACCESS_PRIORITY,
                 alert_type="llm_error",
-                metadata={"sessionId": session_key, "errorCode": error_code},
+                metadata={"sessionId": session_key, "errorCode": error_code, "errorKind": error_kind},
             )
         elif hasattr(self.win, "show_bubble"):
-            self.win.show_bubble(text, duration_ms=self._429_DURATION_MS)
+            self.win.show_bubble(text, duration_ms=self._MODEL_ACCESS_DURATION_MS)
         self._schedule_llm_error_dismiss(session_key)
 
     def _schedule_llm_error_dismiss(self, session_key: str) -> None:
@@ -3347,7 +3976,7 @@ class AgentLinkManager(QObject):
         entry = self._llm_error_cache.get(session_key)
         if not entry:
             return
-        delay_s = self._429_DURATION_MS / 1000.0
+        delay_s = self._MODEL_ACCESS_DURATION_MS / 1000.0
         self._cancel_llm_error_timer(session_key)
         parent = self.win if isinstance(self.win, QObject) else None
         timer = QTimer(parent)
@@ -3405,6 +4034,34 @@ class AgentLinkManager(QObject):
             rpc_id = str(record.get("rpcId") or "")
             self._close_interaction_by_id("question", rpc_id, call_id, session_key)
 
+    def _on_unknown_bridge_event(self, agent_key: str, record: dict) -> None:
+        """DSH 桥接写出的未知事件 → 提醒用户更新/重装 bridge。
+
+        事件名不在 Pet 任何识别路径（语义层 / 状态机 / _poll 直通名单）里，
+        大概率是 bridge 与桌宠版本不匹配写出的新事件。受 bridge 概率门控制
+        （用户可在设置里关掉）；同一 agent 在冷却窗口内只提醒一次——未知
+        事件可能成串到达，逐条弹窗会刷屏。
+        """
+        if not isinstance(record, dict):
+            return
+        if not self._report_allowed(self.cfg.get("agent_link", {}), "bridge.unknown"):
+            return
+        now = self._clock()
+        last = self._unknown_bridge_reminded_at.get(agent_key)
+        if last is not None and now - last < self._UNKNOWN_BRIDGE_REMIND_COOLDOWN_S:
+            return
+        self._unknown_bridge_reminded_at[agent_key] = now
+        name = self.agent_names.get(agent_key, agent_key)
+        event = str(record.get("event") or "").strip()
+        text = self._dialogue(
+            "bridge.unknown",
+            f"检测到未知的桥接事件（{event}），当前桌宠不认识它——"
+            "可能是 bridge 版本过旧，请更新或重装 bridge 插件",
+            name=name,
+            event=event,
+        )
+        self.win.show_bubble(text, duration_ms=6000)
+
     def _close_interaction_by_id(self, kind: str, rpc_id: str, id_: str, session_key: str) -> None:
         """按 kind + identity + session 精确关闭交互弹窗。"""
         for iid, item in self._pending_interactions.items():
@@ -3427,7 +4084,11 @@ class AgentLinkManager(QObject):
                 return
 
     def get_session_display_name(self, session_id: str) -> str:
-        """解析会话的人类可读显示名。
+        """解析会话的人类可读展示名（「projectName · sessionName」组合串）。
+
+        仅用于气泡前缀、探索气泡等**展示**场景；台词模板里的 ``{sessionName}``
+        字段必须走 ``_session_name_or_empty()``（只取会话名），不要用本方法返回值
+        注入，避免 {sessionName} 与 {projectName} 语义重复。
 
         降级链：cache 中的 projectName+sessionName → cache.agentName → 截短 sessionId → 完整 sessionId。
         控制请求（interrupt/replan）仍严格使用 sessionId，此处仅用于展示。
@@ -3448,19 +4109,17 @@ class AgentLinkManager(QObject):
         short_id = session_id[:8] if len(session_id) > 8 else session_id
         return f"DSH · {short_id}"
 
-    def _session_display_name_or_empty(self, session_id: str) -> str:
-        """供台词注入的真实会话显示名。
+    def _session_name_or_empty(self, session_id: str) -> str:
+        """台词注入用会话名：只取会话自己的名字（session/meta 的 sessionName）。
 
-        get_session_display_name() 在没有任何会话元数据时会回退成 id 截短占位
-        （"DSH · <sessionId[:8]>"）——那是兜底展示名，不是「会话显示名」。台词
-        模板的 {sessionName} 只该拿到真实可读名称：落到占位时返回空串，由条件
-        渲染（autohide）隐藏占位符，绝不把 sessionId 冒充会话名露出来。
+        ``get_session_display_name()`` 返回的「projectName · sessionName」组合串
+        是给气泡前缀/探索气泡用的人类可读展示名；台词模板的 ``{sessionName}``
+        字段语义 = 会话名自身，``{projectName}`` 是独立字段——绝不用组合串冒充
+        会话名（否则两字段语义重复，用户在模板里无法单独引用）。无真实会话名时
+        返回空串，由条件渲染（autohide）隐藏占位符，也不把 sessionId 截短占位冒充。
         """
-        display = self.get_session_display_name(session_id)
-        short = session_id[:8] if len(session_id) > 8 else session_id
-        if display == f"DSH · {short}":
-            return ""
-        return display
+        meta = self._session_meta_cache.get(session_id) or {}
+        return str(meta.get("sessionName") or "").strip()
 
     def _exploration_name(self, payload: dict, session_key: str) -> str:
         """返回探索气泡中显示的会话名称，优先使用元数据缓存。"""
@@ -3541,45 +4200,60 @@ class AgentLinkManager(QObject):
     def _on_execution_failed(self, agent_key: str, payload: dict) -> None:
         """硬失败直接提醒：不经行为分析，播失败动画 + 气泡告知本轮运行失败。
 
-        payload 来自 bridge 的 execution/failed（脱敏）：只含 source /
-        retryExhausted / retries / errorCode，不带 400 错误正文。
+        payload 来自 bridge 的 execution/failed（脱敏）：只含 failureType /
+        retryExhausted / retries / errorCode / errorMessage，不带 400 错误正文。
+        failureType 取值（与活动/过程事件的 tool 字段解耦）：
+          - model_retry_exhausted：模型请求链连续重试后仍失败
+          - tool_failed：工具调用最终失败
+        模型访问失败抑制只认真正的模型访问失败（errorCode 属限流类码或消息含限流关键字），
+        重试耗尽失败不并入模型访问失败抑制——那是另一条语义（failure.retry），不重复提醒。
         """
         agent_cfg = self.cfg.get("agent_link", {})
-        if not agent_cfg.get("notify_exec_failed", True):
+        if not self._report_allowed(agent_cfg, "failure.generic"):
             return
         if not hasattr(self.win, "isVisible") or not self.win.isVisible():
             return
         payload = payload if isinstance(payload, dict) else {}
         name = self.AGENT_NAMES.get(agent_key, agent_key)
-        # 若该 session 有活跃的 429 提醒，不再重复弹通用失败横幅（避免双重通知）
+
         session_key = str(payload.get("sessionId") or agent_key)
-        active_429 = self._429_cache.get(session_key)
+        active_model_access = self._model_access_cache.get(session_key)
+
         error_code = str(payload.get("errorCode") or "").strip().upper()
-        error_message = str(payload.get("errorMessage") or payload.get("errorText") or "")
-        rate_limit_codes = {"429", "RATE_LIMIT", "TOO_MANY_REQUESTS", "RESOURCE_EXHAUSTED"}
-        is_rate_limit_failure = error_code in rate_limit_codes or "429" in error_message or "rate limit" in error_message.lower()
-        retry_exhausted = bool(payload.get("retryExhausted"))
-        source = str(payload.get("source") or "").strip()
-        suppress_as_429 = is_rate_limit_failure or (retry_exhausted and source != "tool" and not error_code)
-        if active_429 and not active_429.get("_dismissed") and \
-                self._clock() - active_429.get("_ts", 0) < self._429_COOLDOWN_S and suppress_as_429:
+        error_message = str(payload.get("errorMessage") or payload.get("errorText") or "").lower()
+
+        MODEL_ACCESS_ERROR_CODES = {
+            "429",
+            "RATE_LIMIT",
+            "TOO_MANY_REQUESTS",
+            "RESOURCE_EXHAUSTED",
+        }
+
+        is_model_access_failure = (
+                error_code in MODEL_ACCESS_ERROR_CODES
+                or "429" in error_message
+                or "rate limit" in error_message
+        )
+
+        if active_model_access and not active_model_access.get("_dismissed") and is_model_access_failure:
             return
+
         # 失败动画（若角色素材有）；没有就保持当前动作，仅弹气泡
         anim = self._pick_fail_anim()
         if anim and hasattr(self.win, "request_link_anim"):
             self.win.request_link_anim(anim)
-        source = str(payload.get("source") or "").strip()
+        failure_type = str(payload.get("failureType") or "").strip()
         retry_exhausted = bool(payload.get("retryExhausted"))
         # execution/failed 记录条件字段（缺失不注入，渲染端自动隐藏占位符）
         conditional: dict[str, Any] = {}
-        for field in ("source", "errorCode", "errorMessage", "retries", "retryExhausted"):
+        for field in ("failureType", "errorCode", "errorMessage", "retries", "retryExhausted"):
             value = payload.get(field)
             if value not in (None, ""):
                 conditional[field] = value
         conditional.update(self._session_conditional(payload))
-        if retry_exhausted:
+        if retry_exhausted or failure_type == "model_retry_exhausted":
             text = self._dialogue("failure.retry", f"{name} 本轮运行失败——模型请求多次重试后仍未成功，需要检查或重新运行", name=name, **conditional)
-        elif source == "tool":
+        elif failure_type == "tool_failed":
             text = self._dialogue("failure.tool", f"{name} 本轮运行失败——工具执行最终失败，需要检查或重新运行", name=name, **conditional)
         else:
             text = self._dialogue("failure.generic", f"{name} 本轮运行失败，需要检查或重新运行", name=name, **conditional)

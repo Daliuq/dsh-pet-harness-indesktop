@@ -32,10 +32,62 @@ from pet.agent_link import (
     CustomAgentMonitor,
     DshMonitor,
     normalize_event_state,
+    opencode_event_state,
 )
 from pet.config import Config
 from pet.config import _clean_agent_link_data, _clean_custom_agents
+from pet.report_gates import REPORT_GATE_DEFAULTS
 from pet.speech_bubble import SECTION_HEADER_LABEL, SECTION_HINT_LABEL
+
+
+# 测试门基线：本文件验证「机制」，不隐式依赖产品默认值。
+# 概率门全关（各类汇报需要用例显式开门才该弹），只保留「审批与提问」常开——它
+# 是交互身份/关闭配对用例的前置条件，不属于本文件要验证的汇报抽稀行为。
+# 专门校验产品默认值的用例是 TestAgentLinkManager::test_default_all_disabled，不套本基线。
+_AGENT_GATE_BASELINE = {
+    "state": 0.0,
+    "activity": 0.0,
+    "approval": 1.0,
+    "done": 0.0,
+    "exec_failed": 0.0,
+    "model_access": 0.0,
+    "stuck": 0.0,
+    "bridge": 0.0,
+}
+
+
+def _agent_gates(**overrides) -> dict:
+    """在门基线上按门名覆盖，返回**完整 8 门**字典。
+
+    写全 8 门是刻意的：调用方普遍 `{**cfg.data["agent_link"], **patch}` 浅合并，
+    部分字典会整块替换 report_gates，让未点名的门回落到产品默认（1.0 / activity 0.6），
+    从而破坏基线的不确定性隔离。写全 8 门后每个用例只开自己那一类门。
+    """
+    gates = dict(_AGENT_GATE_BASELINE)
+    gates.update(overrides)
+    return gates
+
+
+@pytest.fixture(autouse=True)
+def _agent_gate_baseline(monkeypatch, request):
+    """把 agent_link 的概率门复位为基线（产品默认值与门语义见 tests/test_report_gates.py）。"""
+    if request.node.name == "test_default_all_disabled":
+        yield
+        return
+    from pet import config as config_module
+
+    real_defaults = config_module._default_agent_link_data
+    monkeypatch.setattr(
+        config_module,
+        "_default_agent_link_data",
+        lambda: {
+            **real_defaults(),
+            "report_gates": dict(_AGENT_GATE_BASELINE),
+            "stuck_detect": False,
+            "pattern_detect": False,
+        },
+    )
+    yield
 
 
 class TestMainlineAgentLinkHardening:
@@ -252,6 +304,13 @@ class TestEventStateNormalization:
 # ============================================================================
 class TestAgentLinkManager:
     def test_default_all_disabled(self, tmp_path):
+        """产品默认的 agent_link 形状：开关全关；汇报控制是**概率门**（非布尔开关）。
+
+        门默认值 = 产品默认（state/done/exec_failed/model_access/stuck/bridge 常开
+        1.0，activity 抽稀到 0.6，approval 常开），键序与 `_default_agent_link_data`
+        一致：custom_agents 之后、stuck_detect 之前。用例名保持不改——文件头 autouse
+        基线夹具按这个确切名字豁免本用例。
+        """
         cfg = Config(base=tmp_path)
         assert cfg.data["agent_link"] == {
             "dsh": False,
@@ -259,11 +318,17 @@ class TestAgentLinkManager:
             "cursor": False,
             "opencode": False,
             "custom_agents": [],
-            "notify_state": False,
-            "notify_done": True,
-            "notify_activity": False,
-            "notify_exec_failed": True,
-            "stuck_detect": False,
+            "report_gates": {
+                "state": 1.0,
+                "activity": 0.6,
+                "approval": 1.0,
+                "done": 1.0,
+                "exec_failed": 1.0,
+                "model_access": 1.0,
+                "stuck": 1.0,
+                "bridge": 1.0,
+            },
+            "stuck_detect": True,
             "stuck_worried_threshold": 3,
             "stuck_intervene_threshold": 5,
             "stuck_window_seconds": 90,
@@ -276,7 +341,7 @@ class TestAgentLinkManager:
             "exploration_watchdog_early_grace_minutes": 5,
             "exploration_watchdog_long_run_minutes": 10,
             "exploration_watchdog_long_think_seconds": 120,
-            "pattern_detect": False,
+            "pattern_detect": True,
             "pattern_w6_control": 3,
             "pattern_w10_warn": 3,
             "pattern_w10_control": 4,
@@ -405,6 +470,11 @@ class TestRealFileTailEndToEnd:
                 return lst[0]
 
         cfg = Config(base=tmp_path)
+        # 本用例验的是「状态 → 桌宠动作 + 完成提醒」的映射，所以显式开 done 门
+        # （基线其它门全关；见文件头 _AGENT_GATE_BASELINE）。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(done=1.0)
+        cfg.set("agent_link", ag)
         win = DummyPetWindow()
         mgr = AgentLinkManager(win, cfg, min_interval=0.0)  # 测试关闭节流，逐个验证状态映射
 
@@ -904,7 +974,7 @@ class TestDshProfileEnumeration:
 # 13. Agent 联动气泡测试（开始干活 / 完成通知 / 冷却 / 抖动 / 占用延后）
 # ============================================================================
 class TestAgentLinkBubbles:
-    def _make_mgr(self, tmp_path, agent_link_cfg=None):
+    def _make_mgr(self, tmp_path, agent_link_cfg=None, gates=None):
         app = QApplication.instance() or QApplication([])
 
         switched = []
@@ -939,6 +1009,12 @@ class TestAgentLinkBubbles:
             data = cfg.data
             data["agent_link"] = {**data.get("agent_link", {}), **agent_link_cfg}
             cfg.save()
+        if gates is not None:
+            # 本类覆盖的是气泡机制（去抖 / 冷却 / 抖动 / 占用），不是门抽稀：
+            # 显式把 state / done 开到 1.0，其余门留在基线 0.0（不隐式继承产品默认）。
+            data = cfg.data
+            data["agent_link"] = {**data.get("agent_link", {}), "report_gates": _agent_gates(**gates)}
+            cfg.save()
 
         clock = [1000.0]
         mgr = AgentLinkManager(win, cfg, min_interval=2.0, clock=lambda: clock[0])
@@ -946,8 +1022,9 @@ class TestAgentLinkBubbles:
 
     def test_working_to_idle_done_bubble(self, tmp_path):
         """1. working→idle 后，mgr._done_pending 里出现 'dsh' 的定时器；
-        手动调 mgr._fire_done('dsh') 后 fake win 的 show_bubble 收到含「干完活啦」的文本。"""
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        手动调 mgr._fire_done('dsh') 后 fake win 的 show_bubble 收到含「干完活啦」的文本。
+        done 门开 1.0（原有断言依赖产品 done 默认常开），state 门保持基线关闭以免混入开始气泡。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 1.0})
         mgr._on_agent_state("dsh", "working")
         assert "dsh" not in mgr._done_pending
 
@@ -957,9 +1034,9 @@ class TestAgentLinkBubbles:
         mgr._fire_done("dsh")
         assert any("已完成本轮任务" in b for b in bubbles)
 
-    def test_notify_done_false_no_bubble(self, tmp_path):
-        """2. 同样流程但 cfg 里 agent_link.notify_done=False → _fire_done 后无气泡。"""
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path, agent_link_cfg={"notify_done": False})
+    def test_done_gate_closed_no_bubble(self, tmp_path):
+        """2. 同样流程但 report_gates.done=0.0 → _fire_done 后无气泡。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 0.0})
         mgr._on_agent_state("dsh", "working")
         mgr._on_agent_state("dsh", "idle")
         assert "dsh" in mgr._done_pending
@@ -967,10 +1044,10 @@ class TestAgentLinkBubbles:
         mgr._fire_done("dsh")
         assert bubbles == []
 
-    def test_notify_state_start_bubble(self, tmp_path):
-        """3. notify_state=True 时，thinking→working 连续两个 busy 状态只弹一次「开始干活啦」
-        （第二次 prev_raw 已是 busy 不弹）；默认 notify_state=False 时不弹。"""
-        # 默认 notify_state=False
+    def test_state_gate_start_bubble(self, tmp_path):
+        """3. report_gates.state=1.0 时，thinking→working 连续两个 busy 状态只弹一次「开始干活啦」
+        （第二次 prev_raw 已是 busy 不弹）；基线 state=0.0 时不弹。"""
+        # 基线 state=0.0
         mgr_off, win_off, bubbles_off, clock_off = self._make_mgr(tmp_path)
         mgr_off._on_agent_state("dsh", "thinking")
         assert bubbles_off == []
@@ -978,8 +1055,10 @@ class TestAgentLinkBubbles:
         mgr_off._on_agent_state("dsh", "working")
         assert bubbles_off == []
 
-        # notify_state=True
-        mgr_on, win_on, bubbles_on, clock_on = self._make_mgr(tmp_path, agent_link_cfg={"notify_state": True})
+        # state 门开到 1.0（确定性放行，无需注入 rng）
+        mgr_on, win_on, bubbles_on, clock_on = self._make_mgr(
+            tmp_path, gates={"state": 1.0}
+        )
         mgr_on._on_agent_state("dsh", "thinking")
         assert len(bubbles_on) == 1
         # legacy 内置预设 thinking 首句（此前为 DSH 专属原文案「大肥鱼正在深度思考」）
@@ -1001,7 +1080,9 @@ class TestAgentLinkBubbles:
     def test_thinking_text_custom_override(self, tmp_path):
         """自定义 thinking 文案：agent_link.thinking_text 非空时优先使用，支持 {name} 占位符。"""
         mgr, win, bubbles, clock = self._make_mgr(
-            tmp_path, agent_link_cfg={"notify_state": True, "thinking_text": "{name} 大脑飞速运转中……"}
+            tmp_path,
+            agent_link_cfg={"thinking_text": "{name} 大脑飞速运转中……"},
+            gates={"state": 1.0},
         )
         mgr._on_agent_state("dsh", "thinking")
         assert len(bubbles) == 1
@@ -1010,7 +1091,7 @@ class TestAgentLinkBubbles:
 
         # 空字符串 → 回退默认（legacy 内置预设 thinking 首句）
         mgr2, win2, bubbles2, _ = self._make_mgr(
-            tmp_path / "b", agent_link_cfg={"notify_state": True, "thinking_text": ""}
+            tmp_path / "b", agent_link_cfg={"thinking_text": ""}, gates={"state": 1.0}
         )
         mgr2._on_agent_state("dsh", "thinking")
         assert "DSH 正在思考" in bubbles2[0]
@@ -1021,7 +1102,7 @@ class TestAgentLinkBubbles:
         ticket 02/05：dialogue_mode=custom + {global, agents} 双层。
         """
         mgr, win, bubbles, clock = self._make_mgr(
-            tmp_path, agent_link_cfg={"notify_state": True}
+            tmp_path, gates={"state": 1.0}
         )
         cfg = mgr.cfg
         cfg.data["dialogue_mode"] = "custom"
@@ -1047,8 +1128,9 @@ class TestAgentLinkBubbles:
 
     def test_jitter_cancel_done_check(self, tmp_path):
         """4. working→idle→working 抖动：idle 后 pending 存在，
-        再来 working 后 pending 被清空（_cancel_done_check 生效），此后 _fire_done 不弹气泡。"""
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        再来 working 后 pending 被清空（_cancel_done_check 生效），此后 _fire_done 不弹气泡。
+        done 门必须开 1.0：否则 _fire_done 会因门关闭提前返回，断言就测不到「busy 短路」。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 1.0})
         mgr._on_agent_state("dsh", "working")
         mgr._on_agent_state("dsh", "idle")
         assert "dsh" in mgr._done_pending
@@ -1063,8 +1145,8 @@ class TestAgentLinkBubbles:
 
     def test_done_cooldown(self, tmp_path):
         """5. 冷却：clock 前进不足 5 秒时第二次 _fire_done 被 _done_cooldown 抑制；
-        前进超过 5 秒后正常弹。"""
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        前进超过 5 秒后正常弹（done 门开 1.0 才能走到冷却判定）。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 1.0})
         mgr._on_agent_state("dsh", "working")
         mgr._on_agent_state("dsh", "idle")
         mgr._fire_done("dsh")
@@ -1089,7 +1171,7 @@ class TestAgentLinkBubbles:
 
     def test_error_during_busy_done_bubble_text(self, tmp_path):
         """6. busy 期间出现 error 再 idle：完成气泡文案含「自己看一眼」而不是「干完活啦」。"""
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 1.0})
         mgr._on_agent_state("dsh", "working")
         clock[0] += 3.0
         mgr._on_agent_state("dsh", "error")
@@ -1105,9 +1187,13 @@ class TestAgentLinkBubbles:
 
     def test_bubble_busy_until_occupancy(self, tmp_path, monkeypatch):
         """7. _show_link_bubble 在 win._bubble_busy_until 为未来时间时：
-        important=False 直接丢弃；important=True 时不立即弹（走 QTimer.singleShot 延后重试，测试里只需断言没有立即调用 show_bubble）。"""
+        important=False 直接丢弃；important=True 时不立即弹（走 QTimer.singleShot 延后重试，测试里只需断言没有立即调用 show_bubble）。
+
+        回归锚点（F1）：hold_bubble 写 time.monotonic() 域（真实 window 行为），
+        _show_link_bubble 必须用同域比较——曾误用 time.time()（epoch 秒）导致
+        门禁恒失效。stub 以 monotonic 未来时刻模拟占用。"""
         mgr, win, bubbles, clock = self._make_mgr(tmp_path)
-        win._bubble_busy_until = time.time() + 100.0
+        win._bubble_busy_until = time.monotonic() + 100.0
 
         # important=False 丢弃
         mgr._show_link_bubble("普通消息", important=False)
@@ -1120,7 +1206,7 @@ class TestAgentLinkBubbles:
     def test_busy_to_attention_counts_as_done(self, tmp_path):
         """8. Claude 风格：working→attention(Stop) 进入完成确认，不弹立即提醒，
         确认后弹完成气泡（因见过 attention 用中性文案）。"""
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 1.0})
         mgr._on_agent_state("claude", "working")
         clock[0] += 3.0
         mgr._on_agent_state("claude", "attention")
@@ -1140,8 +1226,9 @@ class TestAgentLinkBubbles:
 
     def test_done_restores_idle_anim_unless_others_busy(self, tmp_path):
         """10. 完成确认后恢复待机动画（Claude 没有 idle 事件，靠这步回待机）；
-        另有 Agent 在忙时不恢复（避免顶掉对方的工作动画）。"""
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path)
+        另有 Agent 在忙时不恢复（避免顶掉对方的工作动画）。done 门开 1.0：
+        恢复待机发生在门判定之后，门关着就永远走不到。"""
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 1.0})
         mgr._on_agent_state("claude", "working")
         clock[0] += 3.0
         mgr._on_agent_state("claude", "idle")
@@ -1150,7 +1237,7 @@ class TestAgentLinkBubbles:
         assert mgr._last_applied["claude"][0] == "idle"
 
         # 另一 Agent 在忙：不恢复
-        mgr2, win2, bubbles2, clock2 = self._make_mgr(tmp_path)
+        mgr2, win2, bubbles2, clock2 = self._make_mgr(tmp_path, gates={"done": 1.0})
         mgr2._on_agent_state("claude", "working")
         clock2[0] += 3.0
         mgr2._on_agent_state("dsh", "working")
@@ -1159,6 +1246,36 @@ class TestAgentLinkBubbles:
         switched_before = len(win2.switched)
         mgr2._fire_done("claude")
         assert len(win2.switched) == switched_before  # 没有切回待机
+
+    def test_opencode_step_finish_tool_calls_no_done(self, tmp_path):
+        """回归（PR57 合并时丢失的 main 侧用例）：opencode step-finish
+        (reason=tool-calls)（派 task 子代理后主代理停笔等待）不触发完成确认——
+        不产出 idle 状态 → 800ms 确认不排程；step-finish(reason=stop) 才是
+        真结束 → 排程并出完成气泡。产品逻辑（opencode_event_state 的
+        tool-calls→""）仍存在，恢复端到端守卫。"""
+        import json as j
+
+        mgr, win, bubbles, clock = self._make_mgr(tmp_path, gates={"done": 1.0})
+        mgr._on_agent_state("dsh", "working")
+
+        # 子代理长跑期间：tool-calls 维持现状，确认窗口不排程
+        state = opencode_event_state("message.part.updated.1",
+                                     j.dumps({"part": {"type": "step-finish", "reason": "tool-calls"}}))
+        assert state == ""
+        if state:  # 与 agent_link._poll 的空状态跳过逻辑一致
+            mgr._on_agent_state("dsh", state)
+        clock[0] += 3.0
+        assert "dsh" not in mgr._done_pending
+        assert bubbles == []
+
+        # 子代理回注、整轮真结束：stop → idle → 排程 → 完成气泡恰一次
+        state = opencode_event_state("message.part.updated.1",
+                                     j.dumps({"part": {"type": "step-finish", "reason": "stop"}}))
+        assert state == "idle"
+        mgr._on_agent_state("dsh", state)
+        assert "dsh" in mgr._done_pending
+        mgr._fire_done("dsh")
+        assert any("已完成" in b for b in bubbles), f"应弹完成气泡: {bubbles}"
 
 
 class TestAgentLinkSounds:
@@ -1181,7 +1298,14 @@ class TestAgentLinkSounds:
                 pass
 
         cfg = Config(base=tmp_path)
-        cfg.data["agent_link"].update({"sound_enabled": True, **sound_cfg})
+        cfg.data["agent_link"].update({
+            "sound_enabled": True,
+            # 音效本身不经过概率门（_emit_sound 在 _report_allowed 之前），但本类驱动的
+            # 是完整的「开始 → 完成 / 出错」生命周期：把 state/done 开到 1.0，让同一条
+            # 状态流的气泡分支也照常走，避免用例只在半条链路上取证。
+            "report_gates": _agent_gates(state=1.0, done=1.0),
+            **sound_cfg,
+        })
         sound = tmp_path / "sound.wav"
         sound.write_bytes(b"RIFF")
         monkeypatch.setattr(agent_link, "resolve_builtin_sound", lambda _path: sound)
@@ -1281,6 +1405,25 @@ class TestInstallErrorSummary:
         assert json.loads(manifest.read_text(encoding="utf-8"))["dsh"]["profile"]["bundles"] == [
             agent_link.DSH_PLUGIN_NAME
         ]
+
+    def test_find_pnpm_cli_accepts_homebrew_javascript_symlink(self, tmp_path, monkeypatch):
+        """回归（PR57 合并时丢失的 main 侧用例）：homebrew 的 pnpm 是
+        bin/pnpm → lib/node_modules/pnpm/bin/pnpm.cjs 的符号链接，
+        _find_pnpm_cli 必须经 resolve() 落到真实 JS CLI。
+        注：Windows 无管理员权限创建 symlink 会失败（WinError 1314），
+        该用例在 Linux/macOS CI 执行；本地 Windows 跳过。"""
+        try:
+            cli = tmp_path / "lib" / "node_modules" / "pnpm" / "bin" / "pnpm.cjs"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("", encoding="utf-8")
+            shim = tmp_path / "bin" / "pnpm"
+            shim.parent.mkdir()
+            shim.symlink_to(cli)
+        except OSError:
+            pytest.skip("symlink 权限不可用（Windows 无管理员）")
+        monkeypatch.delenv("DSH_PNPM_BIN", raising=False)
+        monkeypatch.setattr(agent_link, "_which", lambda name: str(shim) if name == "pnpm" else None)
+        assert agent_link._find_pnpm_cli() == str(cli)
 
     def test_extract_err_pnpm_line(self):
         output = """
@@ -1392,16 +1535,20 @@ class TestAgentLinkChainingAndActivity:
         assert win.switched == []
 
     def test_activity_reporting(self, tmp_path):
-        """3. 过程汇报：cfg agent_link.notify_activity=True 时 mgr._on_agent_activity('dsh','bash') → 气泡含「正在跑命令」；
+        """3. 过程汇报：report_gates.activity=1.0 时 mgr._on_agent_activity('dsh','bash') → 气泡含「正在跑命令」；
         10 秒内第二次任何工具不弹；同工具 60 秒内不重复（clock 前进 15s 再发 bash 仍不弹；换成 read 则弹「正在读文件」）；
-        全局限流 8s（另一 agent 在 8s 内也不弹）。notify_activity 默认 False 时不弹。未知工具（如 'frobnicate'）弹安全兜底文案。"""
-        # notify_activity 默认 False 时不弹
+        全局限流 8s（另一 agent 在 8s 内也不弹）。activity 门关闭时不弹（本文件基线默认 0.0，
+        见文件头 _AGENT_GATE_BASELINE；产品默认值是 0.6 的过程汇报抽稀）。
+        未知工具（如 'frobnicate'）弹安全兜底文案。"""
+        # activity 门关着（基线 0.0）时不弹
         mgr_off, win_off, bubbles_off, clock_off = self._make_mgr(tmp_path)
         mgr_off._on_agent_activity("dsh", "bash")
         assert bubbles_off == []
 
-        # notify_activity = True
-        mgr, win, bubbles, clock = self._make_mgr(tmp_path, agent_link_cfg={"notify_activity": True})
+        # activity 门开到 1.0（确定性全放行，避免 0.6 抽稀导致断言不确定）
+        mgr, win, bubbles, clock = self._make_mgr(
+            tmp_path, agent_link_cfg={"report_gates": _agent_gates(activity=1.0)}
+        )
 
         # 未知工具弹安全兜底文案，不泄露原始参数
         mgr._on_agent_activity("dsh", "frobnicate")
@@ -1450,7 +1597,7 @@ class TestAgentLinkChainingAndActivity:
         tool/label/command/argsKey/callId/step + 会话字段显式传给模板；
         条件字段缺失时占位符自动隐藏（不原样露出 {target} 等死占位符）。"""
         mgr, win, bubbles, clock = self._make_mgr(
-            tmp_path, agent_link_cfg={"notify_activity": True}
+            tmp_path, agent_link_cfg={"report_gates": _agent_gates(activity=1.0)}
         )
         # 模拟监视器 _poll 的同轮顺序：先 raw_record（工具记录），再 activity 信号
         # 字段以桥接真实写出的 tool/call 为准（tool/argsKey/command/callId/step）。
@@ -1822,12 +1969,15 @@ class TestCustomAgentConfigCleaning:
     def test_clean_agent_link_data_cleans_and_keeps_custom_key_booleans(self):
         cleaned = _clean_agent_link_data({
             "custom_agents": [{"key": "gemini", "name": "Gemini CLI", "path": "~/ev.jsonl"}],
-            "gemini": True,       # 自定义键的开关布尔（set_enabled 写入路径）
-            "notify_done": False,
+            "gemini": True,        # 自定义键的开关布尔（set_enabled 写入路径）
+            "notify_done": False,  # 旧布尔开关：一次性迁移进 done 门，且不再写回旧键
         })
         assert cleaned["custom_agents"] == [{"key": "gemini", "name": "Gemini CLI", "path": "~/ev.jsonl"}]
         assert cleaned["gemini"] is True
-        assert cleaned["notify_done"] is False
+        # 旧开关被弹出（配置形状里不留兼容别名），语义落到概率门上：False → done=0.0；
+        # 其余门取产品默认（activity 抽稀到 0.6），不受旧键迁移影响。
+        assert "notify_done" not in cleaned
+        assert cleaned["report_gates"] == {**REPORT_GATE_DEFAULTS, "done": 0.0}
 
 
 class TestCustomAgentMonitor:
@@ -1987,9 +2137,9 @@ class TestCustomAgentMenu:
             for label in ("DeepSeek Harness (DSH)", "Claude Code", "Cursor", "OpenCode"):
                 assert label in texts
             assert "Gemini CLI" in texts
-            # Agent 联动子菜单不再带「台词风格」入口，仅保留联动相关设置
+            # Agent 联动子菜单不再带「台词风格」「循环检测/卡住检测」入口——
+            # 检测类配置已收敛到设置页（自动化与联动），仅保留联动相关设置
             assert "台词风格" not in texts
-            assert "循环检测" in texts
 
             gemini_act = next(a for a in sub.actions() if a.text() == "Gemini CLI")
             gemini_act.setChecked(True)
@@ -2775,7 +2925,7 @@ class TestInteractionIdentityGate:
 class TestExecutionFailed:
     """execution/failed 不经行为分析直接提醒：失败动画 + 气泡。"""
 
-    def _make_mgr(self, tmp_path, notify_exec_failed=True):
+    def _make_mgr(self, tmp_path, exec_failed=True):
         class FakeWin:
             def __init__(self):
                 self.shown: list[str] = []
@@ -2800,21 +2950,23 @@ class TestExecutionFailed:
 
         cfg = Config(base=tmp_path)
         ag = dict(cfg.get("agent_link", {}))
-        ag["notify_exec_failed"] = notify_exec_failed
+        # 本类只看「硬失败直接提醒」这一条链路：exec_failed 门按参数开/关，
+        # 其余门留在文件头基线（写全 8 门，避免整块替换后回落到产品默认）。
+        ag["report_gates"] = _agent_gates(exec_failed=1.0 if exec_failed else 0.0)
         cfg.set("agent_link", ag)
         mgr = AgentLinkManager(FakeWin(), cfg)
         return mgr
 
     def test_retry_exhausted_shows_reminder(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
-        mgr._on_execution_failed("dsh", {"source": "model_request", "retryExhausted": True, "retries": 4})
+        mgr._on_execution_failed("dsh", {"failureType": "model_retry_exhausted", "retryExhausted": True, "retries": 4})
         assert mgr.win.alerts, "应入队失败提醒"
         assert "重试" in mgr.win.alerts[-1]["text"]  # failure.retry 预设（多次重试后仍未成功）
         assert mgr.win.alerts[-1]["sticky"] is False, "失败提醒是限时气泡（非 sticky）"
 
     def test_tool_failure_shows_reminder(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
-        mgr._on_execution_failed("dsh", {"source": "tool", "retryExhausted": False})
+        mgr._on_execution_failed("dsh", {"failureType": "tool_failed", "retryExhausted": False})
         assert mgr.win.alerts
         assert "工具执行失败" in mgr.win.alerts[-1]["text"]  # failure.tool 预设首句
 
@@ -2831,18 +2983,18 @@ class TestExecutionFailed:
         anim = mgr._pick_fail_anim()
         assert anim == "失败冒烟"
 
-    def test_notify_exec_failed_disabled(self, tmp_path):
-        """notify_exec_failed=False 时不提醒。"""
-        mgr = self._make_mgr(tmp_path, notify_exec_failed=False)
-        mgr._on_execution_failed("dsh", {"source": "model_request", "retryExhausted": True})
+    def test_exec_failed_gate_closed_no_reminder(self, tmp_path):
+        """report_gates.exec_failed=0.0 时不提醒。"""
+        mgr = self._make_mgr(tmp_path, exec_failed=False)
+        mgr._on_execution_failed("dsh", {"failureType": "model_retry_exhausted", "retryExhausted": True})
         assert mgr.win.shown == []
 
 
 
 
 
-class TestRateLimitAlert:
-    """rate_limit 事件 → 高优先级提醒，合并计数，按 session 隔离，可关闭。"""
+class TestModelAccessAlert:
+    """model_access 事件 → 高优先级提醒，合并计数，按 session 隔离，可关闭。"""
 
     def _make_mgr(self, tmp_path):
         class FakeWin:
@@ -2851,7 +3003,7 @@ class TestRateLimitAlert:
                 self.resolved: list[str] = []
                 self.shown: list[str] = []
                 self._visible = True
-                # 有意不提供 _bubble_busy_until：_schedule_429_dismiss 会据 sentinel 跳过 QTimer
+                # 有意不提供 _bubble_busy_until：_schedule_model_access_dismiss 会据 sentinel 跳过 QTimer
 
             def isVisible(self):
                 return self._visible
@@ -2872,51 +3024,93 @@ class TestRateLimitAlert:
                 self.shown.append(str(text))
 
         cfg = Config(base=tmp_path)
+        # model_access 门开 1.0（本类主链路）；exec_failed 也开 1.0——有两个用例
+        # 用模型访问提醒去抑制/不抑制通用失败横幅，exec_failed 关着就测不到抑制分支。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(model_access=1.0, exec_failed=1.0)
+        cfg.set("agent_link", ag)
         mgr = AgentLinkManager(FakeWin(), cfg)
         return mgr
 
-    def test_first_429_shows_reminder(self, tmp_path):
+    def test_first_model_access_shows_reminder(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
-        mgr._on_rate_limit("dsh", {"sessionId": "sess-1"})
-        assert mgr.win.alerts, "应弹出 429 提醒"
+        mgr._on_model_access("dsh", {"sessionId": "sess-1"})
+        assert mgr.win.alerts, "应弹出模型访问失败提醒"
         alert = mgr.win.alerts[-1]
-        assert alert["alert_id"] == "429-rate-limit:sess-1", "alert_id 必须带 sessionId 隔离"
-        # 可见文案走 legacy rate_limit.one 预设（不含 429 字样）；429 语义由 alert_id/alert_type 承载
-        assert "限流" in alert["text"]
-        assert alert["priority"] == mgr._429_PRIORITY and alert["priority"] == 1
+        assert alert["alert_id"] == "model-access:sess-1", "alert_id 必须带 sessionId 隔离"
+        # 可见文案走 legacy model_access.one 预设（模型访问失败语义）；服务端限流码由 alert_id/alert_type 承载
+        assert "模型访问失败" in alert["text"]
+        assert alert["priority"] == mgr._MODEL_ACCESS_PRIORITY and alert["priority"] == 1
 
-    def test_consecutive_429_merged_same_session(self, tmp_path):
+    def test_consecutive_model_access_merged_same_session(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
-        mgr._on_rate_limit("dsh", {"sessionId": "sess-2"})
-        mgr._on_rate_limit("dsh", {"sessionId": "sess-2"})  # 8s 冷却窗口内 → 合并
-        assert mgr._429_cache["sess-2"]["count"] == 2
-        assert "限流" in mgr.win.alerts[-1]["text"] and "2 次" in mgr.win.alerts[-1]["text"]
+        mgr._on_model_access("dsh", {"sessionId": "sess-2"})
+        mgr._on_model_access("dsh", {"sessionId": "sess-2"})  # 8s 冷却窗口内 → 合并
+        assert mgr._model_access_cache["sess-2"]["count"] == 2
+        # 合并后的可见文案走 legacy model_access.many 预设首句：
+        # 「当前会话 … 的模型访问已连续失败 {count} 次，请稍后再试。」
+        merged = mgr.win.alerts[-1]["text"]
+        assert "模型访问" in merged and "连续失败" in merged, merged
+        assert "2 次" in merged, merged
         assert mgr.win.alerts[-2]["alert_id"] == mgr.win.alerts[-1]["alert_id"], "同 session 复用同一 alert_id"
 
     def test_multi_session_isolated(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
-        mgr._on_rate_limit("dsh", {"sessionId": "sess-A"})
-        mgr._on_rate_limit("dsh", {"sessionId": "sess-B"})
+        mgr._on_model_access("dsh", {"sessionId": "sess-A"})
+        mgr._on_model_access("dsh", {"sessionId": "sess-B"})
         ids = [a["alert_id"] for a in mgr.win.alerts]
-        assert ids == ["429-rate-limit:sess-A", "429-rate-limit:sess-B"], "不同 session 不得互相顶替"
-        assert set(mgr._429_cache) == {"sess-A", "sess-B"}
+        assert ids == ["model-access:sess-A", "model-access:sess-B"], "不同 session 不得互相顶替"
+        assert set(mgr._model_access_cache) == {"sess-A", "sess-B"}
 
     def test_dismiss_clears_cache_and_alert(self, tmp_path):
         mgr = self._make_mgr(tmp_path)
-        mgr._on_rate_limit("dsh", {"sessionId": "sess-3"})
-        mgr._dismiss_429_alert("sess-3")
-        assert "sess-3" not in mgr._429_cache, "关闭后清理缓存"
-        assert "429-rate-limit:sess-3" in mgr.win.resolved, "关闭对应 alert"
+        mgr._on_model_access("dsh", {"sessionId": "sess-3"})
+        mgr._dismiss_model_access_alert("sess-3")
+        assert "sess-3" not in mgr._model_access_cache, "关闭后清理缓存"
+        assert "model-access:sess-3" in mgr.win.resolved, "关闭对应 alert"
 
-    def test_execution_failed_suppressed_while_429_active(self, tmp_path):
-        """存在活跃 429 时，不再弹通用失败横幅，避免双重通知。"""
+    def test_execution_failed_suppressed_while_model_access_active(self, tmp_path):
+        """存在活跃模型访问失败提醒时，仅真正的模型访问失败（errorCode 属限流类码）不再弹通用横幅；
+        模型重试耗尽（retryExhausted）是另一条语义，照常提醒。"""
         mgr = self._make_mgr(tmp_path)
-        # 先触发 429，冷却窗口内再出现 execution/failed
-        mgr._on_rate_limit("dsh", {"sessionId": "sess-4"})
+        # 先触发模型访问失败提醒，冷却窗口内再出现真·模型访问失败（errorCode=RATE_LIMIT）→ 抑制
+        mgr._on_model_access("dsh", {"sessionId": "sess-4"})
         before = len(mgr.win.alerts)
-        mgr._on_execution_failed("dsh", {"sessionId": "sess-4", "source": "model_request",
+        mgr._on_execution_failed("dsh", {"sessionId": "sess-4", "failureType": "model_retry_exhausted",
+                                         "retryExhausted": True, "errorCode": "RATE_LIMIT"})
+        assert len(mgr.win.alerts) == before, "活跃模型访问失败提醒 + 真模型访问失败 → 抑制通用失败横幅"
+
+    def test_retry_exhausted_not_suppressed_as_model_access(self, tmp_path):
+        """模型重试耗尽失败（无限流类 errorCode）不是模型访问失败：提醒活跃也不抑制，照常弹 failure.retry。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_model_access("dsh", {"sessionId": "sess-5"})
+        before = len(mgr.win.alerts)
+        mgr._on_execution_failed("dsh", {"sessionId": "sess-5", "failureType": "model_retry_exhausted",
                                          "retryExhausted": True})
-        assert len(mgr.win.alerts) == before, "429 活跃时抑制通用失败横幅"
+        assert len(mgr.win.alerts) == before + 1, "重试耗尽失败不应被当作模型访问失败抑制"
+        assert "重试" in mgr.win.alerts[-1]["text"]  # failure.retry 文案
+
+    def test_execution_failed_suppressed_beyond_cooldown_while_429_alive(self, tmp_path):
+        """F2 回归：模型访问失败提醒展示 15s > 合并冷却 8s，turn/end 的 execution/failed 常
+        在 8~15s 窗口到达——只要提醒仍未 dismiss，通用失败横幅必须继续抑制
+        （旧实现按 8s cooldown 判断会绕过抑制造成双弹）。dismiss 后新失败正常提醒。"""
+        mgr = self._make_mgr(tmp_path)
+        now = [1000.0]
+        mgr._clock = lambda: now[0]
+        mgr._on_model_access("dsh", {"sessionId": "sess-f2",
+                                     "errorCode": "RATE_LIMIT", "consecutiveRetryCount": 1})
+        assert len(mgr.win.alerts) == 1
+        now[0] += 10.0  # 超出 8s cooldown，仍在 15s 展示寿命内
+        mgr._on_execution_failed("dsh", {"sessionId": "sess-f2", "failureType": "model_retry_exhausted",
+                                         "retryExhausted": True, "retries": 5,
+                                         "errorCode": "RATE_LIMIT"})
+        assert len(mgr.win.alerts) == 1, "模型访问失败提醒存活期间不得二次弹通用失败横幅"
+        # 收起提醒后：新的（非限流）失败应正常提醒
+        mgr._dismiss_model_access_alert("sess-f2")
+        mgr._on_execution_failed("dsh", {"sessionId": "sess-f2", "failureType": "tool_failed",
+                                         "retryExhausted": False, "retries": 0,
+                                         "errorCode": ""})
+        assert len(mgr.win.alerts) == 2, "提醒已收起后工具失败应正常提醒"
 
 
 class TestSessionNameTruthfulness:
@@ -2941,7 +3135,7 @@ class TestSessionNameTruthfulness:
         def __init__(self):
             self.alerts = []
             self.resolved = []
-            # 有意不带 _bubble_busy_until：_schedule_429_dismiss 据此跳过 QTimer
+            # 有意不带 _bubble_busy_until：_schedule_model_access_dismiss 据此跳过 QTimer
 
         def isVisible(self):
             return True
@@ -2956,7 +3150,13 @@ class TestSessionNameTruthfulness:
             pass
 
     def _make(self, tmp_path, win=None):
-        return AgentLinkManager(win or self._Win(), Config(base=tmp_path))
+        cfg = Config(base=tmp_path)
+        # 本类取证 model_access 提醒的字段真实性：门开 1.0，避免门关着时
+        # 用「什么都没弹」冒充「字段没被注入」。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(model_access=1.0)
+        cfg.set("agent_link", ag)
+        return AgentLinkManager(win or self._Win(), cfg)
 
     def test_id_fallback_is_not_injected_as_session_name(self, tmp_path):
         mgr = self._make(tmp_path)
@@ -2971,12 +3171,428 @@ class TestSessionNameTruthfulness:
         sid = "session-0123456789"
         mgr._on_session_meta("dsh", {"sessionId": sid, "projectName": "深海项目", "sessionName": "排障对话"})
         cond = mgr._session_conditional({"sessionId": sid})
-        assert cond["sessionName"] == "深海项目 · 排障对话"
-        assert mgr._session_display_name_or_empty(sid) == "深海项目 · 排障对话"
+        # sessionName 只取会话名自身，绝不拼 projectName（两字段语义独立）
+        assert cond["sessionName"] == "排障对话"
+        assert cond["projectName"] == "深海项目", "projectName 是独立字段"
+        assert mgr._session_name_or_empty(sid) == "排障对话"
+        # 组合展示串仍只属于展示 API（气泡前缀/探索气泡），不冒充会话名字段
+        assert mgr.get_session_display_name(sid) == "深海项目 · 排障对话"
 
-    def test_429_alert_does_not_inject_session_name_without_meta(self, tmp_path):
+    def test_model_access_alert_does_not_inject_session_name_without_meta(self, tmp_path):
         mgr = self._make(tmp_path, win=self._AlertWin())
         captured = {}
         mgr._dialogue = lambda key, fallback, **kw: (captured.update(kw), fallback)[1]
-        mgr._show_429_alert("session-abcdef12", 1)
-        assert "sessionName" not in captured, "429 无会话元数据时不得注入 sessionName"
+        mgr._show_model_access_alert("session-abcdef12", 1)
+        assert "sessionName" not in captured, "模型访问失败提醒无会话元数据时不得注入 sessionName"
+
+
+class TestInstallFinishedGuard:
+    """安装后台线程完成回调不得越过 manager 生命周期：窗口关闭/角色切换
+    （shutdown）或重新禁用后，迟到的 install_finished 不得写配置/启动
+    监视器/弹气泡（daemon 安装线程本身无法被取消，只能拦完成回调）。"""
+
+    def _make_manager(self, tmp_path, bubbles, monkeypatch, release):
+        cfg = Config(base=tmp_path)
+        # 本类取证安装代次守卫：bridge 类概率门开 1.0，避免文件头 autouse 基线
+        # （全 0.0）把「门抽稀掉的气泡」冒充「守卫正确丢弃了迟到回调」。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(bridge=1.0)
+        cfg.set("agent_link", ag)
+
+        class Win:
+            def show_bubble(self, text, duration_ms=3000):
+                bubbles.append(text)
+
+            def isVisible(self):
+                return True
+
+        mgr = AgentLinkManager(Win(), cfg)
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **kw: QMessageBox.StandardButton.Yes,
+        )
+        monkeypatch.setattr(
+            DshMonitor, "uninstall_bridge", classmethod(lambda cls: True),
+        )
+
+        def fake_install():
+            assert release.wait(timeout=5.0), "测试释放信号未到达"
+            return (True, "ok")
+
+        monkeypatch.setattr(
+            DshMonitor, "install_bridge", classmethod(lambda cls: fake_install()),
+        )
+        return cfg, mgr
+
+    def _install_thread(self):
+        return next(
+            t for t in threading.enumerate() if t.name == "dsh-bridge-install"
+        )
+
+    def test_late_completion_after_shutdown_is_dropped(self, tmp_path, monkeypatch):
+        """安装完成发生在 shutdown（窗口关闭/角色切换）之后 → 完成回调被
+        丢弃：配置不写回、监视器不启动、无完成气泡。"""
+        app = QApplication.instance() or QApplication([])
+        bubbles = []
+        release = threading.Event()
+        cfg, mgr = self._make_manager(tmp_path, bubbles, monkeypatch, release)
+        mgr.set_enabled("dsh", True)
+        install_thread = self._install_thread()
+        assert "dsh" in mgr._install_pending
+        assert bubbles == ["正在为 DSH 安装通信桥。"]  # persona legacy: bridge.install.pending
+        mgr.shutdown()   # 安装完成前 manager 被关闭（窗口 close / 角色切换）
+        release.set()    # 安装此刻才完成
+        install_thread.join(timeout=5.0)
+        app.processEvents()
+        app.processEvents()
+        assert cfg.data["agent_link"]["dsh"] is False
+        assert not mgr.monitors["dsh"]._running
+        assert bubbles == ["正在为 DSH 安装通信桥。"], "不得弹完成气泡"
+
+    def test_queued_completion_dispatched_after_shutdown_is_dropped(self, tmp_path, monkeypatch):
+        """emit→dispatch 竞态：信号在 shutdown 前已 emit 入队（worker 已
+        完成），但回调在 shutdown 之后才被派发 → 同样必须丢弃（完成回调
+        在 GUI 线程的权威校验兜住该窗口）。"""
+        app = QApplication.instance() or QApplication([])
+        bubbles = []
+        release = threading.Event()
+        cfg, mgr = self._make_manager(tmp_path, bubbles, monkeypatch, release)
+        mgr.set_enabled("dsh", True)
+        install_thread = self._install_thread()
+        release.set()                 # 安装完成 → worker emit（queued 入队）
+        install_thread.join(timeout=5.0)
+        # 未跑 processEvents：queued 回调仍躺在 GUI 事件队列里
+        mgr.shutdown()                # 关闭发生在回调派发之前
+        app.processEvents()           # 迟到的 queued 回调此刻才派发 → 丢弃
+        app.processEvents()
+        assert cfg.data["agent_link"]["dsh"] is False
+        assert not mgr.monitors["dsh"]._running
+        assert bubbles == ["正在为 DSH 安装通信桥。"], "不得弹完成气泡"
+
+    def test_late_completion_after_redisable_is_dropped(self, tmp_path, monkeypatch):
+        """用户重新关闭联动（安装进行中）→ 在途安装作废，完成回调被丢弃，
+        不得反向把配置写回 True / 启动监视器。"""
+        app = QApplication.instance() or QApplication([])
+        bubbles = []
+        release = threading.Event()
+        cfg, mgr = self._make_manager(tmp_path, bubbles, monkeypatch, release)
+        mgr.set_enabled("dsh", True)
+        install_thread = self._install_thread()
+        assert "dsh" in mgr._install_pending
+        mgr.set_enabled("dsh", False)  # 用户重新关闭联动 → 在途安装作废
+        assert "dsh" not in mgr._install_pending
+        release.set()
+        install_thread.join(timeout=5.0)
+        app.processEvents()
+        app.processEvents()
+        assert cfg.data["agent_link"]["dsh"] is False
+        assert not mgr.monitors["dsh"]._running
+        assert bubbles == ["正在为 DSH 安装通信桥。"], "不得弹完成气泡"
+
+    def test_stale_queued_completion_must_not_consume_reinstalled_pending(self, tmp_path, monkeypatch):
+        """B9 复审 P1：disable→re-enable 两代安装交错。安装 A 完成信号已
+        queued 入队但未派发时，用户关闭联动并再次开启、登记安装 B（新代次）；
+        A 的旧回调随后派发时不得消费 B 的 pending（不得写配置/启动监视器/
+        弹完成气泡），B 的真实回调随后正常生效。完成信号必须携带并校验
+        安装代次，仅凭 agent key 无法区分两代安装。"""
+        app = QApplication.instance() or QApplication([])
+        bubbles = []
+        cfg = Config(base=tmp_path)
+        # 同上：bridge 类概率门开 1.0，保证气泡断言取证的是守卫而非概率门。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(bridge=1.0)
+        cfg.set("agent_link", ag)
+
+        class Win:
+            def show_bubble(self, text, duration_ms=3000):
+                bubbles.append(text)
+
+            def isVisible(self):
+                return True
+
+        mgr = AgentLinkManager(Win(), cfg)
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **kw: QMessageBox.StandardButton.Yes,
+        )
+        monkeypatch.setattr(
+            DshMonitor, "uninstall_bridge", classmethod(lambda cls: True),
+        )
+
+        release_a, release_b = threading.Event(), threading.Event()
+        queue = [release_a, release_b]
+
+        def fake_install():
+            ev = queue.pop(0)
+            assert ev.wait(timeout=5.0), "测试释放信号未到达"
+            return (True, "ok")
+
+        monkeypatch.setattr(
+            DshMonitor, "install_bridge", classmethod(lambda cls: fake_install()),
+        )
+
+        def install_thread():
+            return next(
+                t for t in threading.enumerate() if t.name == "dsh-bridge-install"
+            )
+
+        # 第一代安装 A：等它完成并 emit（queued 入队），但先不派发
+        mgr.set_enabled("dsh", True)
+        thread_a = install_thread()
+        release_a.set()
+        thread_a.join(timeout=5.0)
+        assert not thread_a.is_alive()
+        assert "dsh" in mgr._install_pending   # A 的 pending 尚未被消费
+        # 未跑 processEvents：A 的 queued 回调仍躺在 GUI 事件队列里
+        mgr.set_enabled("dsh", False)          # 关闭联动：作废在途安装
+        assert "dsh" not in mgr._install_pending
+        mgr.set_enabled("dsh", True)           # 再次开启：登记安装 B（新代次）
+        assert "dsh" in mgr._install_pending
+        thread_b = install_thread()
+        # 此刻派发 A 的旧 queued 回调：不得消费 B 的 pending
+        app.processEvents()
+        app.processEvents()
+        assert "dsh" in mgr._install_pending           # B 的 pending 必须仍在
+        assert cfg.data["agent_link"]["dsh"] is False  # 配置不得被 A 写回
+        assert not mgr.monitors["dsh"]._running        # 监视器不得被 A 启动
+        assert not any("安装完成" in b for b in bubbles), f"不得弹完成气泡: {bubbles}"
+        # B 的真实回调随后派发：正常生效（写配置、启动监视器、弹气泡）
+        release_b.set()
+        thread_b.join(timeout=5.0)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if cfg.data["agent_link"]["dsh"]:
+                break
+            time.sleep(0.01)
+        assert cfg.data["agent_link"]["dsh"] is True
+        assert mgr.monitors["dsh"]._running
+        assert any("安装完成" in b for b in bubbles), f"应有 B 的完成气泡: {bubbles}"
+
+    def test_normal_completion_still_applies(self, tmp_path, monkeypatch):
+        """正常路径回归：安装完成后回调照常生效（写配置、启动监视器、
+        弹完成气泡）。"""
+        app = QApplication.instance() or QApplication([])
+        bubbles = []
+        release = threading.Event()
+        cfg, mgr = self._make_manager(tmp_path, bubbles, monkeypatch, release)
+        mgr.set_enabled("dsh", True)
+        install_thread = self._install_thread()
+        release.set()
+        install_thread.join(timeout=5.0)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if cfg.data["agent_link"]["dsh"]:
+                break
+            time.sleep(0.01)
+        assert cfg.data["agent_link"]["dsh"] is True
+        assert mgr.monitors["dsh"]._running
+        assert any("安装完成" in b for b in bubbles), f"应有完成气泡，实际: {bubbles}"
+        mgr.set_enabled("dsh", False)
+        assert cfg.data["agent_link"]["dsh"] is False
+
+class TestDetectorAlertThrottle:
+    """N2 跨检测器弹窗节流：stuck/pattern/watchdog 同 agent 30s 内只弹一次窗
+    （动画照常），升级档位放行，不同 scope 互不影响。"""
+
+    def _make_mgr(self, tmp_path):
+        class FakeWin:
+            def __init__(self):
+                self.alerts = []
+                self.anims = []
+                self._visible = True
+                self._bubble_suppressed = False
+
+            def isVisible(self):
+                return self._visible
+
+            def request_link_anim(self, anim):
+                self.anims.append(str(anim))
+
+            def show_alert(self, text, *, duration_ms=0, sticky=True, **kw):
+                # 与 window_alerts.show_alert 一致：设置窗打开期间普通提醒被丢弃。
+                if self._bubble_suppressed:
+                    return
+                self.alerts.append({"text": str(text), "sticky": bool(sticky)})
+
+            def show_bubble(self, text, duration_ms=3000):
+                self.alerts.append({"text": str(text), "bubble": True})
+
+        cfg = Config(base=tmp_path)
+        # 本类取证 N2 跨检测器节流：stuck/pattern/watchdog 三条检测类概率门开 1.0，
+        # 避免文件头 autouse 基线（全 0.0）把「没弹窗」冒充「被节流」。
+        ag = dict(cfg.get("agent_link", {}))
+        ag["report_gates"] = _agent_gates(stuck=1.0, pattern=1.0, watchdog=1.0)
+        cfg.set("agent_link", ag)
+        mgr = AgentLinkManager(FakeWin(), cfg)
+        mgr._clock = lambda: mgr._throttle_now[0]
+        mgr._throttle_now = [1000.0]
+        return mgr
+
+    def test_watchdog_suppressed_after_stuck_within_window(self, tmp_path):
+        """stuck(severity2) 弹窗后 30s 内 watchdog warning 到达 → 弹窗被抑制。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert len(mgr.win.alerts) == 1
+        mgr._throttle_now[0] += 10.0
+        mgr._on_exploration_warning("sess-1", {"agent_key": "dsh", "reasons": ["search"], "steps": []})
+        assert len(mgr.win.alerts) == 1, "30s 窗口内 watchdog 弹窗应被抑制"
+
+    def test_watchdog_allowed_after_cooldown_expired(self, tmp_path):
+        """超过 30s 后同 agent 再触发 watchdog → 正常弹窗。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert len(mgr.win.alerts) == 1
+        mgr._throttle_now[0] += 31.0
+        mgr._on_exploration_warning("sess-2", {"agent_key": "dsh", "reasons": ["search"], "steps": []})
+        assert len(mgr.win.alerts) == 2, "冷却结束后 watchdog 应正常弹窗"
+
+    def test_escalation_pattern_control_overrides_previous(self, tmp_path):
+        """watchdog 弹窗后 pattern control（升级/控制级）到达 → 放行（覆盖低档）。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_exploration_warning("sess-3", {"agent_key": "dsh", "reasons": ["search"], "steps": []})
+        assert len(mgr.win.alerts) == 1
+        mgr._throttle_now[0] += 5.0
+        mgr._on_pattern_control("dsh", {"verdict": "REPLAN", "reason": "loop", "class": "search", "count": 8, "window": "10"})
+        assert len(mgr.win.alerts) == 2, "升级到 control 应放行（覆盖低档提醒）"
+
+    def test_different_scope_not_throttled(self, tmp_path):
+        """不同 agent scope 互不影响：agent B 弹窗不受 agent A 的节流记录约束。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_stuck_intervention("agent-a", {"severity": 2})
+        assert len(mgr.win.alerts) == 1
+        mgr._throttle_now[0] += 5.0
+        mgr._on_exploration_warning("sess-b", {"agent_key": "agent-b", "reasons": ["search"], "steps": []})
+        assert len(mgr.win.alerts) == 2, "不同 agent scope 不受节流影响"
+
+    def test_pattern_warning_no_alert_but_records_gate(self, tmp_path):
+        """pattern warning 只播动画不弹窗、也不该占用节流槽（非弹窗事件）。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_pattern_warning("dsh", {})
+        assert mgr.win.alerts == []
+        # 随后 stuck severity2（升级）不受影响
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert len(mgr.win.alerts) == 1
+
+    def test_same_tier_stuck_escalation_is_throttled(self, tmp_path):
+        """N2-b：同级重复升级（stuck 档位 2 → 档位 2）应被节流，不再连环换弹。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert len(mgr.win.alerts) == 1
+        mgr._throttle_now[0] += 5.0
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert len(mgr.win.alerts) == 1, "同档重复升级应被节流"
+
+    def test_pattern_control_then_stuck_same_tier_is_throttled(self, tmp_path):
+        """N2-b：pattern control 已弹窗后，同档 stuck 档位 2 应被节流（对称）。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr._on_pattern_control("dsh", {"verdict": "REPLAN", "reason": "loop",
+                                        "class": "search", "count": 8, "window": "10"})
+        assert len(mgr.win.alerts) == 1
+        mgr._throttle_now[0] += 5.0
+        mgr._on_stuck_intervention("dsh", {"severity": 2})
+        assert len(mgr.win.alerts) == 1, "同档提醒应被节流"
+
+    def test_suppressed_alert_does_not_consume_throttle_slot(self, tmp_path):
+        """N2-a：设置窗打开期间提醒被 show_alert 丢弃，不得占用 30s 节流槽。"""
+        mgr = self._make_mgr(tmp_path)
+        mgr.win._bubble_suppressed = True
+        mgr._on_exploration_warning("sess-1", {"agent_key": "dsh", "reasons": ["search"], "steps": []})
+        assert mgr.win.alerts == [], "设置窗打开期间普通提醒应被丢弃"
+        mgr.win._bubble_suppressed = False
+        mgr._throttle_now[0] += 1.0
+        mgr._on_exploration_warning("sess-1", {"agent_key": "dsh", "reasons": ["search"], "steps": []})
+        assert len(mgr.win.alerts) == 1, "被丢弃的提醒不该占用节流槽"
+
+
+# ============================================================================
+class TestUnknownBridgeEventReminder:
+    """未知桥接事件 → 提醒用户更新/重装 bridge。
+
+    识别：DSH 监视器里，事件名在「语义层 / 状态机 / _poll 直通名单」全部
+    不认识才算未知（claude/cursor 的 transcript 噪声不算）。提醒受 bridge
+    概率门控制，同一 agent 在冷却窗口内只弹一次（未知事件成串时不刷屏）。
+    """
+
+    def _make_mgr(self, tmp_path, gates=None):
+        app = QApplication.instance() or QApplication([])
+        bubbles = []
+
+        class DummyWin:
+            def isVisible(self):
+                return True
+
+            def show_bubble(self, text, duration_ms=3000):
+                bubbles.append(text)
+
+        cfg = Config(base=tmp_path)
+        if gates is not None:
+            data = cfg.data
+            data["agent_link"] = {**data.get("agent_link", {}), "report_gates": _agent_gates(**gates)}
+            cfg.save()
+        clock = [1000.0]
+        mgr = AgentLinkManager(DummyWin(), cfg, min_interval=2.0, clock=lambda: clock[0])
+        return mgr, bubbles, clock
+
+    def test_monitor_emits_only_unknown_dsh_events(self, tmp_path):
+        """监视器只对「全识别路径都不认识」的 DSH 事件发 unknown_bridge_event。"""
+        app = QApplication.instance() or QApplication([])
+        mon = BaseAgentMonitor("dsh", tmp_path)
+        unknown = []
+        mon.unknown_bridge_event.connect(lambda k, d: unknown.append((k, d)))
+        events_file = mon.events_file
+        events_file.parent.mkdir(parents=True, exist_ok=True)
+        events_file.touch()
+        mon._poll()  # 初始化 tailer（首轮不重放）
+        with open(events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "brand/sparkle", "ts": 1}) + "\n")             # 未知
+            f.write(json.dumps({"event": "execution/failed", "ts": 2}) + "\n")          # 语义层已知
+            f.write(json.dumps({"event": "agent/status", "state": "working", "ts": 3}) + "\n")  # 状态机已知
+            f.write(json.dumps({"event": "model_access", "errorCode": "429", "ts": 4}) + "\n")   # 直通名单已知
+            f.write(json.dumps({"event": "cordis/request-run", "ts": 5}) + "\n")        # 直通名单已知
+        mon._poll()
+        assert [(k, d.get("event")) for k, d in unknown] == [("dsh", "brand/sparkle")]
+        mon.stop()
+
+    def test_non_dsh_monitor_never_emits_unknown(self, tmp_path):
+        """claude/cursor 等 transcript 噪声不算桥接未知事件（只查 DSH 监视器）。"""
+        app = QApplication.instance() or QApplication([])
+        mon = BaseAgentMonitor("cursor", tmp_path)
+        unknown = []
+        mon.unknown_bridge_event.connect(lambda k, d: unknown.append((k, d)))
+        events_file = mon.events_file
+        events_file.parent.mkdir(parents=True, exist_ok=True)
+        events_file.touch()
+        mon._poll()
+        with open(events_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "brand/sparkle", "ts": 1}) + "\n")
+        mon._poll()
+        assert unknown == []
+        mon.stop()
+
+    def test_wiring_manager_bubbles_reminder(self, tmp_path):
+        """Monitor → Manager 全链路：bridge 门开时收到未知事件即弹更新/重装提醒。"""
+        mgr, bubbles, _ = self._make_mgr(tmp_path, gates={"bridge": 1.0})
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        assert len(bubbles) == 1
+        assert "更新" in bubbles[0] or "重装" in bubbles[0], bubbles[0]
+        mgr.shutdown()
+
+    def test_gate_closed_keeps_quiet(self, tmp_path):
+        """bridge 门为 0 时未知事件提醒静音（可被用户统一关掉）。"""
+        mgr, bubbles, _ = self._make_mgr(tmp_path, gates={"bridge": 0.0})
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        assert bubbles == []
+        mgr.shutdown()
+
+    def test_cooldown_reminds_once_per_window(self, tmp_path):
+        """同一 agent 冷却窗口内只提醒一次；窗口过后再次提醒。"""
+        mgr, bubbles, clock = self._make_mgr(tmp_path, gates={"bridge": 1.0})
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        assert len(bubbles) == 1, "冷却窗口内重复未知事件不得刷屏"
+        clock[0] += 601.0
+        mgr.monitors["dsh"].unknown_bridge_event.emit("dsh", {"event": "brand/sparkle"})
+        assert len(bubbles) == 2, "冷却窗口过后应再次提醒"
+        mgr.shutdown()

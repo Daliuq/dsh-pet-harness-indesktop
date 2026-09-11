@@ -38,9 +38,11 @@ def _atomic_json(path: str, value: dict) -> None:
             pass
 
 
-def _log_event(directory: str, event: str, **fields) -> None:
+def _log_event(base_dir: str, event: str, **fields) -> None:
+    # 形参名不能叫 directory：调用方把 directory 作为 JSON 字段写进事件，
+    # 同名会造成 "got multiple values for argument 'directory'"（PR57 遗留）。
     try:
-        path = os.path.join(directory, f"dsh-pet-control-{os.getpid()}.jsonl")
+        path = os.path.join(base_dir, f"dsh-pet-control-{os.getpid()}.jsonl")
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps({"ts": time.time(), "agent": "pet", "event": event, **fields}, ensure_ascii=False) + "\n")
     except Exception:
@@ -49,7 +51,7 @@ def _log_event(directory: str, event: str, **fields) -> None:
 
 def request(operation: str, session_id: str, text: str = "", ports: list[int] | None = None,
             *, goal: str = "", context: str = "", provider: str = "", model: str = "",
-            timeout: float = TIMEOUT_S, alert_id: str = "") -> tuple[bool, str]:
+            timeout: float = TIMEOUT_S, alert_id: str = "", cancel=None) -> tuple[bool, str]:
     del ports  # retained for compatibility; bridge discovery is file based
     if not session_id or session_id.startswith("turn:"):
         return False, "missing-session-id"
@@ -86,6 +88,10 @@ def request(operation: str, session_id: str, text: str = "", ports: list[int] | 
     deadline = time.monotonic() + max(1.0, float(timeout))
     try:
         while time.monotonic() < deadline:
+            # 可取消等待：pet 侧 shutdown 时置位 cancel，30s 轮询立刻退出，
+            # 保证 worker 能在 shutdown 的 join 预算内结束。
+            if cancel is not None and cancel.is_set():
+                return False, "cancelled"
             try:
                 with open(response_path, "r", encoding="utf-8") as handle:
                     result = json.load(handle)
@@ -93,7 +99,11 @@ def request(operation: str, session_id: str, text: str = "", ports: list[int] | 
                     return True, json.dumps(result, ensure_ascii=False)
                 return False, str(result.get("error") or "bridge-control-rejected")
             except (FileNotFoundError, PermissionError, json.JSONDecodeError):
-                time.sleep(POLL_S)
+                if cancel is not None:
+                    if cancel.wait(POLL_S):
+                        return False, "cancelled"
+                else:
+                    time.sleep(POLL_S)
     finally:
         for path in (request_path, response_path):
             try:

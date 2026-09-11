@@ -15,7 +15,7 @@ const PLUGIN_ID = "dsh-pet-bridge";
 // These services are resolved by DSH when the plugin is loaded.  The bridge
 // uses them only for the watchdog's isolated diagnosis request; normal event
 // forwarding remains usable even when no model is configured.
-const inject = ["llm", "agentDefaultModel", "apiProxy"];
+const inject = ["llm", "agentDefaultModel"];
 const CONTROL_POLL_MS = 150;
 const CONTROL_MAX_CONTEXT = 12000;
 const CONTROL_MAX_REQUEST_AGE_MS = 10 * 60 * 1000;
@@ -41,9 +41,9 @@ function aggregateWrite() {
   writeRecord({ state: next });
 }
 
-// 判定是否为限流/429 错误。DSH 实测 errorCode 为 "RATE_LIMIT"（消息如 "429: ..."），
+// 判定是否为模型访问失败（服务端限流/过载）。DSH 实测 errorCode 为 "RATE_LIMIT"（消息如 "429: ..."），
 // 偶见直接 "429"。必须同时匹配 code 与 message，避免漏判。
-function isRateLimitError(code, message) {
+function isModelAccessError(code, message) {
   const c = String(code || "").trim().toUpperCase();
   const m = String(message || "");
   if (c === "RATE_LIMIT" || c === "429" || c === "TOO_MANY_REQUESTS") return true;
@@ -107,6 +107,65 @@ function controlAgentState(agent) {
   return String(agent?.status || agent?.state || "unknown");
 }
 
+// ===== 子代理 → 根会话归一 =====
+// DSH 的会话在持久化 header 里携带谱系：parentSession（直接父会话 id）、
+// delegationDepth（顶层为 0/缺省，子代理 = 父级深度 + 1）、origin === "subagent"
+// （直接子代理标记）。运行时 Agent 经 session.header 暴露该 header。
+// 控制动作（interrupt/replan）打在一个子代理上时，主 agent 会立刻补派新的
+// 子代理——用户视角「终止没用」。因此把控制归一到目标会话的根会话：
+//   子代理链上的 agent 统一作用到其最高可解析的存活祖先（根）；
+//   顶层 session 直接作用自身。
+// 返回的对象同时给出 wasSubagent / appliedToRoot / rootSessionId / subagentChain，
+// 供 pet 侧区分「已终止会话（含子代理）」与「已终止子代理（主代理仍在运行）」。
+function resolveControlRoot(agent, sessionLookup) {
+  const sessionIdOf = (a) => String(a?.id || a?.session?.id || "");
+  const headerOf = (a) => (a && a.session && a.session.header) || null;
+  const isSubagentHeader = (a) => {
+    const h = headerOf(a);
+    if (!h) return false;
+    return Number(h.delegationDepth || 0) > 0 ||
+      String(h.origin || "") === "subagent" ||
+      String(h.parentSession || "") !== "";
+  };
+  const targetSessionId = sessionIdOf(agent);
+  if (!isSubagentHeader(agent)) {
+    return {
+      targetSessionId,
+      wasSubagent: false,
+      appliedToRoot: false,
+      rootAgent: agent,
+      rootSessionId: targetSessionId,
+      subagentChain: [],
+    };
+  }
+  // 沿 parentSession 谱系向上，尽可能解析到最高存活的祖先。
+  const chain = [];
+  let current = agent;
+  const seen = new Set();
+  while (current) {
+    const sid = sessionIdOf(current);
+    if (!sid || seen.has(sid)) break;
+    seen.add(sid);
+    chain.push(sid);
+    const h = headerOf(current);
+    const parent = h && h.parentSession ? String(h.parentSession) : "";
+    if (!parent) break;
+    const parentAgent = (typeof sessionLookup === "function") ? sessionLookup(parent) : null;
+    if (!parentAgent || parentAgent === current) break;
+    current = parentAgent;
+  }
+  const appliedToRoot = chain.length > 1 && current !== agent;
+  const rootAgent = appliedToRoot ? current : agent;
+  return {
+    targetSessionId,
+    wasSubagent: true,
+    appliedToRoot,
+    rootAgent,
+    rootSessionId: sessionIdOf(rootAgent),
+    subagentChain: chain,
+  };
+}
+
 async function waitAgentIdle(agent, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -148,18 +207,25 @@ async function runBridgeDiagnosis(ctx, request, signal) {
     source: { kind: "plugin", plugin: PLUGIN_ID },
   })];
   let output = "";
+  let reasoning = "";
   for await (const chunk of ctx.llm.stream({
     provider: selection.provider,
     model: selection.model,
     messages,
-    maxTokens: 700,
+    // 推理型模型会先消耗 token 在 reasoning 上，700 经常被吃光导致正文为空
+    // （实机复现：empty-diagnosis）。给足预算，正文才出得来。
+    maxTokens: 2048,
     purpose: "dsh-pet-watchdog-replan",
     signal,
   })) {
     if (chunk?.type === "text-delta") output += String(chunk.text || "");
+    else if (chunk?.type === "reasoning-delta" || chunk?.type === "reasoning") reasoning += String(chunk.text || "");
   }
   output = output.trim();
-  if (!output) throw new Error("empty-diagnosis");
+  if (!output) {
+    console.warn(`[${PLUGIN_ID}] diagnosis empty (reasoning ${reasoning.length} chars, model ${selection.provider}/${selection.model})`);
+    throw new Error("empty-diagnosis");
+  }
   return output.slice(0, CONTROL_MAX_CONTEXT);
 }
 
@@ -183,20 +249,36 @@ async function handleControlRequest(ctx, request) {
     }
     return { ok: false, operation, sessionId, phase: "not-found", error: "session-not-found", foundAgent: false, cancelInvoked: false };
   }
+  // 把控制归一到根会话：子代理 → 其最高存活祖先；顶层 session → 自身。
+  // 这样 interrupt 停根 agent 的当前回合（主 agent 不会再补派新子代理），
+  // replan 给根 agent 注入重规划建议，而不是只作用于空转的子代理。
+  const resolved = resolveControlRoot(agent, (sid) => liveAgents.get(String(sid)));
+  const controlTarget = resolved.appliedToRoot ? resolved.rootAgent : agent;
+  const rootNorm = {
+    wasSubagent: resolved.wasSubagent,
+    appliedToRoot: resolved.appliedToRoot,
+    rootSessionId: resolved.rootSessionId,
+    subagentChain: resolved.subagentChain,
+  };
   let cancelInvoked = false;
   try {
     if (operation === "interrupt") {
       // Terminate means terminate: discard pending watchdog/user steering too.
-      await agent.cancel("dsh-pet-watchdog", { keepInbox: false });
+      await controlTarget.cancel("dsh-pet-watchdog", { keepInbox: false });
       cancelInvoked = true;
-      if (await waitAgentIdle(agent)) {
-        return { ok: true, operation, sessionId, phase: "cancelled", alreadyIdle: false, foundAgent: true, cancelInvoked };
+      // 用户点的是这个子代理：主 agent 的回合取消未必级联到已发布的子代理
+      // 自身 driver，显式再停一次目标，确保用户看到的那个空转子代理确实停下。
+      if (resolved.appliedToRoot && agent !== controlTarget) {
+        try { agent.cancel("dsh-pet-watchdog", { keepInbox: false }); } catch {}
       }
-      return { ok: false, operation, sessionId, phase: "timeout", error: "cancel-timeout", foundAgent: true, cancelInvoked };
+      if (await waitAgentIdle(controlTarget)) {
+        return { ok: true, operation, sessionId, phase: "cancelled", alreadyIdle: false, foundAgent: true, cancelInvoked, ...rootNorm };
+      }
+      return { ok: false, operation, sessionId, phase: "timeout", error: "cancel-timeout", foundAgent: true, cancelInvoked, ...rootNorm };
     }
     // Stop the active driver first.  keepInbox is essential: it prevents a
     // watchdog request from deleting ordinary queued Agent input.
-    await agent.cancel("dsh-pet-watchdog-replan", { keepInbox: true });
+    await controlTarget.cancel("dsh-pet-watchdog-replan", { keepInbox: true });
     cancelInvoked = true;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), Math.max(1000, Number(request.timeoutMs || 8000)));
@@ -206,14 +288,14 @@ async function handleControlRequest(ctx, request) {
     } finally {
       clearTimeout(timeout);
     }
-    await agent.steer(createUserMessage({
+    await controlTarget.steer(createUserMessage({
       content: [{ type: "text", text: plan }],
       source: { kind: "plugin", plugin: PLUGIN_ID },
     }));
-    return { ok: true, operation, sessionId, phase: "replanned", plan, foundAgent: true, cancelInvoked };
+    return { ok: true, operation, sessionId, phase: "replanned", plan, foundAgent: true, cancelInvoked, ...rootNorm };
   } catch (err) {
     console.warn(`[${PLUGIN_ID}] control failed: ${String(err?.message || err)}`);
-    return { ok: false, operation, sessionId, phase: "failed", error: "bridge-internal-error", foundAgent: true, cancelInvoked };
+    return { ok: false, operation, sessionId, phase: "failed", error: "bridge-internal-error", foundAgent: true, cancelInvoked, ...rootNorm };
   }
 }
 
@@ -221,7 +303,9 @@ function writeControlOutcome(id, request, result) {
   const controlResult = { source: "bridge", requestId: id, operation: request.operation,
     sessionId: request.sessionId, ok: !!result.ok, phase: result.phase || "",
     error: result.error || "", alreadyIdle: !!result.alreadyIdle,
-    foundAgent: !!result.foundAgent, cancelInvoked: !!result.cancelInvoked };
+    foundAgent: !!result.foundAgent, cancelInvoked: !!result.cancelInvoked,
+    wasSubagent: !!result.wasSubagent, appliedToRoot: !!result.appliedToRoot,
+    rootSessionId: String(result.rootSessionId || "") };
   writeControlResponse(id, result);
   writeRecord({ event: "bridge/control-result", ...controlResult });
   writeRecord({ event: "watchdog/control-result", ...controlResult });
@@ -274,17 +358,25 @@ const ARGS_KEY_LENGTH = 64;
 const TEXT_MAX = 300;
 
 // ===== 硬失败判定（execution/failed）=====
-// 规则：DSH 已决定「本轮不再继续」的事件 → 直接提醒，不经行为分析。
-//   - 模型请求重试耗尽（llm/retry 达到阈值）
-//   - 本轮工具执行最终失败（有失败且无成功）
+// 规则：只有 DSH 以「本轮出错的 turn 结尾」为真才可能提醒，正常完成绝不误报。
+//   DSH 的 turn/end 自带 data.reason.kind：completed / error / aborted /
+//   blocked / max-tokens。completed（正常收尾）等非 error 结尾一律不判失败——
+//   即使中途出现过模型重试或工具失败、之后又恢复并正常跑完。
+//   真·重试耗尽 = 连续 llm/retry 后 DSH 抛错 → reason.kind === "error"。
+//   工具最终失败同理：只有 turn 以 error 结尾且本 turn 有工具失败无成功才判。
+// 重试计数只在 turn 内生效，且「恢复即清零」：出现模型成功产出（assistant/
+// message、tool/call、成功的 tool/result）就把 retries 归零——只统计距离上次
+// 恢复后的连续重试，绝不把不同时段已恢复的抖动累加成长期故障。
 // 只在 turn/end 时判定并写一条脱敏记录（错误码保留、错误正文不落盘）。
 const RETRY_EXHAUSTED_THRESHOLD = 4;
 // 限流/连接重试只在同一 session 连续达到 5 次时提醒一次。
 // 原始 llm/retry 仍然逐条转发，便于桌宠侧做详细诊断；这里只抑制高优先级
-// rate_limit 事件，避免一次短暂抖动连续轰炸桌宠。
+// model_access 事件，避免一次短暂抖动连续轰炸桌宠。
 const RETRY_EVENT_THRESHOLD = 5;
 
-// 每个 turn 的状态：sessionKey -> {retries, hadSuccess, hadFailure, lastErrorCode, lastErrorMessage, turnActive}
+// 每个 turn 的状态：sessionKey -> {retries, hadSuccess, hadFailure,
+//   lastErrorCode, lastErrorMessage, lastRetryCode, turnActive}
+// retries = 距上次恢复后的连续模型重试次数（恢复即清零，见上方规则）。
 const turnStatsMap = new Map();
 
 // sessionKey -> { count, notified }
@@ -318,7 +410,7 @@ function _turnStats(sessionKey) {
   if (!turnStatsMap.has(sessionKey)) {
     turnStatsMap.set(sessionKey, {
       retries: 0, hadSuccess: false, hadFailure: false,
-      lastErrorCode: "", lastErrorMessage: "", turnActive: false,
+      lastErrorCode: "", lastErrorMessage: "", lastRetryCode: "", turnActive: false,
     });
   }
   return turnStatsMap.get(sessionKey);
@@ -328,17 +420,90 @@ function _endTurnStats(sessionKey) {
   turnStatsMap.delete(sessionKey);
 }
 
+// turn 开始/异常兜底：把单个 turn 统计重置为全新状态（绝不跨 turn 累计）。
+function resetTurnStats(st) {
+  st.retries = 0;
+  st.hadSuccess = false;
+  st.hadFailure = false;
+  st.lastErrorCode = "";
+  st.lastErrorMessage = "";
+  st.lastRetryCode = "";
+  st.turnActive = true;
+  return st;
+}
+
+// 记录一次模型重试：只累加连续计数（恢复信号会把 retries 归零），并记住
+// 最后一次重试的错误码（重试耗尽时 execution/failed 用它标注根因）。
+function noteStatsRetry(st, errorCode) {
+  st.retries += 1;
+  if (errorCode) st.lastRetryCode = String(errorCode).slice(0, 48);
+}
+
+// 「恢复即清零」：模型成功产出/流程继续推进 → 连续重试计数归零。绝不把已经
+// 恢复的抖动计入「重试耗尽」（否则正常完成的 turn 会被误判成硬失败）。
+function noteStatsRecovery(st) {
+  st.retries = 0;
+}
+
 // 记录一次工具结果对硬失败判定的影响（turn/start 重置，tool/result 累计）
-function noteTurnToolResult(sessionKey, ok, errorCode, errorMessage) {
-  const st = _turnStats(sessionKey);
+function noteStatsToolResult(st, ok, errorCode, errorMessage) {
   st.turnActive = true;
   if (ok) {
     st.hadSuccess = true;
+    // 工具执行成功说明模型调用链已恢复推进——同一 turn 内此前任何模型
+    // 重试都不再计入「耗尽」判定（与恢复信号同语义）。
+    st.retries = 0;
   } else {
     st.hadFailure = true;
     if (errorCode) st.lastErrorCode = String(errorCode).slice(0, 48);
     if (errorMessage) st.lastErrorMessage = truncate(errorMessage);
   }
+}
+
+// 按 sessionKey 包装（生产事件路径使用）：
+function noteTurnRetry(sessionKey, errorCode) {
+  noteStatsRetry(_turnStats(sessionKey), errorCode);
+}
+
+function noteTurnRecovery(sessionKey) {
+  noteStatsRecovery(_turnStats(sessionKey));
+}
+
+function noteTurnToolResult(sessionKey, ok, errorCode, errorMessage) {
+  noteStatsToolResult(_turnStats(sessionKey), ok, errorCode, errorMessage);
+}
+
+// turn/end 时的硬失败判定（纯函数，供 Node 回归测试直接驱动）：
+// 只认 DSH 的 reason.kind === "error"（本轮真的出错终止）；completed /
+// aborted / blocked / max-tokens / reason 缺失 → 一律不写 execution/failed。
+// 返回要写盘的对象（含脱敏错误码），或 null（不提醒）。
+function decideTurnEndFailure(reason, st) {
+  if (!st || !st.turnActive) return null;
+  const kind = reason && reason.kind ? String(reason.kind) : "";
+  if (kind !== "error") return null;
+  const retryExhausted = st.retries >= RETRY_EXHAUSTED_THRESHOLD;
+  const toolFailed = st.hadFailure && !st.hadSuccess;
+  if (!retryExhausted && !toolFailed) return null;
+  const reasonCode = reason && reason.error && reason.error.code
+    ? String(reason.error.code) : "";
+  // 错误码按失败来源选取（只落码不落错误正文）：
+  //   模型重试耗尽 → 最近一次 llm/retry 错误码，缺省回退 turn/end 终止错误码
+  //   工具最终失败 → 工具错误码，缺省回退终止错误码（generic 码没有工具码信息量大）
+  const errorCode = retryExhausted
+    ? String(st.lastRetryCode || reasonCode || st.lastErrorCode || "")
+    : String(st.lastErrorCode || reasonCode || "");
+  return {
+    event: "execution/failed",
+    // failureType 与活动/过程事件（tool/call 的 tool）解耦：模型重试耗尽 =
+    // 模型请求链连续重试后仍失败；tool_failed = 工具调用最终失败。不再是
+    // 语义含糊的 "tool"/"model_request"，也不会与协议保留字段 source（Agent
+    // 来源）撞名。
+    failureType: retryExhausted ? "model_retry_exhausted" : "tool_failed",
+    retryExhausted: !!retryExhausted,
+    retries: st.retries,
+    errorCode: errorCode.slice(0, 48),
+    errorMessage: String(st.lastErrorMessage || ""),
+  };
 }
 
 function summarizeArgs(args) {
@@ -449,12 +614,40 @@ function extractSessionMeta(agent, session, summary = null, workspace = null) {
   return { sessionId, sessionName, projectName, agentName, displayLabel };
 }
 
+// apiProxy 缺失（当前 dsh 发布版无此服务）时的真实标题兜底：
+// dsh 把会话标题/工作目录缓存在 ~/.dsh/storages/session_projcache/sessions/<sid>.json。
+function readProjcacheSummary(sessionId) {
+  const sid = String(sessionId || "");
+  if (!sid) return null;
+  const candidates = sid.startsWith("session-") ? [sid] : [sid, `session-${sid}`];
+  for (const name of candidates) {
+    try {
+      const file = path.join(os.homedir(), ".dsh", "storages", "session_projcache", "sessions", `${name}.json`);
+      const data = JSON.parse(fs.readFileSync(file, "utf8"));
+      const title = data?.record?.rows?.title?.val;
+      const cwd = data?.record?.identity?.cwd;
+      if (!title && !cwd) continue;
+      return { sessionId: name, cwd: cwd || "", projections: { values: { title: title || "" } } };
+    } catch { /* 缓存不存在或损坏：跳过 */ }
+  }
+  return null;
+}
+
 async function refreshSessionMetadata(ctx) {
   if (metadataRefreshPromise) return metadataRefreshPromise;
   metadataRefreshPromise = (async () => {
     try {
-      const api = ctx?.apiProxy;
-      if (!api?.sessions?.list || !api?.workspace?.list) return;
+      // apiProxy 不进 inject（当前 dsh 发布版无此服务，强依赖会让插件无法激活）；
+      // 用 ctx.get 免 inject 读取，缺失时返回 undefined。
+      const api = typeof ctx?.get === "function" ? ctx.get("apiProxy", false) : undefined;
+      if (!api?.sessions?.list || !api?.workspace?.list) {
+        // 兜底：读 dsh 本地会话缓存投影出 summary，复用同一条写 meta 通路。
+        for (const [id, agent] of liveAgents) {
+          const sid = String(agent?.session?.id || id);
+          writeSessionMeta(agent, agent?.session, readProjcacheSummary(sid), null);
+        }
+        return;
+      }
       const request = () => ({ rpcId: randomUUID(), payload: {} });
       const [sessionsResponse, workspacesResponse] = await Promise.all([
         api.sessions.list(request()),
@@ -994,10 +1187,16 @@ function _interactionDedupKeys(extra) {
     // 的同 session 事件上去重（如两个不同审批在同一 session 中先后到达）。
     if (extra.approvalId && extra.sessionId) keys.push(`ap:se:${extra.sessionId}:${extra.approvalId}`);
     else if (extra.rpcId && extra.sessionId) keys.push(`ap:se:${extra.sessionId}:${extra.rpcId}`);
-    // tool+command 作为降级去重键（同 agent 的同一命令审批不应重复）
+    // tool+command 降级去重键：仅在没有任何稳定审批身份（approvalId/rpcId）
+    // 时才使用——无条件加入会让同一会话内两条身份不同的审批（同命令）在 8s
+    // 窗口内互相吞掉（P1-4）。有 sessionId 时拼进键里做基本隔离。
     const tool = extra.toolName || extra.tool || "";
     const cmd = extra.command || "";
-    if (tool || cmd) keys.push(`ap:tc:${tool}|${cmd}`);
+    const session = extra.sessionId || "";
+    const hasIdentity = Boolean(extra.approvalId || extra.rpcId);
+    if (!hasIdentity && (tool || cmd)) {
+      keys.push(session ? `ap:tc:${session}:${tool}|${cmd}` : `ap:tc:${tool}|${cmd}`);
+    }
   } else if (ev === "question/requested" || ev === "question/resolved") {
     if (extra.rpcId) keys.push(`qu:${extra.rpcId}`);
     // sessionId 同理：与 rpcId 组合
@@ -1093,15 +1292,15 @@ export function apply(ctx) {
         const retrySessionKey = String(agent.session?.id || agent.id || "");
         // 只有同一 session 连续累计达到阈值才写高优先级提醒；每次
         // request-error 仍保留原始记录，便于诊断真实重试过程。
-        if (isRateLimitError(errCode, errMsg) && noteRetryConnection(retrySessionKey)) {
+        if (isModelAccessError(errCode, errMsg) && noteRetryConnection(retrySessionKey)) {
           writeRecord({
-            event: "rate_limit",
+            event: "model_access",
             errorCode: errCode.slice(0, 48) || "RATE_LIMIT",
             errorMessage: truncate(errMsg),
             sessionId: retrySessionKey,
             consecutiveRetryCount: retryConnectionStats.get(retrySessionKey)?.count || RETRY_EVENT_THRESHOLD,
           });
-        } else if (!isRateLimitError(errCode, errMsg)) {
+        } else if (!isModelAccessError(errCode, errMsg)) {
           resetRetryConnection(retrySessionKey);
         }
       });
@@ -1216,6 +1415,8 @@ export function apply(ctx) {
         } else {
           writeStateEvent("assistant/message", stepOf(event), sessionId);
         }
+        // 模型成功产出 = 重试已恢复 → 连续重试计数归零（见上方硬失败判定规则）
+        noteTurnRecovery(sessionKeyOf(_session, event));
       }
 
       // 2) 审批请求：approval/asked 只是 DSH 的会话/审计信号（供 dsh_state 锁存
@@ -1239,6 +1440,8 @@ export function apply(ctx) {
       //     同时记录卡住检测所需数据（工具名、参数指纹、成败、耗时）。
       if (type === "tool/call") {
         const d = event.data || {};
+        // 工具调用 = 模型请求链已恢复推进 → 连续重试计数归零
+        noteTurnRecovery(sessionKeyOf(_session, event));
         if (d.name === QUESTION_TOOL) {
           writeQuestionRequest(d.callId, extractQuestions(d.arguments), sessionId);
         }
@@ -1265,7 +1468,10 @@ export function apply(ctx) {
         }
       } else if (type === "tool/result") {
         const d = event.data || {};
-        const callId = d.message && d.message.callId;
+        // 与 toolResultInfo 同一取数路径：当前 dsh 版本 callId 也可能只挂在
+        // message.source 下，只看 message.callId 会导致 resolveQuestion 永远
+        // 收不到 callId——question/resolved 写不出，桌宠端提醒队列卡死。
+        const callId = d.message && (d.message.callId || (d.message.source && d.message.source.callId));
         if (callId) resolveQuestion(callId, sessionId);
         // 用户介入信号：ask_user_question 回答后
         if (callId && pendingQuestionCallIds.has(String(callId))) {
@@ -1302,7 +1508,9 @@ export function apply(ctx) {
           ok: !info.isError,
           timeout: !!timeout,
           errorCode: info.errorCode,
-          errorText: info.errorText,
+          // 错误正文统一用 errorMessage（与 llm/retry / model_access / llm_error /
+          // execution/failed 同一字段名），不再用并行的 errorText 别名。
+          errorMessage: info.errorText,
           evidenceStatus,
           evidenceHash,
           ...(info.resultText ? { resultSummary: info.resultText } : {}),
@@ -1319,9 +1527,10 @@ export function apply(ctx) {
         );
       }
 
-      // 2.7) turn 开始：重置硬失败判定状态（新一轮从零计数）
+      // 2.7) turn 开始：重置硬失败判定状态（新一轮从零计数；若上一轮 turn/end
+      //      因异常漏发，这里兜底清掉残留统计，绝不跨 turn 累计）
       if (type === "turn/start") {
-        _turnStats(sessionKeyOf(_session, event)).turnActive = true;
+        resetTurnStats(_turnStats(sessionKeyOf(_session, event)));
       }
 
       // 2.75) 模型请求错误：agent/request-error 是 cordis agent 上下文事件，
@@ -1343,13 +1552,13 @@ export function apply(ctx) {
           step: stepOf(event),
           sessionId,
         });
-        // 429 限流即时提醒：不等到 turn/end，LLM 重试时直接写 rate_limit 事件。
+        // 模型访问失败即时提醒：不等到 turn/end，LLM 重试时直接写 model_access 事件。
         // DSH 实测 errorCode 为 "RATE_LIMIT"（消息形如 "429: ..."），旧实现仅
-        // 匹配 code==="429"，导致真实限流永远不触发。改用 isRateLimitError 判定。
-        if (isRateLimitError(errorCode, errorMessage) &&
+        // 匹配 code==="429"，导致真实模型访问失败永远不触发。改用 isModelAccessError 判定。
+        if (isModelAccessError(errorCode, errorMessage) &&
             noteRetryConnection(sessionKeyOf(_session, event))) {
           writeRecord({
-            event: "rate_limit",
+            event: "model_access",
             errorCode: errorCode.slice(0, 48) || "RATE_LIMIT",
             errorMessage: truncate(errorMessage),
             sessionId,
@@ -1357,44 +1566,39 @@ export function apply(ctx) {
             retry: typeof d.retry === "number" ? d.retry : 0,
           });
         }
-        // PI_AI_ERROR（bad_response_status_code）：AI API 返回 404/5xx 等 HTTP 错误，
-        // 表示函数/模型不存在或 API 不可用。此类错误与限流不同，直接写入 llm_error 事件。
+        // bad_response_status_code：AI API 返回 404/5xx 等 HTTP 错误，
+        // 表示函数/模型不存在或 API 不可用。此类错误与限流不同，直接写入
+        // llm_error 事件。errorCode 保留上游真实码（不再替换成 PI_AI_ERROR），
+        // 分类语义由 errorKind 承载（errorKind=api → 弹窗走 llm_error.api 文案）。
         if (errorCode === "bad_response_status_code" &&
             noteRetryConnection(sessionKeyOf(_session, event))) {
           writeRecord({
             event: "llm_error",
-            errorCode: "PI_AI_ERROR",
+            errorCode: errorCode.slice(0, 48),
             errorMessage: truncate(errorMessage),
             sessionId,
             retry: typeof d.retry === "number" ? d.retry : 0,
+            errorKind: "api",
           });
         }
-        // 累计本轮重试计数（供 turn/end 时判定「重试耗尽」硬失败）
-        const st = _turnStats(sessionKeyOf(_session, event));
-        if (st) st.retries++;
+        // 累计本轮连续重试计数（恢复即清零；turn/end 判定「重试耗尽」时用）
+        noteTurnRetry(sessionKeyOf(_session, event), errorCode);
       }
 
       // 2.85) 硬失败判定（execution/failed，脱敏，不经行为分析直接提醒）
-      // 规则：DSH 已决定「本轮不再继续」的事件 → 直接提醒，不走 stuck_detector。
-      //   - llm/retry 重试耗尽（>= 阈值）
-      //   - 本轮有工具失败且无任何成功（工具执行最终失败）
+      // 规则：DSH 的 turn/end 自带 data.reason.kind。只有 kind === "error"
+      // （本轮真的以出错终止）才可能判硬失败：
+      //   - 连续 llm/retry 达到阈值后 DSH 抛错 → 模型重试耗尽（failureType=model_retry_exhausted）
+      //   - 本轮有工具失败且无任何成功，且 turn 以 error 结尾 → 工具最终失败（failureType=tool_failed）
+      // 正常完成（completed）、被中止（aborted）、被阻塞（blocked）、触达
+      // max-tokens 以及 reason 缺失的 turn/end，一律不写 execution/failed——
+      // 中途抖动但最终恢复并正常收尾的 turn 绝不误报。
       // 只在 turn/end 时判定并写一条；错误码保留（判根因），错误正文不落盘。
       if (type === "turn/end") {
-        const st = _turnStats(sessionKeyOf(_session, event));
-        if (st && st.turnActive) {
-          const retryExhausted = st.retries >= RETRY_EXHAUSTED_THRESHOLD;
-          const toolFailed = st.hadFailure && !st.hadSuccess;
-          if (retryExhausted || toolFailed) {
-            writeRecord({
-              event: "execution/failed",
-              source: retryExhausted ? "model_request" : "tool",
-              retryExhausted: !!retryExhausted,
-              retries: st.retries,
-              errorCode: st.lastErrorCode || "",
-              errorMessage: st.lastErrorMessage || "",
-              sessionId,
-            });
-          }
+        const reason = (event.data && event.data.reason) || null;
+        const failure = decideTurnEndFailure(reason, turnStatsMap.get(sessionKeyOf(_session, event)));
+        if (failure) {
+          writeRecord({ ...failure, sessionId });
         }
         _endTurnStats(sessionKeyOf(_session, event));
         resetRetryConnection(sessionKeyOf(_session, event));
@@ -1454,4 +1658,12 @@ export const __retryTest = {
   threshold: RETRY_EVENT_THRESHOLD,
   reset: resetRetryConnection,
   note: noteRetryConnection,
+};
+export const __hardFailureTest = {
+  threshold: RETRY_EXHAUSTED_THRESHOLD,
+  decideTurnEnd: decideTurnEndFailure,
+  resetTurnStats,
+  noteRetry: noteStatsRetry,
+  recovery: noteStatsRecovery,
+  noteToolResult: noteStatsToolResult,
 };

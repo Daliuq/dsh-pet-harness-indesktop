@@ -242,9 +242,24 @@ class _FakePosixHome:
         )
 
     def use(self, monkeypatch) -> None:
-        """把这个假家目录装进 node_runtime 的两个平台/家目录 seam。"""
+        """把这个假家目录装进 node_runtime 的平台/家目录 seam，并隔离宿主环境。
+
+        只 mock ``_is_windows`` / ``_home`` 还不够：POSIX 的 nvm/fnm 探测会按
+        ``NVM_DIR`` / ``FNM_DIR`` 等环境变量重定向根目录——CI runner 的真实
+        环境若带着这些变量（如 GitHub runner 常设 ``NVM_DIR``），探测就会绕开
+        临时家目录、找不到本类构造的布局（ubuntu CI 实测红）。测试要的是
+        「这台假机器」，宿主环境变量在这里全是噪声，统一清掉。
+        注意：``VOLTA_HOME`` 等即使保留也不影响各目录断言（volta/bun/yarn/
+        asdf/pnpm 的默认位置都来自 ``_POSIX_HOME_BIN_DIRS``、与 home 相对），
+        但一并清除可防止探测被宿主值带偏。
+        """
         monkeypatch.setattr(node_runtime, "_is_windows", lambda: False)
         monkeypatch.setattr(node_runtime, "_home", lambda: self.home)
+        for name in (
+            "NVM_DIR", "NVM_HOME", "NVM_SYMLINK",
+            "FNM_DIR", "VOLTA_HOME", "BUN_INSTALL", "PNPM_HOME",
+        ):
+            monkeypatch.delenv(name, raising=False)
 
 
 class TestPosixEnvironment:
@@ -330,6 +345,29 @@ class TestPosixEnvironment:
         assert str(posix.pnpm_store) in roots
         assert str(fnm_lib) in roots
         assert all(Path(p).is_dir() for p in roots), "共享根目录只返回真实存在的"
+
+    def test_stale_nvm_dir_env_falls_back_to_default_home(self, tmp_path, monkeypatch):
+        """产品缺陷回归：NVM_DIR/FNM_DIR 指向已移除/失效目录时不得丢掉默认布局。
+
+        真实 Linux 场景：环境里 NVM_DIR 残留旧路径（升级/换机/配置删除），目录
+        已不存在——若按该变量直接探测，默认家目录下真实存在的 nvm/fnm 布局会
+        整个被丢弃，桌宠找不到全局 pnpm/npm（「需要 pnpm，自动安装失败」）。
+        """
+        posix = _FakePosixHome(tmp_path)
+        posix.use(monkeypatch)
+        monkeypatch.setenv("NVM_DIR", str(tmp_path / "stale-nvm"))   # 不存在
+        monkeypatch.setenv("FNM_DIR", str(tmp_path / "stale-fnm"))  # 不存在
+        fnm_lib = _dir(
+            posix.home / ".local" / "share" / "fnm" / "node-versions" / "v20.11.1"
+            / "installation" / "lib" / "node_modules"
+        )
+
+        entries = node_runtime.augmented_path().split(os.pathsep)
+        assert str(posix.nvm_bin) in entries, "NVM_DIR 失效时仍应找到默认 ~/.nvm 布局"
+
+        roots = [str(p) for p in node_runtime.global_node_modules_roots()]
+        assert str(posix.nvm_lib) in roots
+        assert str(fnm_lib) in roots, "FNM_DIR 失效时仍应找到默认 fnm 布局"
 
     def test_node_modules_root_layout_is_recognized(self, tmp_path, monkeypatch):
         """共享根本身就是全局 node_modules 时（nvm 的 lib/node_modules）也要命中。"""

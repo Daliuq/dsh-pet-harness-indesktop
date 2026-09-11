@@ -105,6 +105,27 @@ def _env_get(env: Mapping[str, str], name: str) -> str:
     return ""
 
 
+def _env_root_or_default(env: Mapping[str, str], name: str, fallback: Path) -> Path:
+    """环境变量重定向的**替代根**：指向不存在的目录时回退默认布局。
+
+    只用于「替代根」语义的变量（NVM_DIR / FNM_DIR）：设置了就替换默认探测根。
+    用户的 NVM_DIR/FNM_DIR 可能指向已移除/失效的目录（升级、换机器、配置残留），
+    此时若按变量直接探测会**整个丢掉**默认家目录下真实存在的 nvm/fnm 布局——
+    桌面 Linux/macOS 场景即「找不到全局 pnpm/npm → 需要 pnpm，自动安装失败」。
+    追加型变量（VOLTA_HOME / BUN_INSTALL / PNPM_HOME）只是额外候选、不替换
+    默认，不经过本函数（_existing_dirs 会滤掉不存在的）。
+    """
+    value = _env_get(env, name).strip()
+    if value:
+        candidate = Path(value)
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            pass
+    return fallback
+
+
 # ----------------------------------------------------------------------
 # PATH 拼接工具
 # ----------------------------------------------------------------------
@@ -206,14 +227,17 @@ def _version_manager_bin_dirs(env: Mapping[str, str], home: Path, *, windows: bo
             dirs.append(root)
             dirs.extend(_safe_glob(root, "v*"))
     else:
-        nvm_root = Path(nvm_dir) if nvm_dir else home / ".nvm"
+        nvm_root = _env_root_or_default(env, "NVM_DIR", home / ".nvm")
         for version in _safe_glob(nvm_root / "versions" / "node", "*"):
             dirs.append(version / "bin")
 
     fnm_dir = _env_get(env, "FNM_DIR").strip()
-    fnm_root = Path(fnm_dir) if fnm_dir else (
-        home / "AppData" / "Roaming" / "fnm" if windows else home / ".local" / "share" / "fnm"
-    )
+    if windows:
+        fnm_root = Path(fnm_dir) if fnm_dir else (
+            home / "AppData" / "Roaming" / "fnm"
+        )
+    else:
+        fnm_root = _env_root_or_default(env, "FNM_DIR", home / ".local" / "share" / "fnm")
     for version in _safe_glob(fnm_root / "node-versions", "*"):
         dirs.append(version / "installation" / "bin")
         if windows:
@@ -390,14 +414,12 @@ def global_node_modules_roots() -> list[Path]:
         for version in _safe_glob(fnm_root / "node-versions", "*"):
             roots.append(version / "installation" / "node_modules")
     else:
-        nvm_dir = _env_get(env, "NVM_DIR").strip()
-        nvm_root = Path(nvm_dir) if nvm_dir else home / ".nvm"
+        nvm_root = _env_root_or_default(env, "NVM_DIR", home / ".nvm")
         for version in _safe_glob(nvm_root / "versions" / "node", "*"):
             roots.append(version / "lib" / "node_modules")
         for image in _safe_glob(home / ".volta" / "tools" / "image" / "node", "*"):
             roots.append(image / "lib" / "node_modules")
-        fnm_dir = _env_get(env, "FNM_DIR").strip()
-        fnm_root = Path(fnm_dir) if fnm_dir else home / ".local" / "share" / "fnm"
+        fnm_root = _env_root_or_default(env, "FNM_DIR", home / ".local" / "share" / "fnm")
         for version in _safe_glob(fnm_root / "node-versions", "*"):
             roots.append(version / "installation" / "lib" / "node_modules")
         for store in _safe_glob(home / ".local" / "share" / "pnpm" / "global", "*"):
